@@ -95,23 +95,47 @@ class Candidate(Protocol):
     def session(self) -> str: ...
 
 
+_TMUX_PANE_ID = re.compile(r"%[0-9]+")
+
+
+def _is_tmux_pane_id(pane_id: str) -> bool:
+    return _TMUX_PANE_ID.fullmatch(pane_id) is not None
+
+
+def _candidate_order(pane: Candidate) -> tuple[str, int, int, str]:
+    """Sort key: id, then tmux pane ids (``%N``) by number, then any other pane id as text."""
+    if _is_tmux_pane_id(pane.pane_id):
+        return (pane.id, 0, int(pane.pane_id[1:]), "")
+    return (pane.id, 1, 0, pane.pane_id)
+
+
+def _describe(pane: Candidate) -> str:
+    """``tc-xxxxxxxx (%N)``; a pane id that is not tmux's ``%N`` is left out."""
+    if _is_tmux_pane_id(pane.pane_id):
+        return f"{pane.id} ({pane.pane_id})"
+    return pane.id
+
+
 def resolve[P: Candidate](id_input: IdInput, panes: Sequence[P]) -> P:
     """The one managed pane ``id_input`` names.
 
     No match exits 10 (``not_found``); several matches, including two panes carrying the same
-    full id, exit 21 (``ambiguous``) with the candidates sorted by id, then pane id, and termctl
-    acts on none of them. The message lists the candidates' ids, which the pane reader has
-    checked against the id grammar; sessions (untrusted) appear only in ``candidates``.
-    ``panes`` holds one entry per pane id (linked-window rows already merged).
+    full id, exit 21 (``ambiguous``) and termctl acts on none of them. Candidates are sorted by
+    id, then by pane id: tmux's ``%N`` by number (``%9`` before ``%10``), any other pane id
+    after those, as text. The message lists each candidate as ``tc-xxxxxxxx (%N)`` so panes
+    carrying the same full id are told apart; the ids have been checked by the pane reader
+    against the id grammar, and a pane id is printed only if it matches ``%N``. Sessions
+    (untrusted) appear only in ``candidates``. ``panes`` holds one entry per pane id
+    (linked-window rows already merged).
     """
     matches = sorted(
         (pane for pane in panes if id_input.matches(pane.id)),
-        key=lambda pane: (pane.id, pane.pane_id),
+        key=_candidate_order,
     )
     if not matches:
         raise TermctlError("not_found", f"no managed pane matches {show(id_input.raw)}")
     if len(matches) > 1:
-        listed = ", ".join(pane.id for pane in matches)
+        listed = ", ".join(_describe(pane) for pane in matches)
         raise TermctlError(
             "ambiguous",
             f"{show(id_input.raw)} matches {len(matches)} managed panes: {listed}",

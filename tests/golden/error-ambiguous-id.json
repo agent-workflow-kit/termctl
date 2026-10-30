@@ -1,1 +1,1 @@
-{"error": {"code": "ambiguous", "message": "'abcd' matches 2 managed panes: tc-abcdefgh, tc-abcdxxxx", "candidates": [{"id": "tc-abcdefgh", "pane_id": "%1", "session": "termctl"}, {"id": "tc-abcdxxxx", "pane_id": "%2", "session": "work"}]}}
+{"error": {"code": "ambiguous", "message": "'abcd' matches 2 managed panes: tc-abcdefgh (%1), tc-abcdxxxx (%2)", "candidates": [{"id": "tc-abcdefgh", "pane_id": "%1", "session": "termctl"}, {"id": "tc-abcdxxxx", "pane_id": "%2", "session": "work"}]}}

@@ -197,6 +197,26 @@ def test_resolve_ambiguous_candidates_are_sorted_by_id_then_pane_id() -> None:
     ]
 
 
+def test_resolve_ambiguous_candidates_sort_pane_ids_numerically() -> None:
+    panes = [Pane("tc-abcdaaaa", "%10", "a"), Pane("tc-abcdaaaa", "%9", "b")]
+    with pytest.raises(TermctlError) as info:
+        ids.resolve(ids.parse("abcd"), panes)
+    assert [c["pane_id"] for c in info.value.candidates or []] == ["%9", "%10"]
+    assert info.value.message.endswith("tc-abcdaaaa (%9), tc-abcdaaaa (%10)")
+
+
+def test_resolve_ambiguous_non_tmux_pane_ids_sort_as_strings_and_are_not_printed() -> None:
+    panes = [
+        Pane("tc-abcdaaaa", "x\x1b", "a"),
+        Pane("tc-abcdaaaa", "%2", "b"),
+        Pane("tc-abcdaaaa", "%b", "c"),
+    ]
+    with pytest.raises(TermctlError) as info:
+        ids.resolve(ids.parse("abcd"), panes)
+    assert [c["pane_id"] for c in info.value.candidates or []] == ["%2", "%b", "x\x1b"]
+    assert info.value.message.endswith("tc-abcdaaaa (%2), tc-abcdaaaa, tc-abcdaaaa")
+
+
 def test_resolve_ambiguous_message_lists_ids_but_never_sessions() -> None:
     panes = [Pane("tc-abcdzzzz", "%2", "\x1b]0;evil"), Pane("tc-abcdaaaa", "%1", "s")]
     with pytest.raises(TermctlError) as info:

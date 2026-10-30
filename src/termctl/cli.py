@@ -320,12 +320,15 @@ COMMANDS: dict[str, CommandSpec] = {
 
 
 def check_args(args: argparse.Namespace, ctx: Context) -> None:
-    """Step 1: the grammars and limits of the arguments, and ``open``'s cwd (exit 2).
+    """Part of step 1: the grammars and limits of the arguments, and ``open``'s cwd (exit 2).
 
     Replaces ``open``'s ``args.cwd`` with the resolved working directory. Checks that need
     config (a marker or placement being defined) or the pane list (the label limit of
-    ``label add``) belong to later steps.
+    ``label add``) belong to later steps. Some step-1 checks are not here yet (see the TODO).
     """
+    # TODO: remaining step-1 usage checks, owned by later issues: an argv[0] containing '='
+    # and --env PATH=... without argv (#15); the --override-escalation gate (TTY or a human:
+    # actor) and --hook name validity (#6, #17).
     if args.socket is not None:
         validate.check_socket_flag(args.socket)
     command = args.command

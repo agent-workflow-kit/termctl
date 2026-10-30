@@ -247,7 +247,11 @@ def default_actor(*, stdin_is_tty: bool, user: str | None) -> tuple[str, str | N
 
 
 def resolve_actor(given: str | None, gateway: Gateway) -> tuple[str, str | None]:
-    """``--actor`` if given, else the default; returns the actor and a warning, if any."""
+    """``--actor`` if given, else the default; returns the actor and a warning, if any.
+
+    No caller yet: the ``--override-escalation`` gate and audit records of ``open`` (#17) and
+    the ``close --force`` gate (#23) will call it.
+    """
     if given is not None:
         return check_actor(given), None
     return default_actor(stdin_is_tty=gateway.stdin_isatty(), user=gateway.user_name())
