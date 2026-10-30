@@ -58,7 +58,8 @@ class _VersionAction(argparse.Action):
 
 
 class _HelpAction(argparse.Action):
-    """``-h``/``--help``: ``main`` prints the help of the parser that met the flag."""
+    """Lists ``-h``/``--help`` in the help. ``parse_args`` finds it in its pre-scan, so this
+    action only raises as a fallback; ``main`` prints the help of the parser that met it."""
 
     def __init__(self, option_strings: Sequence[str], dest: str, **kwargs: Any) -> None:
         super().__init__(option_strings, dest=argparse.SUPPRESS, nargs=0, **kwargs)
@@ -263,14 +264,23 @@ def _check_open_argv(args: argparse.Namespace, tokens: Sequence[str], usage: str
         raise UsageError("the command to run must follow '--'", usage=usage)
 
 
+def _is_short_cluster(token: str) -> bool:
+    """``-h`` followed by more text, which argparse would read as ``-h`` and further flags
+    (``-h`` is termctl's only short option)."""
+    return token.startswith("-h") and token != "-h"
+
+
 def _parse(parser: _Parser, scanned: Scan) -> argparse.Namespace:
     if "--version" in scanned.options:
         raise _VersionRequested
+    if scanned.help is not None:
+        raise _HelpRequested(scanned.help)
     usage = scanned.parser.format_usage()
     if scanned.early_separator:
         raise UsageError("'--' cannot come before the command", usage=usage)
-    if scanned.unknown and not scanned.complete:
-        # argparse would report the missing command instead of the unknown flag.
+    if scanned.unknown and (not scanned.complete or any(map(_is_short_cluster, scanned.unknown))):
+        # argparse would report the missing command instead of the unknown flag, and would
+        # read `-hx` as `-h -x`.
         raise UsageError(f"unrecognized arguments: {' '.join(scanned.unknown)}", usage=usage)
     args, extra = parser.parse_known_args(scanned.args)
     if extra:
@@ -370,6 +380,8 @@ def main(
     stderr: TextIO | None = None,
 ) -> int:
     # sys.stdout and sys.stderr are None when termctl starts with that descriptor closed.
+    if stdout is None or stderr is None:
+        _backslashreplace_standard_streams()
     out = Output(
         stdout=stdout or sys.stdout or io.StringIO(),
         stderr=stderr or sys.stderr or io.StringIO(),
@@ -385,6 +397,13 @@ def main(
     finally:
         if stdout is None or stderr is None:
             flush_standard_streams()
+
+
+def _backslashreplace_standard_streams() -> None:
+    """Write characters the locale cannot encode as backslash escapes instead of failing."""
+    for stream in (sys.stdout, sys.stderr):
+        if isinstance(stream, io.TextIOWrapper):
+            stream.reconfigure(errors="backslashreplace")
 
 
 def _run(

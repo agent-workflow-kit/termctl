@@ -3,8 +3,8 @@
 argparse refuses an option value that begins with ``-``. termctl follows getopt instead: an
 option that takes a value always consumes the next token as its value. ``scan`` walks the
 tokens with the parsers' own option tables, so it knows which options take values, which
-(sub)parser each token belongs to and where the ``--`` separator is. The ``--json`` and
-``--version`` checks read its result, so they agree with argparse about what is a value.
+(sub)parser each token belongs to and where the ``--`` separator is. The ``--json``, ``--version`` and
+``--help`` checks read its result, so they agree with argparse about what is a value.
 """
 
 from __future__ import annotations
@@ -30,6 +30,8 @@ class Scan:
     """The deepest parser reached: the subcommand's, or the top level's if none was named."""
     early_separator: bool
     """A ``--`` came before the command was complete."""
+    help: argparse.ArgumentParser | None = None
+    """The parser that met the first ``-h``/``--help``, if one was given."""
 
     @property
     def complete(self) -> bool:
@@ -53,18 +55,23 @@ def scan(parser: argparse.ArgumentParser, raw: Sequence[str]) -> Scan:
     args: list[str] = []
     options: list[str] = []
     unknown: list[str] = []
+    help_parser: argparse.ArgumentParser | None = None
     i = 0
     while i < len(tokens):
         token = tokens[i]
         if token == "--":
             args.extend(tokens[i:])
-            return Scan(args, options, unknown, parser, early_separator=bool(subcommands(parser)))
+            early = bool(subcommands(parser))
+            return Scan(args, options, unknown, parser, early, help_parser)
         if _is_option(token):
             name = token.split("=", 1)[0]
             options.append(name)
             action = parser._option_string_actions.get(name)
             if action is None:
+                # Short options are never clustered: `-hx` is unknown, not `-h -x`.
                 unknown.append(token)
+            elif name in ("-h", "--help") and help_parser is None:
+                help_parser = parser
             elif action.nargs != 0 and name == token and i + 1 < len(tokens):
                 # Only long options take values, so the `=` form is always available.
                 i += 1
@@ -73,4 +80,4 @@ def scan(parser: argparse.ArgumentParser, raw: Sequence[str]) -> Scan:
             parser = subcommands(parser).get(token, parser)
         args.append(token)
         i += 1
-    return Scan(args, options, unknown, parser, early_separator=False)
+    return Scan(args, options, unknown, parser, False, help_parser)

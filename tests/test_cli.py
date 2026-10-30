@@ -903,3 +903,142 @@ def test_closed_stdout_subprocess() -> None:
 def test_stdout_pipe_without_reader_subprocess() -> None:
     proc = shell('{ sleep 0.3; "$0" -m termctl --version; echo "rc=$?" >&2; } | true')
     assert proc.stderr == "rc=0\n"
+
+
+def test_envelope_precedes_stderr_message_in_merged_pipe() -> None:
+    proc = subprocess.run(
+        [sys.executable, "-m", "termctl", "--json", "bogus"],
+        stdout=subprocess.PIPE,
+        stderr=subprocess.STDOUT,
+        text=True,
+        timeout=30,
+        check=False,
+    )
+    lines = proc.stdout.splitlines()
+    assert proc.returncode == 2
+    assert json.loads(lines[0])["error"]["code"] == "usage"
+    assert lines[1].startswith("termctl: ")
+
+
+# --- help precedence ----------------------------------------------------------------------------
+
+
+@pytest.mark.parametrize(
+    ("argv", "usage"),
+    [
+        (["-h", "--bogus"], "usage: termctl [--json]"),
+        (["--bogus", "-h"], "usage: termctl [--json]"),
+        (["label", "-h", "--bogus"], "usage: termctl label "),
+        (["label", "--bogus", "-h"], "usage: termctl label "),
+        (["list", "-h", "--bogus"], "usage: termctl list "),
+        (["list", "--bogus", "-h"], "usage: termctl list "),
+        (["--json", "list", "extra", "--help"], "usage: termctl list "),
+        (["show", "--help"], "usage: termctl show "),
+        (["--verbose", "--quiet", "-h"], "usage: termctl [--json]"),
+        (["-h", "--", "list"], "usage: termctl [--json]"),
+        (["bogus", "-h"], "usage: termctl [--json]"),
+        (["-h", "label", "add"], "usage: termctl [--json]"),
+    ],
+)
+def test_help_ignores_usage_errors(argv: list[str], usage: str) -> None:
+    run = Run(argv)
+    assert (run.code, run.stderr) == (0, "")
+    assert run.stdout.startswith(usage)
+
+
+@pytest.mark.parametrize("argv", [["-h", "--version"], ["list", "--version", "--help"]])
+def test_version_wins_over_help(argv: list[str]) -> None:
+    assert Run(argv).stdout == f"termctl {__version__}\n"
+
+
+def test_help_after_double_dash_is_not_help() -> None:
+    run = Run(["rename", ID, "--", "-h", "extra"])
+    assert run.code == 2
+
+
+@pytest.mark.parametrize(
+    "argv",
+    [
+        ["-hx"],
+        ["-hx", "list"],
+        ["list", "-hx"],
+        ["label", "-hx"],
+        ["label", "add", ID, "k=v", "-hx"],
+    ],
+)
+def test_short_option_cluster_is_an_unknown_flag(argv: list[str]) -> None:
+    run = Run(argv)
+    assert run.code == 2
+    assert run.stdout == ""
+    assert run.stderr.startswith("termctl: unrecognized arguments: -hx\n")
+
+
+def test_json_before_early_double_dash_prints_envelope() -> None:
+    run = Run(["--json", "--", "list"])
+    assert run.code == 2
+    assert run.json()["error"] == {
+        "code": "usage",
+        "message": "'--' cannot come before the command",
+    }
+
+
+# --- undecodable arguments and output encoding --------------------------------------------------
+
+
+def test_undecodable_argument_json_subprocess() -> None:
+    proc = subprocess.run(
+        [sys.executable, "-m", "termctl", "--json", "list", b"\xff"],
+        capture_output=True,
+        timeout=30,
+        check=False,
+    )
+    assert proc.returncode == 2
+    envelope = json.loads(proc.stdout.decode("utf-8", errors="strict"))
+    # A strict parser rejects lone surrogates: none may reach the envelope.
+    json.dumps(envelope, ensure_ascii=False).encode("utf-8", errors="strict")
+    assert envelope["error"]["message"] == "unrecognized arguments: \\xff"
+    assert proc.stderr == b"termctl: unrecognized arguments: \\xff\n"
+
+
+def test_undecodable_argument_human_subprocess() -> None:
+    proc = subprocess.run(
+        [sys.executable, "-m", "termctl", "list", b"\xff"],
+        capture_output=True,
+        timeout=30,
+        check=False,
+    )
+    assert proc.returncode == 2
+    assert proc.stdout == b""
+    assert proc.stderr.startswith(b"termctl: unrecognized arguments: \\xff\n")
+
+
+def test_json_output_maps_lone_surrogates(monkeypatch: pytest.MonkeyPatch) -> None:
+    data = {"s": ["a\udcffb", "c\ud800"], "n": {"k": "\udc80"}}
+    monkeypatch.setattr(cli, "run_command", lambda args, ctx: Result(data, ""))
+    run = Run(["placements", "--json"])
+    assert run.json() == {"s": ["a\\xffb", "c\\ud800"], "n": {"k": "\\x80"}}
+
+
+def strict_stream() -> io.TextIOWrapper:
+    return io.TextIOWrapper(io.BytesIO(), encoding="ascii", errors="strict")
+
+
+def test_unencodable_output_keeps_exit_code(monkeypatch: pytest.MonkeyPatch) -> None:
+    monkeypatch.setattr(cli, "run_command", lambda args, ctx: Result({}, "\u00e9", exit_code=10))
+    stdout, stderr = strict_stream(), strict_stream()
+    assert run_with(["placements"], stdout=stdout, stderr=stderr) == 10  # type: ignore[arg-type]
+
+
+def test_unencodable_error_message_keeps_exit_code() -> None:
+    stdout, stderr = strict_stream(), strict_stream()
+    assert run_with(["list", "\u00e9"], stdout=stdout, stderr=stderr) == 2  # type: ignore[arg-type]
+
+
+def test_standard_streams_use_backslashreplace(monkeypatch: pytest.MonkeyPatch) -> None:
+    monkeypatch.setattr(cli, "run_command", lambda args, ctx: Result({}, "\u00e9"))
+    stdout, stderr = strict_stream(), strict_stream()
+    monkeypatch.setattr(sys, "stdout", stdout)
+    monkeypatch.setattr(sys, "stderr", stderr)
+    code = main(["placements"], gateway=FakeGateway(), clock=FakeClock(), environ={})
+    assert code == 0
+    assert stdout.buffer.getvalue() == b"\\xe9\n"  # type: ignore[attr-defined]

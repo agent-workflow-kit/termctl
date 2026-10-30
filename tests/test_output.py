@@ -20,3 +20,16 @@ from termctl.output import escape
 )
 def test_escape(text: str, expected: str) -> None:
     assert escape(text) == expected
+
+
+@pytest.mark.parametrize(
+    ("text", "expected"),
+    [
+        ("a\udcffb", "a\\xffb"),
+        ("\udc80\udcc3\udca9", "\\x80\\xc3\\xa9"),
+        ("\ud800", "\\ud800"),
+        ("\udfff\udc7f", "\\udfff\\udc7f"),
+    ],
+)
+def test_escape_lone_surrogates(text: str, expected: str) -> None:
+    assert escape(text) == expected
