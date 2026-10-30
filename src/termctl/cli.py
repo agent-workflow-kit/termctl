@@ -297,6 +297,8 @@ def _parse(parser: _Parser, scanned: Scan) -> argparse.Namespace:
     args, extra = parser.parse_known_args(scanned.args)
     if extra:
         raise UsageError(f"unrecognized arguments: {' '.join(extra)}", usage=usage)
+    if args.config == "":
+        raise UsageError("--config must not be empty", usage=usage)
     if args.verbose and args.quiet:
         raise UsageError("--verbose and --quiet cannot be combined", usage=usage)
     if args.command == "open":

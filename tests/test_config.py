@@ -6,6 +6,7 @@ import os
 import time
 from collections.abc import Iterator
 from pathlib import Path
+from types import SimpleNamespace
 from typing import Any
 
 import pytest
@@ -17,7 +18,7 @@ from termctl.cli import Context, Result, main
 from termctl.config import DEFAULTS, ENV_KEYS, Config, ConfigError, load
 
 from .fakes import FakeClock, FakeGateway
-from .schemas import validate
+from .schemas import SCHEMAS, validate
 
 ROOT = Path(__file__).resolve().parents[1]
 GOLDEN = Path(__file__).parent / "golden"
@@ -83,6 +84,14 @@ def example() -> dict[str, Any]:
 
 def test_defaults_equal_config_example() -> None:
     assert DEFAULTS == example()
+
+
+def test_schema_defaults_equal_defaults() -> None:
+    properties = SCHEMAS["termctl/config.json"]["properties"]
+    schema_defaults = {
+        key: prop["default"] for key, prop in properties.items() if "default" in prop
+    }
+    assert schema_defaults == DEFAULTS
 
 
 def test_config_example_matches_schema() -> None:
@@ -214,6 +223,79 @@ def test_no_home_and_no_passwd_entry_is_an_error(monkeypatch: pytest.MonkeyPatch
     )
 
 
+@pytest.mark.parametrize("home_value", ["", "relhome"])
+def test_empty_or_relative_home_falls_back_to_the_passwd_entry(
+    monkeypatch: pytest.MonkeyPatch, home: Path, main_file: Path, home_value: str
+) -> None:
+    write(main_file, {"tmux_bin": "from-passwd"})
+
+    class Entry:
+        pw_dir = str(home)
+
+    monkeypatch.setattr(config.pwd, "getpwuid", lambda uid: Entry())
+    assert load({"HOME": home_value}).tmux_bin == "from-passwd"
+
+
+@pytest.mark.parametrize("pw_dir", ["", "relhome"])
+def test_empty_or_relative_passwd_home_is_an_error(
+    monkeypatch: pytest.MonkeyPatch, pw_dir: str
+) -> None:
+    entry = SimpleNamespace(pw_dir=pw_dir)
+    monkeypatch.setattr(config.pwd, "getpwuid", lambda uid: entry)
+    err = load_error({"HOME": "relhome"})
+    assert err.message.startswith("cannot determine the home directory")
+
+
+def test_dangling_symlink_above_the_default_file_is_an_error(tmp_path: Path) -> None:
+    xdg = tmp_path / "xdg"
+    xdg.mkdir()
+    (xdg / "termctl").symlink_to(tmp_path / "nowhere")
+    err = load_error({"XDG_CONFIG_HOME": str(xdg)})
+    assert err.details == {"file": str(xdg / "termctl")}
+    assert "dangling symlink" in err.message
+
+
+def test_dangling_drop_in_directory_symlink_is_an_error(
+    tmp_path: Path, home: Path, dropins: Path
+) -> None:
+    dropins.symlink_to(tmp_path / "nowhere")
+    err = load_error({"HOME": str(home)})
+    assert err.details == {"file": str(dropins)}
+    assert "dangling symlink" in err.message
+
+
+def test_fifo_drop_in_is_not_a_regular_file(home: Path, dropins: Path) -> None:
+    dropins.mkdir()
+    fifo = dropins / "a.yaml"
+    os.mkfifo(fifo)
+    err = load_error({"HOME": str(home)})
+    assert err.details == {"file": str(fifo)}
+    assert "not a regular file" in err.message
+
+
+@pytest.mark.parametrize("device", ["/dev/null", "/dev/zero"])
+def test_main_file_symlink_to_a_device_is_not_a_regular_file(
+    home: Path, main_file: Path, device: str
+) -> None:
+    main_file.symlink_to(device)
+    err = load_error({"HOME": str(home)})
+    assert err.details == {"file": str(main_file)}
+    assert "not a regular file" in err.message
+
+
+def test_config_flag_naming_a_directory_is_not_a_regular_file(tmp_path: Path) -> None:
+    err = load_error({}, str(tmp_path))
+    assert "not a regular file" in err.message
+
+
+def test_regular_file_through_a_symlink_is_read(
+    tmp_path: Path, home: Path, main_file: Path
+) -> None:
+    real = write(tmp_path / "real.yaml", {"tmux_bin": "linked"})
+    main_file.symlink_to(real)
+    assert load_home(home).tmux_bin == "linked"
+
+
 def test_empty_file_means_no_settings(home: Path, main_file: Path) -> None:
     write(main_file, "# only a comment\n")
     assert load_home(home) == config.defaults()
@@ -224,13 +306,45 @@ def test_unparsable_or_non_mapping_file_is_invalid(home: Path, main_file: Path, 
     write(main_file, text)
     err = load_error({"HOME": str(home)})
     assert str(main_file) in err.message
-    assert err.details == {"file": str(main_file)}
+    assert without_position(err.details) == {"file": str(main_file)}
+
+
+def without_position(details: dict[str, Any] | None) -> dict[str, Any]:
+    return {k: v for k, v in (details or {}).items() if k not in ("line", "column")}
+
+
+@pytest.mark.parametrize(
+    ("text", "line", "column"),
+    [
+        ("tmux_bin: x\nkey: [unclosed\n", 3, 1),
+        ("tmux_bin: x\nplacements: {a: !foo x}\n", 2, 17),
+        ("tmux_bin: !!int abc\n", 1, 11),
+        ("tmux_bin: !!float x\n", 1, 11),
+        ("tmux_bin: !!bool yes\n", 1, 11),
+        ("tmux_bin: a\ntmux_bin: b\n", 2, 1),
+        ("markers:\n  a: &m {text: x}\n", 2, 6),
+        ('tmux_bin: x\nfoo: "\\q"\n', 2, 8),
+    ],
+)
+def test_yaml_errors_are_one_line_with_file_and_position(
+    home: Path, main_file: Path, text: str, line: int, column: int
+) -> None:
+    write(main_file, text)
+    err = load_error({"HOME": str(home)})
+    assert "\n" not in err.message and "<unicode string>" not in err.message
+    assert err.message.startswith(f"invalid config {main_file}: line {line}, column {column}: ")
+    assert err.details is not None
+    assert (err.details["file"], err.details["line"], err.details["column"]) == (
+        str(main_file),
+        line,
+        column,
+    )
 
 
 def test_unparsable_drop_in_names_the_drop_in(home: Path, dropins: Path) -> None:
     bad = write(dropins / "b.yaml", ": : :\n")
     err = load_error({"HOME": str(home)})
-    assert err.details == {"file": str(bad)}
+    assert without_position(err.details) == {"file": str(bad)}
 
 
 # --- YAML hazards -------------------------------------------------------------------------------
@@ -246,14 +360,14 @@ def test_unparsable_drop_in_names_the_drop_in(home: Path, dropins: Path) -> None
 def test_duplicate_keys_are_invalid(home: Path, main_file: Path, text: str, key: str) -> None:
     write(main_file, text)
     err = load_error({"HOME": str(home)})
-    assert err.details == {"file": str(main_file), "key": key}
+    assert without_position(err.details) == {"file": str(main_file), "key": key}
     assert str(main_file) in err.message and key in err.message
 
 
 def test_duplicate_keys_in_a_drop_in_name_the_drop_in(home: Path, dropins: Path) -> None:
     bad = write(dropins / "a.yaml", "hooks:\n  pre-open: []\n  pre-open: []\n")
     err = load_error({"HOME": str(home)})
-    assert err.details == {"file": str(bad), "key": "hooks.pre-open"}
+    assert err.details == {"file": str(bad), "key": "hooks.pre-open", "line": 3, "column": 3}
 
 
 @pytest.mark.parametrize(
@@ -267,7 +381,7 @@ def test_duplicate_keys_in_a_drop_in_name_the_drop_in(home: Path, dropins: Path)
 def test_anchors_aliases_and_merge_keys_are_invalid(home: Path, main_file: Path, text: str) -> None:
     write(main_file, text)
     err = load_error({"HOME": str(home)})
-    assert err.details == {"file": str(main_file)}
+    assert without_position(err.details) == {"file": str(main_file)}
     assert str(main_file) in err.message
 
 
@@ -279,15 +393,17 @@ def test_alias_bomb_fails_fast(home: Path, main_file: Path) -> None:
     start = time.monotonic()
     err = load_error({"HOME": str(home)})
     assert time.monotonic() - start < 0.5
-    assert err.details == {"file": str(main_file)}
+    assert without_position(err.details) == {"file": str(main_file)}
 
 
 @pytest.mark.parametrize(
     ("text", "key", "shown"),
     [
-        ("placements: {no: {}}\n", "placements.no", "no"),
+        ("placements: {true: {}}\n", "placements.true", "true"),
         ("markers: {1: {text: x}}\n", "markers.1", "1"),
-        ("on: 1\n", "on", "on"),
+        ("markers: {0x1F: {text: x}}\n", "markers.0x1F", "0x1F"),
+        ("markers: {1.5: {text: x}}\n", "markers.1.5", "1.5"),
+        ("null: 1\n", "null", "null"),
     ],
 )
 def test_non_string_keys_are_invalid(
@@ -295,7 +411,7 @@ def test_non_string_keys_are_invalid(
 ) -> None:
     write(main_file, text)
     err = load_error({"HOME": str(home)})
-    assert err.details == {"file": str(main_file), "key": key}
+    assert without_position(err.details) == {"file": str(main_file), "key": key}
     assert shown in err.message and "quote" in err.message
 
 
@@ -303,6 +419,122 @@ def test_deep_nesting_is_invalid(home: Path, main_file: Path) -> None:
     write(main_file, "a: " + "[" * 100_000 + "]" * 100_000 + "\n")
     err = load_error({"HOME": str(home)})
     assert err.details == {"file": str(main_file)}
+
+
+def test_unprintable_character_is_one_line_naming_the_file(home: Path, main_file: Path) -> None:
+    write(main_file, "tmux_bin: a\x01\n")
+    err = load_error({"HOME": str(home)})
+    assert err.message == (
+        f"invalid config {main_file}: position 11: unacceptable character #x0001:"
+        " special characters are not allowed"
+    )
+    assert err.details == {"file": str(main_file)}
+
+
+# --- YAML 1.2 core schema -----------------------------------------------------------------------
+
+
+@pytest.mark.parametrize(
+    ("text", "expected"),
+    [
+        ("17", 17),
+        ("017", 17),
+        ("0o17", 15),
+        ("0x1F", 31),
+        ("+5", 5),
+        ("1e1", 10),
+        ("5.0", 5),
+    ],
+)
+def test_integers_are_read_as_yaml_1_2(
+    home: Path, main_file: Path, text: str, expected: int
+) -> None:
+    write(main_file, f"hooks:\n  pre-open: [{{cmd: x, timeout: {text}}}]\n")
+    assert load_home(home).hooks.pre_open[0].timeout == expected
+
+
+@pytest.mark.parametrize("text", ["1:30", "1_000", "0b11", ".inf", "-.inf", ".nan", "0o8"])
+def test_yaml_1_1_numbers_are_not_integers(home: Path, main_file: Path, text: str) -> None:
+    write(main_file, f"hooks:\n  pre-open: [{{cmd: x, timeout: {text}}}]\n")
+    err = load_error({"HOME": str(home)})
+    assert err.details == {"key": "hooks.pre-open[0].timeout"}
+
+
+@pytest.mark.parametrize(
+    "text", ["yes", "no", "on", "off", "y", "n", "1:30", "2024-01-01", "1_000", "<<"]
+)
+def test_yaml_1_1_scalars_are_strings(home: Path, main_file: Path, text: str) -> None:
+    write(main_file, f"tmux_bin: {text}\n")
+    assert load_home(home).tmux_bin == text
+
+
+@pytest.mark.parametrize(("text", "expected"), [("true", True), ("False", False), ("TRUE", True)])
+def test_booleans_are_true_and_false(
+    home: Path, main_file: Path, text: str, expected: bool
+) -> None:
+    write(main_file, f"markers: {{m: {{text: x, bell: {text}}}}}\n")
+    assert load_home(home).markers["m"].bell is expected
+
+
+@pytest.mark.parametrize("text", ["yes", "no", "on", "off"])
+def test_yaml_1_1_booleans_are_rejected_with_a_hint(home: Path, main_file: Path, text: str) -> None:
+    write(main_file, f"markers: {{m: {{text: x, bell: {text}}}}}\n")
+    err = load_error({"HOME": str(home)})
+    assert err.details == {"key": "markers.m.bell"}
+    assert "true or false" in err.message
+
+
+@pytest.mark.parametrize("text", ["~", "null", "Null", "NULL", ""])
+def test_nulls_are_yaml_1_2(home: Path, main_file: Path, text: str) -> None:
+    write(main_file, f"placements: {{a: {{layout: {text}}}}}\n")
+    err = load_error({"HOME": str(home)})
+    assert err.details == {"key": "placements.a.layout"}
+
+
+def test_yaml_1_1_boolean_words_are_string_keys(home: Path, main_file: Path) -> None:
+    write(
+        main_file,
+        "placements: {no: {session: x}, on: {}}\nrules: [{match: {yes: n}, placement: no}]\n",
+    )
+    cfg = load_home(home)
+    assert set(cfg.placements) == {"default", "no", "on"}
+    assert cfg.rules[0].match == {"yes": "n"}
+
+
+def test_yaml_1_1_boolean_word_as_a_top_level_key_is_unknown(home: Path, main_file: Path) -> None:
+    write(main_file, "yes: 1\n")
+    err = load_error({"HOME": str(home)})
+    assert err.details == {"key": "yes"}
+
+
+# --- Unicode ------------------------------------------------------------------------------------
+
+
+@pytest.mark.parametrize(
+    ("text", "key"),
+    [
+        ('placements: {a: {layout: "\\ud800"}}\n', "placements.a.layout"),
+        ('placements: {a: {group_by: "x\\udcff"}}\n', "placements.a.group_by"),
+        ('hooks: {post-open: [{cmd: "\\ud800"}]}\n', "hooks.post-open[0].cmd"),
+        ('tmux_bin: "\\udcff"\n', "tmux_bin"),
+        ('placements: {"a\\udcff": {}}\n', "placements.a\udcff"),
+    ],
+)
+def test_lone_surrogates_in_config_are_rejected(
+    home: Path, main_file: Path, text: str, key: str
+) -> None:
+    write(main_file, text)
+    err = load_error({"HOME": str(home)})
+    assert err.details == {"key": key}
+    assert err.message.startswith(f"invalid config: {key}: ")
+    assert "valid Unicode" in err.message
+
+
+@pytest.mark.parametrize("var", ["TERMCTL_TMUX_BIN", "TERMCTL_CLOSE_GRACE", "TERMCTL_BACKEND"])
+def test_lone_surrogates_in_variables_are_rejected(home: Path, var: str) -> None:
+    err = load_error({"HOME": str(home), var: "\udcff"})
+    assert err.details == {"variable": var}
+    assert err.message == f"invalid {var}: must be valid Unicode text"
 
 
 # --- drop-ins and merging -----------------------------------------------------------------------
@@ -419,6 +651,14 @@ def test_environment_overrides_config(home: Path, main_file: Path, key: str) -> 
     assert getattr(cfg, key) == expected
 
 
+@pytest.mark.parametrize("socket", ["work", "/run/tmux/other"])
+def test_termctl_socket_name_or_path_overrides_config_socket(
+    home: Path, main_file: Path, socket: str
+) -> None:
+    write(main_file, {"socket": "/run/tmux/sock"})
+    assert load_home(home, TERMCTL_SOCKET=socket).socket == socket
+
+
 def test_environment_overrides_drop_ins(home: Path, dropins: Path) -> None:
     write(dropins / "a.yaml", {"keep_on_exit": "failed"})
     assert load_home(home, TERMCTL_KEEP_ON_EXIT="never").keep_on_exit == "never"
@@ -511,6 +751,13 @@ def test_async_on_a_pre_hook_is_rejected(
     err = load_error({"HOME": str(home)})
     assert err.details == {"key": f"hooks.{hook}[1].async"}
     assert f"hooks.{hook}[1].async" in err.message
+
+
+def test_hook_keys_index_the_merged_list(home: Path, main_file: Path, dropins: Path) -> None:
+    write(main_file, {"hooks": {"pre-open": [{"cmd": "main"}]}})
+    write(dropins / "a.yaml", {"hooks": {"pre-open": [{"cmd": "dropin", "async": True}]}})
+    err = load_error({"HOME": str(home)})
+    assert err.details == {"key": "hooks.pre-open[1].async"}
 
 
 @pytest.mark.parametrize("hook", ["post-open", "post-close"])
@@ -678,6 +925,9 @@ INVALID: list[tuple[dict[str, Any], str]] = [
     ({"hooks": {"pre-open": [{"cmd": "x", "timeout": 1.5}]}}, "hooks.pre-open[0].timeout"),
     ({"hooks": {"post-open": [{"cmd": "x", "async": "true"}]}}, "hooks.post-open[0].async"),
     ({"hooks": {"post-close": [{"cmd": "x", "env": {}}]}}, "hooks.post-close[0].env"),
+    ({"hooks": {"post-open": [{"cmd": "x", "async_": True}]}}, "hooks.post-open[0].async_"),
+    ({"hooks": {"pre_open": []}}, "hooks.pre_open"),
+    ({"hooks": {"post_close": []}}, "hooks.post_close"),
 ]
 
 
@@ -777,7 +1027,7 @@ def test_cli_invalid_config_exits_2_before_tmux(tmp_path: Path, command: list[st
             {"hooks": {"pre-close": [{"cmd": "gate", "async": True}]}},
             {},
         ),
-        ("error-config-invalid-variable.json", {}, {"TERMCTL_KEEP_ON_EXIT": "sometimes"}),
+        ("error-config-invalid-variable.json", {}, {"TERMCTL_CLOSE_GRACE": "11m"}),
     ],
 )
 def test_config_invalid_golden(
@@ -804,3 +1054,14 @@ def test_cli_undecodable_termctl_socket_is_reported_escaped(tmp_path: Path) -> N
     assert envelope["error"]["details"] == {"variable": "TERMCTL_SOCKET"}
     assert stderr.startswith("termctl: invalid TERMCTL_SOCKET: ")
     stderr.encode()  # no lone surrogate reaches the stream
+
+
+@pytest.mark.parametrize("argv", [["--config", ""], ["--config="]])
+def test_cli_empty_config_flag_is_a_usage_error(argv: list[str]) -> None:
+    gateway = FakeGateway()
+    code, stdout, _ = run(["--json", *argv, "placements"], {}, gateway)
+    assert code == 2
+    envelope = json.loads(stdout)
+    validate(envelope, "termctl/cli/error.json")
+    assert envelope["error"]["code"] == "usage"
+    assert envelope["error"]["message"] == "--config must not be empty"

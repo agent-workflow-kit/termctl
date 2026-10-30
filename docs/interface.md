@@ -326,7 +326,7 @@ An option that takes a value always consumes the next token as its value, even o
 |---|---|
 | `--json` | machine output (schemas in `schemas/cli/`); errors as `{"error": {...}}` on stdout ([Errors](#errors)), usage errors included |
 | `--socket NAME\|PATH` | the tmux server ([Server selection](#server-selection)) |
-| `--config PATH` | config file instead of `~/.config/termctl/config.yaml` (drop-ins are read from the `config.d/` next to it) |
+| `--config PATH` | config file instead of `~/.config/termctl/config.yaml` (drop-ins are read from the `config.d/` next to it); an empty PATH is a usage error |
 | `--verbose` | also writes each tmux command termctl runs to stderr, with `--env` values replaced by their names |
 | `--quiet` | suppresses all stderr output except errors; with `--verbose`, exit 2 |
 | `--version` | prints `termctl <version>` and exits 0. `--version` (without `=VALUE`) anywhere before `--` does so before any other check: other flags, `--help` and usage errors are ignored |
@@ -408,15 +408,18 @@ Every payload has the top-level fields `tool` (`termctl`), `hook`, `object_type`
 
 ## Config
 
-`~/.config/termctl/config.yaml` (respecting `XDG_CONFIG_HOME`) plus `config.d/*.yaml` in code point order, merged after it: maps are merged key by key at every depth, `hooks` lists are appended, and other lists (`server_env_allow`, `rules`) are replaced. Schema: `schemas/config.json`; every key with its default is in `config.example.yaml`. Invalid config exits 2 (`config_invalid`) naming the key; besides the schema, termctl checks at load that every rule names a defined placement, that `socket` is a socket name or an absolute path ([Server selection](#server-selection)), and that no pre-hook sets `async`. Unsupported placement fields are not a load error ([Placement](#placement)).
+`~/.config/termctl/config.yaml` (respecting `XDG_CONFIG_HOME`) plus `config.d/*.yaml` in code point order, merged after it: maps are merged key by key at every depth, `hooks` lists are appended, and other lists (`server_env_allow`, `rules`) are replaced. Schema: `schemas/config.json`; every key with its default is in `config.example.yaml`. Invalid config exits 2 (`config_invalid`) naming the key (`details.key`). The key is a path in the merged config, so a list index in a `hooks` key counts in the appended list: the main file's entries first, then each drop-in's in order. Besides the schema, termctl checks at load that every rule names a defined placement, that `socket` is a socket name or an absolute path ([Server selection](#server-selection)), and that no pre-hook sets `async`. Unsupported placement fields are not a load error ([Placement](#placement)).
 
-Config files are YAML with these restrictions; a violation exits 2 (`config_invalid`) naming the file, and the key where there is one:
+Config files are YAML, read with the YAML 1.2 core schema: booleans are `true` and `false` (also `True`, `TRUE`, and so on), so `yes`, `no`, `on`, `off`, `1:30` and `2024-01-01` are strings, `017` is 17, `0o17` is 15 and `0x1F` is 31. A YAML error or a violation of these restrictions exits 2 (`config_invalid`) with a one-line message naming the file (`details.file`), the line and column where the parser knows them (`details.line`, `details.column`), and the key where there is one:
 
-- Every mapping key is a string and appears once in its mapping. Quote keys YAML 1.1 reads as other types (`"no"`, `"on"`, `"yes"`, `"off"`, numbers).
+- Every mapping key is a string and appears once in its mapping. Quote keys YAML reads as other types (`"true"`, `"null"`, numbers).
 - Anchors, aliases and merge keys (`<<`) are not allowed; config files need none, and aliases allow exponential growth.
 - An integral float (`1.0`) is accepted where an integer is expected, as in the schema; other floats are not.
+- Every key and string is valid Unicode: one with a lone surrogate (from a `\u` escape) exits 2 naming the key.
 
-The main file may be missing (no settings), unless it was given with `--config` or is a dangling symlink; any other failure to read it is an error. A missing `config.d/` means no drop-ins; one that cannot be listed (unreadable, not a directory) is an error. Drop-ins are the entries whose names end in `.yaml` and do not start with `.`, read in code point order of their names. When neither an absolute `XDG_CONFIG_HOME` nor `HOME` is set, the home directory comes from the user's passwd entry; without one, termctl exits 2 (`config_invalid`).
+The main file may be missing (no settings), unless it was given with `--config` or it, or a directory above it, is a dangling symlink (the error names that symlink); any other failure to read it is an error. The main file and the drop-ins must be regular files after following symlinks; anything else (a directory, a FIFO, a device) is an error, and termctl never blocks opening one. A missing `config.d/` means no drop-ins; one that cannot be listed (unreadable, not a directory, a dangling symlink) is an error. Drop-ins are the entries whose names end in `.yaml` and do not start with `.`, read in code point order of their names. When neither an absolute `XDG_CONFIG_HOME` nor an absolute `HOME` is set, the home directory comes from the user's passwd entry; without one, or if it is not absolute, termctl exits 2 (`config_invalid`).
+
+With `--config PATH`, termctl also reads the `config.d/` next to PATH. Drop-ins can add hooks, which run commands, so PATH should be a file in a directory only the user can write.
 
 | Key | Default | Meaning |
 |---|---|---|
@@ -436,7 +439,7 @@ termctl has no per-repo overrides (it has no notion of a repository).
 
 ## Environment
 
-- **Config from the environment:** `TERMCTL_<KEY>` sets a top-level scalar key (`TERMCTL_SOCKET`, `TERMCTL_TMUX_BIN`, `TERMCTL_BACKEND`, `TERMCTL_KEEP_ON_EXIT`, `TERMCTL_CLOSE_GRACE`, `TERMCTL_MARKER_DISPLAY`). An invalid value exits 2 (`config_invalid`) naming the variable. Other `TERMCTL_*` variables are ignored. Lists and maps (`server_env_allow`, `markers`, `placements`, `rules`, `hooks`) cannot be set from the environment. Precedence: flags > environment > config > built-in defaults.
+- **Config from the environment:** `TERMCTL_<KEY>` sets a top-level scalar key (`TERMCTL_SOCKET`, `TERMCTL_TMUX_BIN`, `TERMCTL_BACKEND`, `TERMCTL_KEEP_ON_EXIT`, `TERMCTL_CLOSE_GRACE`, `TERMCTL_MARKER_DISPLAY`). An invalid value, including one that is not valid UTF-8, exits 2 (`config_invalid`) naming the variable. Other `TERMCTL_*` variables are ignored. Lists and maps (`server_env_allow`, `markers`, `placements`, `rules`, `hooks`) cannot be set from the environment. Precedence: flags > environment > config > built-in defaults.
 - **Hook variables:** `TERMCTL_HOOK`, `TERMCTL_ID`, `TERMCTL_OBJECT_TYPE`; these are never config keys. Hooks get the caller's full environment ([Hooks](#hooks)).
 - **The filtered environment:** termctl runs every tmux command with the caller's environment filtered by `server_env_allow` (the exceptions are the attach of [`focus`](#focus) and hooks). tmux takes several values from the environment of the process that runs a tmux command, so this filter decides them: the server's global environment when the command starts the server, the variables a new session imports (tmux's `update-environment`, e.g. `DISPLAY` and `SSH_AUTH_SOCK`), and the new pane's `PATH`. termctl therefore never adds the caller's credentials (for example from a cron env file) to tmux. A server started by anyone else keeps its own global environment.
 - **Clients import their environment.** A client that attaches to a session or switches to it without `-E` (for example a user's plain `tmux attach`) imports its `update-environment` variables, such as `SSH_AUTH_SOCK`, into that session, and panes created there later get them (spike F1). termctl's own `attach` and `switch-client` always pass `-E`; what other clients do is outside termctl's control ([Residual risks](#residual-risks)).

@@ -51,6 +51,11 @@ def show(value: str, limit: int = 64) -> str:
     return f"'{escape(value)}'"
 
 
+def has_surrogate(value: str) -> bool:
+    """Whether ``value`` has a lone surrogate, so is not valid Unicode text."""
+    return _SURROGATE.search(value) is not None
+
+
 def _fullmatch(pattern: re.Pattern[str], value: str) -> bool:
     return pattern.fullmatch(value) is not None
 

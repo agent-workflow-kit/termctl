@@ -9,8 +9,11 @@ logs.
 from __future__ import annotations
 
 import copy
+import errno
 import os
 import pwd
+import re
+import stat
 from collections.abc import Callable, Mapping
 from pathlib import Path
 from typing import Annotated, Any, Literal
@@ -68,7 +71,7 @@ PRE_HOOKS = ("pre-open", "pre-close")
 class ConfigError(TermctlError):
     """Invalid config (exit 2, ``config_invalid``); ``details`` names the key, variable or file."""
 
-    def __init__(self, message: str, **details: str) -> None:
+    def __init__(self, message: str, **details: Any) -> None:
         super().__init__("config_invalid", message, details=details)
 
 
@@ -170,6 +173,8 @@ class Rule(_Model):
 
 class PreHook(_Model):
     cmd: NonEmpty
+    # TODO(#6): bound hook timeout (schema allows arbitrarily large ints; clamp or add a schema
+    # maximum).
     timeout: PositiveInt = 30
 
 
@@ -213,19 +218,22 @@ _HOME_UNKNOWN = "cannot determine the home directory; set HOME or XDG_CONFIG_HOM
 
 def config_path(environ: Mapping[str, str], explicit: str | None) -> Path:
     """``--config PATH``, else ``$XDG_CONFIG_HOME/termctl/config.yaml`` (when set and
-    absolute), else ``~/.config/termctl/config.yaml`` (``HOME``, else the passwd entry)."""
+    absolute), else ``~/.config/termctl/config.yaml`` (an absolute ``HOME``, else the passwd
+    entry's home, which must be absolute)."""
     if explicit is not None:
         return Path(explicit)
     xdg = environ.get("XDG_CONFIG_HOME", "")
     if xdg and os.path.isabs(xdg):
         base = Path(xdg)
     else:
-        home = environ.get("HOME")
-        if not home:
+        home = environ.get("HOME", "")
+        if not os.path.isabs(home):
             try:
                 home = pwd.getpwuid(os.getuid()).pw_dir
             except KeyError:
                 raise ConfigError(_HOME_UNKNOWN) from None
+            if not os.path.isabs(home):
+                raise ConfigError(_HOME_UNKNOWN)
         base = Path(home) / ".config"
     return base / "termctl" / "config.yaml"
 
@@ -245,16 +253,20 @@ def merge(base: Mapping[Any, Any], over: Mapping[Any, Any], path: tuple[Any, ...
     return result
 
 
-class _Rejected(yaml.YAMLError):
+class _Rejected(yaml.MarkedYAMLError):
     """A YAML construct config files do not allow; ``key`` is the dotted path, if any."""
 
-    def __init__(self, message: str, mark: yaml.Mark, key: str | None = None) -> None:
-        super().__init__(f"{message} (line {mark.line + 1})")
+    def __init__(self, message: str, mark: yaml.Mark | None, key: str | None = None) -> None:
+        super().__init__(problem=message, problem_mark=mark)
         self.key = key
 
 
 _STR_TAG = "tag:yaml.org,2002:str"
-_MERGE_TAG = "tag:yaml.org,2002:merge"
+
+
+def _is_merge_key(node: yaml.Node) -> bool:
+    """A plain ``<<`` key: a merge key in YAML 1.1, rejected rather than read as a string."""
+    return isinstance(node, yaml.ScalarNode) and node.value == "<<" and node.style is None
 
 
 def _check_keys(root: yaml.Node) -> None:
@@ -272,7 +284,7 @@ def _check_keys(root: yaml.Node) -> None:
             seen: set[str] = set()
             values: list[tuple[yaml.Node, str]] = []
             for key_node, value_node in pairs:
-                if key_node.tag == _MERGE_TAG:
+                if _is_merge_key(key_node):
                     raise _Rejected("merge keys (<<) are not allowed", key_node.start_mark)
                 text = key_node.value if isinstance(key_node, yaml.ScalarNode) else "?"
                 key = f"{path}.{text}" if path else text
@@ -290,9 +302,37 @@ def _check_keys(root: yaml.Node) -> None:
             stack.extend(reversed(values))
 
 
+def _construct_bool(loader: yaml.SafeLoader, node: yaml.ScalarNode) -> bool:
+    value = loader.construct_scalar(node).lower()
+    if value not in ("true", "false"):
+        raise _Rejected(f"not a boolean (use true or false): {value!r}", node.start_mark)
+    return value == "true"
+
+
+def _construct_int(loader: yaml.SafeLoader, node: yaml.ScalarNode) -> int:
+    value = loader.construct_scalar(node)
+    try:
+        return int(value, 0) if value[:2] in ("0o", "0x") else int(value, 10)
+    except ValueError:
+        raise _Rejected(f"not an integer: {value!r}", node.start_mark) from None
+
+
+def _construct_float(loader: yaml.SafeLoader, node: yaml.ScalarNode) -> float:
+    value = loader.construct_scalar(node)
+    special = {".inf": "inf", "+.inf": "inf", "-.inf": "-inf", ".nan": "nan"}
+    try:
+        return float(special.get(value.lower(), value))
+    except ValueError:
+        raise _Rejected(f"not a number: {value!r}", node.start_mark) from None
+
+
 class _Loader(yaml.SafeLoader):
-    """``SafeLoader`` without anchors, aliases or merge keys (they enable exponential blow-up and
-    config files need none), with string keys only and no duplicate keys."""
+    """``SafeLoader`` with the YAML 1.2 core schema's scalars (so ``yes``, ``on``, ``017`` and
+    ``1:30`` are not special), without anchors, aliases or merge keys (they enable exponential
+    blow-up and config files need none), with string keys only and no duplicate keys."""
+
+    # Only the core schema's implicit types (added below).
+    yaml_implicit_resolvers: dict[Any, Any] = {}  # noqa: RUF012 (PyYAML's class attribute)
 
     def compose_node(self, parent: yaml.Node | None, index: Any) -> yaml.Node | None:
         event = self.peek_event()
@@ -305,54 +345,121 @@ class _Loader(yaml.SafeLoader):
         return super().construct_document(node)  # pyright: ignore[reportUnknownMemberType]
 
 
+_CORE_RESOLVERS = [
+    ("bool", r"true|True|TRUE|false|False|FALSE", "tTfF"),
+    ("int", r"[-+]?[0-9]+|0o[0-7]+|0x[0-9a-fA-F]+", "-+0123456789"),
+    (
+        "float",
+        r"[-+]?(?:\.[0-9]+|[0-9]+(?:\.[0-9]*)?)(?:[eE][-+]?[0-9]+)?"
+        r"|[-+]?\.(?:inf|Inf|INF)|\.(?:nan|NaN|NAN)",
+        "-+.0123456789",
+    ),
+    ("null", r"~|null|Null|NULL|", ["~", "n", "N", ""]),
+]
+for _kind, _pattern, _first in _CORE_RESOLVERS:
+    _Loader.add_implicit_resolver(  # pyright: ignore[reportUnknownMemberType]
+        f"tag:yaml.org,2002:{_kind}", re.compile(f"^(?:{_pattern})$"), list(_first)
+    )
+_Loader.add_constructor("tag:yaml.org,2002:bool", _construct_bool)  # pyright: ignore[reportUnknownMemberType]
+_Loader.add_constructor("tag:yaml.org,2002:int", _construct_int)  # pyright: ignore[reportUnknownMemberType]
+_Loader.add_constructor("tag:yaml.org,2002:float", _construct_float)  # pyright: ignore[reportUnknownMemberType]
+
+
+def _yaml_error(path: Path, exc: yaml.YAMLError) -> ConfigError:
+    """One line naming the file and, where PyYAML knows them, the line, column and key."""
+    details: dict[str, Any] = {"file": str(path)}
+    mark = None
+    if isinstance(exc, yaml.MarkedYAMLError):
+        mark = exc.problem_mark or exc.context_mark
+        text = "; ".join(part for part in (exc.context, exc.problem) if part)
+    elif isinstance(exc, yaml.reader.ReaderError):
+        text = (
+            f"position {exc.position}: unacceptable character #x{exc.character:04x}: {exc.reason}"
+        )
+    else:
+        text = " ".join(str(exc).split())
+    position = ""
+    if mark is not None:
+        details.update(line=mark.line + 1, column=mark.column + 1)
+        position = f"line {mark.line + 1}, column {mark.column + 1}: "
+    if isinstance(exc, _Rejected) and exc.key is not None:
+        details["key"] = exc.key
+    return ConfigError(f"invalid config {path}: {position}{text}", **details)
+
+
+def _dangling(path: Path) -> Path | None:
+    """The first of ``path`` and its ancestors (from the root down) that is a dangling
+    symlink, if any."""
+    for candidate in (*reversed(path.parents), path):
+        if candidate.is_symlink() and not candidate.exists():
+            return candidate
+    return None
+
+
+def _cannot_read(path: Path, reason: str) -> ConfigError:
+    return ConfigError(f"cannot read config {path}: {reason}", file=str(path))
+
+
+def _read_bytes(path: Path) -> bytes:
+    """The contents of ``path``, which must be a regular file (after symlinks). Opened without
+    blocking, so a FIFO is reported rather than waited on."""
+    fd = os.open(path, os.O_RDONLY | os.O_NONBLOCK | os.O_CLOEXEC)
+    try:
+        if not stat.S_ISREG(os.fstat(fd).st_mode):
+            raise _cannot_read(path, "not a regular file")
+        with open(fd, "rb", closefd=False) as file:
+            return file.read()
+    finally:
+        os.close(fd)
+
+
 def _read(path: Path, *, optional: bool = False) -> dict[str, Any]:
-    """Read one config file. With ``optional``, a missing file (not a dangling symlink) means
-    no settings; every other failure is a ``ConfigError`` naming the file."""
+    """Read one config file. With ``optional``, a missing file (not a dangling symlink, nor
+    below one) means no settings; every other failure is a ``ConfigError`` naming the file."""
     try:
-        text = path.read_text(encoding="utf-8")
-    except (OSError, UnicodeDecodeError) as exc:
-        if isinstance(exc, FileNotFoundError) and path.is_symlink():
-            reason = "dangling symlink"
-        elif isinstance(exc, FileNotFoundError) and optional:
+        text = _read_bytes(path).decode("utf-8")
+    except FileNotFoundError:
+        if dangling := _dangling(path):
+            raise _cannot_read(dangling, "dangling symlink") from None
+        if optional:
             return {}
-        elif isinstance(exc, OSError):
-            reason = exc.strerror or str(exc)
-        else:
-            reason = "not UTF-8"
-        raise ConfigError(f"cannot read config {path}: {reason}", file=str(path)) from None
-    details = {"file": str(path)}
+        raise _cannot_read(path, os.strerror(errno.ENOENT)) from None
+    except OSError as exc:
+        raise _cannot_read(path, exc.strerror or str(exc)) from None
+    except UnicodeDecodeError:
+        raise _cannot_read(path, "not UTF-8") from None
     try:
-        data = yaml.load(text, Loader=_Loader)  # _Loader is a SafeLoader
-    except _Rejected as exc:
-        if exc.key is not None:
-            details["key"] = exc.key
-        raise ConfigError(f"invalid config {path}: {exc}", **details) from None
+        loader = _Loader(text)  # checks for unprintable characters
+        loader.name = str(path)
+        try:
+            data = loader.get_single_data()
+        finally:
+            loader.dispose()
     except yaml.YAMLError as exc:
-        raise ConfigError(f"invalid config {path}: {exc}", **details) from None
+        raise _yaml_error(path, exc) from None
     except RecursionError:
-        raise ConfigError(f"invalid config {path}: nested too deeply", **details) from None
+        raise ConfigError(f"invalid config {path}: nested too deeply", file=str(path)) from None
     if data is None:
         return {}
     if not isinstance(data, dict):
-        raise ConfigError(f"invalid config {path}: the top level must be a mapping", **details)
+        raise ConfigError(f"invalid config {path}: the top level must be a mapping", file=str(path))
     return data  # pyright: ignore[reportUnknownVariableType]
 
 
 def _dropins(main: Path) -> list[Path]:
     """``config.d/*.yaml`` next to the main file, sorted by code point; hidden files are
     skipped, as a shell glob would. No ``config.d`` means no drop-ins; one that cannot be
-    listed is a ``ConfigError``."""
+    listed (a dangling symlink included) is a ``ConfigError``."""
     directory = main.parent / "config.d"
     try:
         with os.scandir(directory) as entries:
             names = [e.name for e in entries if e.name.endswith(".yaml")]
     except FileNotFoundError:
+        if dangling := _dangling(directory):
+            raise _cannot_read(dangling, "dangling symlink") from None
         return []
     except OSError as exc:
-        reason = exc.strerror or str(exc)
-        raise ConfigError(
-            f"cannot read config {directory}: {reason}", file=str(directory)
-        ) from None
+        raise _cannot_read(directory, exc.strerror or str(exc)) from None
     return [directory / name for name in sorted(names) if not name.startswith(".")]
 
 
@@ -369,7 +476,28 @@ def _key(loc: tuple[int | str, ...]) -> str:
 def _first_error(exc: ValidationError) -> tuple[str, str]:
     error = exc.errors()[0]
     message = error["msg"].removeprefix("Value error, ")
+    if error["type"] == "bool_type" and isinstance(error["input"], str):
+        message += " (use true or false)"
     return _key(error["loc"]), message
+
+
+_NOT_UNICODE = "must be valid Unicode text"
+
+
+def _check_unicode(data: Any, path: tuple[int | str, ...] = ()) -> None:
+    """Every key and string in ``data`` is valid Unicode (no lone surrogates, which YAML's
+    ``\\u`` escapes can produce); the first violation in document order is reported."""
+    if isinstance(data, str):
+        if validate.has_surrogate(data):
+            raise _key_error(_key(path), _NOT_UNICODE)
+    elif isinstance(data, dict):
+        for key, value in data.items():  # pyright: ignore[reportUnknownVariableType]
+            if isinstance(key, str) and validate.has_surrogate(key):
+                raise _key_error(_key((*path, key)), _NOT_UNICODE)
+            _check_unicode(value, (*path, key))  # pyright: ignore[reportUnknownArgumentType]
+    elif isinstance(data, list):
+        for index, value in enumerate(data):  # pyright: ignore[reportUnknownVariableType, reportUnknownArgumentType]
+            _check_unicode(value, (*path, index))
 
 
 def _key_error(key: str, message: str) -> ConfigError:
@@ -395,6 +523,8 @@ def _from_environment(environ: Mapping[str, str]) -> dict[str, Any]:
         variable = f"TERMCTL_{key.upper()}"
         if variable not in environ:
             continue
+        if validate.has_surrogate(environ[variable]):
+            raise ConfigError(f"invalid {variable}: {_NOT_UNICODE}", variable=variable)
         try:
             values[key] = _ENV_ADAPTERS[key].validate_python(environ[variable])
         except ValidationError as exc:
@@ -435,6 +565,7 @@ def load(environ: Mapping[str, str], explicit: str | None = None) -> Config:
     for path in _dropins(main):
         data = merge(data, _read(path))
 
+    _check_unicode(data)
     _check_pre_hooks(data)
     try:
         cfg = Config.model_validate(data)
