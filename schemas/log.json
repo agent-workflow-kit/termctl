@@ -1,33 +1,250 @@
 {
   "$schema": "https://json-schema.org/draft/2020-12/schema",
-  "$id": "termctl/log",
+  "$id": "termctl/log.json",
   "title": "termctl log.jsonl record",
   "type": "object",
   "properties": {
     "ts": {
-      "type": "string",
-      "format": "date-time"
+      "$ref": "defs.json#/$defs/ts"
     },
     "level": {
-      "type": "string",
       "enum": [
-        "debug",
         "info",
         "warn",
         "error"
-      ]
+      ],
+      "description": "error for result error; warn for warning, refused, vetoed and escalated; else info."
     },
     "event": {
-      "type": "string"
+      "enum": [
+        "open",
+        "close",
+        "rename",
+        "mark",
+        "unmark",
+        "label_add",
+        "label_remove",
+        "focus",
+        "hook_failed",
+        "warning"
+      ]
+    },
+    "id": {
+      "oneOf": [
+        {
+          "$ref": "defs.json#/$defs/id"
+        },
+        {
+          "type": "null"
+        }
+      ],
+      "description": "null when no id was resolved."
+    },
+    "socket_path": {
+      "oneOf": [
+        {
+          "$ref": "defs.json#/$defs/socket_path"
+        },
+        {
+          "type": "null"
+        }
+      ]
+    },
+    "result": {
+      "enum": [
+        "ok",
+        "error",
+        "vetoed",
+        "escalated",
+        "refused",
+        "warning"
+      ]
+    },
+    "exit_code": {
+      "type": "integer",
+      "description": "Invocations that fail the usage check are not logged; a label limit checked after id resolution is (exit 2)."
+    },
+    "actor": {
+      "$ref": "defs.json#/$defs/actor",
+      "description": "open and close only (required there, with decision_ids and escalation_override)."
+    },
+    "decision_ids": {
+      "$ref": "defs.json#/$defs/decision_ids"
+    },
+    "escalation_override": {
+      "type": "boolean"
+    },
+    "force": {
+      "type": "boolean",
+      "description": "close only."
+    },
+    "action": {
+      "enum": [
+        "switched",
+        "attach"
+      ],
+      "description": "focus only; attach is logged before the exec."
     },
     "message": {
       "type": "string"
+    },
+    "details": {
+      "type": "object"
     }
   },
+  "additionalProperties": false,
   "required": [
     "ts",
     "level",
-    "event"
+    "event",
+    "id",
+    "socket_path",
+    "result"
   ],
-  "additionalProperties": true
+  "allOf": [
+    {
+      "if": {
+        "properties": {
+          "result": {
+            "const": "error"
+          }
+        }
+      },
+      "then": {
+        "properties": {
+          "level": {
+            "const": "error"
+          }
+        }
+      },
+      "else": {
+        "if": {
+          "properties": {
+            "result": {
+              "const": "ok"
+            }
+          }
+        },
+        "then": {
+          "properties": {
+            "level": {
+              "const": "info"
+            }
+          }
+        },
+        "else": {
+          "properties": {
+            "level": {
+              "const": "warn"
+            }
+          }
+        }
+      }
+    },
+    {
+      "if": {
+        "properties": {
+          "event": {
+            "enum": [
+              "open",
+              "close"
+            ]
+          }
+        }
+      },
+      "then": {
+        "required": [
+          "actor",
+          "decision_ids",
+          "escalation_override"
+        ]
+      },
+      "else": {
+        "not": {
+          "anyOf": [
+            {
+              "required": [
+                "actor"
+              ]
+            },
+            {
+              "required": [
+                "escalation_override"
+              ]
+            }
+          ]
+        }
+      }
+    },
+    {
+      "if": {
+        "properties": {
+          "event": {
+            "const": "close"
+          }
+        }
+      },
+      "then": {
+        "required": [
+          "force"
+        ]
+      },
+      "else": {
+        "not": {
+          "required": [
+            "force"
+          ]
+        }
+      }
+    },
+    {
+      "if": {
+        "properties": {
+          "event": {
+            "const": "focus"
+          }
+        }
+      },
+      "then": {
+        "required": [
+          "action"
+        ]
+      },
+      "else": {
+        "not": {
+          "required": [
+            "action"
+          ]
+        }
+      }
+    },
+    {
+      "if": {
+        "properties": {
+          "event": {
+            "enum": [
+              "hook_failed",
+              "warning"
+            ]
+          }
+        }
+      },
+      "then": {
+        "properties": {
+          "result": {
+            "const": "warning"
+          }
+        }
+      },
+      "else": {
+        "properties": {
+          "result": {
+            "not": {
+              "const": "warning"
+            }
+          }
+        }
+      }
+    }
+  ]
 }
