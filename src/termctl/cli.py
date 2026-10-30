@@ -74,6 +74,15 @@ class _Parser(argparse.ArgumentParser):
     def error(self, message: str) -> NoReturn:
         raise UsageError(message, usage=self.format_usage())
 
+    def _check_value(self, action: argparse.Action, value: Any) -> None:
+        # argparse quotes the value with repr(), which would print an undecodable byte as
+        # `\udcff`; quoting it as text lets the output escape it as `\xff`.
+        if action.choices is not None and value not in action.choices:
+            choices = ", ".join(map(str, action.choices))
+            raise argparse.ArgumentError(
+                action, f"invalid choice: '{value}' (choose from {choices})"
+            )
+
 
 def _add_global_flags(parser: argparse.ArgumentParser, *, top: bool) -> None:
     """Add the global flags. Only the top-level parser sets defaults, so a flag given before
@@ -271,7 +280,7 @@ def _is_short_cluster(token: str) -> bool:
 
 
 def _parse(parser: _Parser, scanned: Scan) -> argparse.Namespace:
-    if "--version" in scanned.options:
+    if scanned.version:
         raise _VersionRequested
     if scanned.help is not None:
         raise _HelpRequested(scanned.help)

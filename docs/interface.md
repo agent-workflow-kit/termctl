@@ -320,7 +320,7 @@ Exit 0, 1, 2, 10, 11, 12, 13, 20, 21.
 
 Global flags may come before or after the subcommand, never after `--`. A `--` may also precede positional arguments, for example `rename <id> -- -name`; a `--` before the subcommand (`termctl -- list`) exits 2, and a `--json` after that `--` is not a flag.
 
-An option that takes a value always consumes the next token as its value, even one that begins with `-` (getopt semantics): `open --name -x -- ls` names the pane `-x`, and in `open --name --json -- ls` the name is `--json` and JSON output is not selected. `--opt=value` is equivalent. Only tokens before the first `--` that are not such values count as flags, for `--json` and `--version` as for the rest.
+An option that takes a value always consumes the next token as its value, even one that begins with `-` (getopt semantics): `open --name -x -- ls` names the pane `-x`, and in `open --name --json -- ls` the name is `--json` and JSON output is not selected. `--opt=value` is equivalent. Only tokens before the first `--` that are not such values count as flags, for `--json` and `--version` as for the rest. A flag that takes no value rejects `=VALUE` (`--json=x`, `--version=x`, `-h=1`) as a usage error, exit 2.
 
 | Flag | Meaning |
 |---|---|
@@ -329,8 +329,8 @@ An option that takes a value always consumes the next token as its value, even o
 | `--config PATH` | config file instead of `~/.config/termctl/config.yaml` (drop-ins are read from the `config.d/` next to it) |
 | `--verbose` | also writes each tmux command termctl runs to stderr, with `--env` values replaced by their names |
 | `--quiet` | suppresses all stderr output except errors; with `--verbose`, exit 2 |
-| `--version` | prints `termctl <version>` and exits 0. `--version` anywhere before `--` does so before any other check: other flags, `--help` and usage errors are ignored |
-| `-h`, `--help` | prints the help of the command it is given to (termctl's own before a subcommand) on stdout and exits 0; human-readable only, `--json` is ignored. `-h` anywhere before `--` does so before any check but `--version`, which wins over it: usage errors are ignored, and `label --bogus -h` prints the help of `label`. Short options do not combine: `-hx` is an unrecognized argument |
+| `--version` | prints `termctl <version>` and exits 0. `--version` (without `=VALUE`) anywhere before `--` does so before any other check: other flags, `--help` and usage errors are ignored |
+| `-h`, `--help` | prints the help of the command it is given to (termctl's own before a subcommand) on stdout and exits 0; human-readable only, `--json` is ignored. `-h` or `--help` (without `=VALUE`) anywhere before `--` does so before any check but `--version`, which wins over it: usage errors are ignored, and `label --bogus -h` prints the help of `label`. Short options do not combine: `-hx` is an unrecognized argument |
 
 ## Exit codes
 

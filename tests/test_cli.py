@@ -973,6 +973,27 @@ def test_short_option_cluster_is_an_unknown_flag(argv: list[str]) -> None:
     assert run.stderr.startswith("termctl: unrecognized arguments: -hx\n")
 
 
+@pytest.mark.parametrize(
+    "argv",
+    [
+        ["-h=1"],
+        ["--help=x"],
+        ["-h="],
+        ["--version=x"],
+        ["--json=x"],
+        ["list", "--help=x"],
+        ["list", "--version=x"],
+    ],
+)
+def test_flag_without_value_rejects_a_value(argv: list[str]) -> None:
+    run = Run(argv)
+    assert run.code == 2
+    assert "usage: termctl" not in run.stdout
+    assert f"termctl {__version__}" not in run.stdout
+    assert run.stderr.startswith("termctl: ")
+    assert run.gateway.calls == []
+
+
 def test_json_before_early_double_dash_prints_envelope() -> None:
     run = Run(["--json", "--", "list"])
     assert run.code == 2
@@ -1010,6 +1031,38 @@ def test_undecodable_argument_human_subprocess() -> None:
     assert proc.returncode == 2
     assert proc.stdout == b""
     assert proc.stderr.startswith(b"termctl: unrecognized arguments: \\xff\n")
+
+
+@pytest.mark.parametrize(
+    ("argv", "value", "json_value"),
+    [
+        ([b"\xff"], "'\\xff'", "'\\xff'"),
+        ([b"label", b"\xff"], "'\\xff'", "'\\xff'"),
+        # JSON string encoding escapes the ESC itself; only the undecodable byte is mapped.
+        ([b"open", b"--target", b"\xff\x1b", b"--", b"x"], "'\\xff\\x1b'", "'\\xff\x1b'"),
+    ],
+)
+@pytest.mark.parametrize("json_mode", [False, True])
+def test_undecodable_invalid_choice_subprocess(
+    argv: list[bytes], value: str, json_value: str, json_mode: bool
+) -> None:
+    proc = subprocess.run(
+        [sys.executable, "-m", "termctl", *([b"--json"] if json_mode else []), *argv],
+        capture_output=True,
+        timeout=30,
+        check=False,
+    )
+    assert proc.returncode == 2
+    stderr = proc.stderr.decode("utf-8", errors="strict")
+    assert "\\udc" not in stderr
+    assert stderr.startswith("termctl: argument ")
+    assert f"invalid choice: {value} (choose from " in stderr.splitlines()[0]
+    if json_mode:
+        message = json.loads(proc.stdout.decode("utf-8", errors="strict"))["error"]["message"]
+        assert "\\udc" not in message
+        assert f"invalid choice: {json_value} (choose from " in message
+    else:
+        assert proc.stdout == b""
 
 
 def test_json_output_maps_lone_surrogates(monkeypatch: pytest.MonkeyPatch) -> None:

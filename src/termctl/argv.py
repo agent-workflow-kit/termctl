@@ -32,7 +32,9 @@ class Scan:
     early_separator: bool
     """A ``--`` came before the command was complete."""
     help: argparse.ArgumentParser | None = None
-    """The parser that met the first ``-h``/``--help``, if one was given."""
+    """The parser that met the first ``-h``/``--help`` given without ``=VALUE``, if any."""
+    version: bool = False
+    """``--version`` was given without ``=VALUE``."""
 
     @property
     def complete(self) -> bool:
@@ -57,13 +59,14 @@ def scan(parser: argparse.ArgumentParser, raw: Sequence[str]) -> Scan:
     options: list[str] = []
     unknown: list[str] = []
     help_parser: argparse.ArgumentParser | None = None
+    version = False
     i = 0
     while i < len(tokens):
         token = tokens[i]
         if token == "--":
             args.extend(tokens[i:])
             early = bool(subcommands(parser))
-            return Scan(args, options, unknown, parser, early, help_parser)
+            return Scan(args, options, unknown, parser, early, help_parser, version)
         if _is_option(token):
             name = token.split("=", 1)[0]
             options.append(name)
@@ -71,8 +74,11 @@ def scan(parser: argparse.ArgumentParser, raw: Sequence[str]) -> Scan:
             if action is None:
                 # Short options are never clustered: `-hx` is unknown, not `-h -x`.
                 unknown.append(token)
-            elif name in ("-h", "--help") and help_parser is None:
+            elif token in ("-h", "--help") and help_parser is None:
+                # A flag that takes no value rejects `=VALUE`: argparse reports `-h=1`.
                 help_parser = parser
+            elif token == "--version":
+                version = True
             elif action.nargs != 0 and name == token and i + 1 < len(tokens):
                 # Only long options take values, so the `=` form is always available.
                 i += 1
@@ -81,4 +87,4 @@ def scan(parser: argparse.ArgumentParser, raw: Sequence[str]) -> Scan:
             parser = subcommands(parser).get(token, parser)
         args.append(token)
         i += 1
-    return Scan(args, options, unknown, parser, False, help_parser)
+    return Scan(args, options, unknown, parser, False, help_parser, version)
