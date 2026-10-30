@@ -2,7 +2,9 @@ from __future__ import annotations
 
 import io
 import json
+import math
 import os
+import socket
 import time
 from collections.abc import Iterator
 from pathlib import Path
@@ -16,6 +18,7 @@ from jsonschema import ValidationError as SchemaError
 from termctl import cli, config
 from termctl.cli import Context, Result, main
 from termctl.config import DEFAULTS, ENV_KEYS, Config, ConfigError, load
+from termctl.validate import show
 
 from .fakes import FakeClock, FakeGateway
 from .schemas import SCHEMAS, validate
@@ -273,6 +276,20 @@ def test_fifo_drop_in_is_not_a_regular_file(home: Path, dropins: Path) -> None:
     assert "not a regular file" in err.message
 
 
+def test_unix_socket_as_the_config_file_is_not_a_regular_file(
+    tmp_path: Path, monkeypatch: pytest.MonkeyPatch
+) -> None:
+    monkeypatch.chdir(tmp_path)  # bind a short relative name: socket paths are length-limited
+    with socket.socket(socket.AF_UNIX) as server:
+        try:
+            server.bind("s.yaml")
+        except OSError as exc:
+            pytest.skip(f"cannot bind a Unix socket: {exc}")
+        err = load_error({}, str(tmp_path / "s.yaml"))
+    assert err.details == {"file": str(tmp_path / "s.yaml")}
+    assert err.message.endswith(": not a regular file")
+
+
 @pytest.mark.parametrize("device", ["/dev/null", "/dev/zero"])
 def test_main_file_symlink_to_a_device_is_not_a_regular_file(
     home: Path, main_file: Path, device: str
@@ -505,6 +522,164 @@ def test_yaml_1_1_boolean_word_as_a_top_level_key_is_unknown(home: Path, main_fi
     write(main_file, "yes: 1\n")
     err = load_error({"HOME": str(home)})
     assert err.details == {"key": "yes"}
+
+
+def parse(text: str) -> Any:
+    """``text`` as the config loader reads it."""
+    return yaml.load(text, Loader=config._Loader)  # pyright: ignore[reportPrivateUsage]
+
+
+@pytest.mark.parametrize(
+    ("text", "expected"),
+    [
+        ("0", 0),
+        ("-1", -1),
+        ("+1", 1),
+        ("0o17", 15),
+        ("0x1F", 31),
+        ("017", 17),
+        ("!!int 017", 17),
+        ("!!int 0x1F", 31),
+    ],
+)
+def test_core_integers(text: str, expected: int) -> None:
+    value = parse(f"v: {text}\n")["v"]
+    assert type(value) is int and value == expected
+
+
+@pytest.mark.parametrize(
+    ("text", "expected"),
+    [
+        ("1.5", 1.5),
+        ("-1e3", -1000.0),
+        ("1.", 1.0),
+        (".5", 0.5),
+        (".inf", math.inf),
+        (".Inf", math.inf),
+        (".INF", math.inf),
+        ("+.inf", math.inf),
+        ("-.inf", -math.inf),
+        ("-.Inf", -math.inf),
+        ("!!float 1", 1.0),
+        ("!!float -.INF", -math.inf),
+    ],
+)
+def test_core_floats(text: str, expected: float) -> None:
+    value = parse(f"v: {text}\n")["v"]
+    assert type(value) is float and value == expected
+
+
+@pytest.mark.parametrize("text", [".nan", ".NaN", ".NAN", "!!float .nan"])
+def test_core_nans(text: str) -> None:
+    value = parse(f"v: {text}\n")["v"]
+    assert type(value) is float and math.isnan(value)
+
+
+@pytest.mark.parametrize(
+    ("text", "expected"),
+    [
+        ("true", True),
+        ("True", True),
+        ("TRUE", True),
+        ("false", False),
+        ("False", False),
+        ("FALSE", False),
+        ("!!bool True", True),
+    ],
+)
+def test_core_booleans(text: str, expected: bool) -> None:
+    assert parse(f"v: {text}\n")["v"] is expected
+
+
+@pytest.mark.parametrize("text", ["~", "null", "Null", "NULL", "", "!!null null", "!!null ''"])
+def test_core_nulls(text: str) -> None:
+    assert parse(f"v: {text}\n") == {"v": None}
+
+
+@pytest.mark.parametrize(
+    "text",
+    ["-.NaN", "+.nan", "tRuE", "yes", "1:30", "0x", "1_000", ".iNf", "nULL", "0b11", "1e", "+0x1"],
+)
+def test_other_scalars_stay_strings(text: str) -> None:
+    assert parse(f"v: {text}\n") == {"v": text}
+
+
+@pytest.mark.parametrize(
+    "text",
+    [
+        "!!int 1_000",
+        "!!int ' 12 '",
+        "!!int '\u0661\u0662'",
+        "!!int 0x_1F",
+        "!!int 1.0",
+        "!!float infinity",
+        "!!float 1_0",
+        "!!float .iNf",
+        "!!float ' 1.5'",
+        "!!bool tRuE",
+        "!!bool YES",
+        "!!null x",
+    ],
+)
+def test_tagged_scalars_must_have_their_core_form(home: Path, main_file: Path, text: str) -> None:
+    write(main_file, f"tmux_bin: {text}\n")
+    original = parse(f"v: !!str {text.split(' ', 1)[1]}\n")["v"]
+    err = load_error({"HOME": str(home)})
+    assert err.details == {"file": str(main_file), "line": 1, "column": 11}
+    assert err.message.endswith(show(original))
+
+
+def test_too_large_integer_is_reported_briefly(home: Path, main_file: Path) -> None:
+    write(main_file, f"hooks: {{pre-open: [{{cmd: x, timeout: {'9' * 5000}}}]}}\n")
+    err = load_error({"HOME": str(home)})
+    assert "integer too large" in err.message
+    assert len(err.message) < 300
+
+
+def test_long_invalid_tagged_scalar_is_shortened(home: Path, main_file: Path) -> None:
+    write(main_file, f"tmux_bin: !!int {'a' * 5000}\n")
+    err = load_error({"HOME": str(home)})
+    assert "(5000 characters)" in err.message
+    assert len(err.message) < 300
+
+
+@pytest.mark.parametrize(
+    "text",
+    [
+        "!!timestamp 2024-01-01",
+        "!!binary aGk=",
+        "!!set {a: null}",
+        "!!omap [{a: 1}]",
+        "!!pairs [{a: 1}]",
+        "!!merge x",
+        "!foo x",
+    ],
+)
+def test_tags_outside_the_core_schema_are_unsupported(
+    home: Path, main_file: Path, text: str
+) -> None:
+    write(main_file, f"tmux_bin: {text}\n")
+    err = load_error({"HOME": str(home)})
+    assert err.details == {"file": str(main_file), "line": 1, "column": 11}
+    assert "unsupported tag" in err.message
+
+
+@pytest.mark.parametrize(
+    ("text", "key"), [("!!merge x: 1\n", "x"), ("markers: {!!int 1: {text: x}}\n", "markers.1")]
+)
+def test_tagged_keys_get_a_hint_to_remove_the_tag(
+    home: Path, main_file: Path, text: str, key: str
+) -> None:
+    write(main_file, text)
+    err = load_error({"HOME": str(home)})
+    assert without_position(err.details) == {"file": str(main_file), "key": key}
+    assert "remove the tag" in err.message and "quote" not in err.message
+
+
+def test_untagged_integer_key_hint_says_an_int(home: Path, main_file: Path) -> None:
+    write(main_file, "markers: {1: {text: x}}\n")
+    err = load_error({"HOME": str(home)})
+    assert "read as an int," in err.message and "quote" in err.message
 
 
 # --- Unicode ------------------------------------------------------------------------------------

@@ -261,7 +261,30 @@ class _Rejected(yaml.MarkedYAMLError):
         self.key = key
 
 
-_STR_TAG = "tag:yaml.org,2002:str"
+_TAG_PREFIX = "tag:yaml.org,2002:"
+_STR_TAG = f"{_TAG_PREFIX}str"
+
+# The YAML 1.2 core schema's scalar forms, by tag: the implicit resolvers and the explicit-tag
+# constructors both match these (in full), so ``!!int`` accepts exactly what ``17`` resolves as.
+_CORE_FORMS = {
+    "bool": re.compile(r"true|True|TRUE|false|False|FALSE"),
+    "int": re.compile(r"[-+]?[0-9]+|0o[0-7]+|0x[0-9a-fA-F]+"),
+    "float": re.compile(
+        r"[-+]?(?:\.[0-9]+|[0-9]+(?:\.[0-9]*)?)(?:[eE][-+]?[0-9]+)?"
+        r"|[-+]?\.(?:inf|Inf|INF)|\.(?:nan|NaN|NAN)"
+    ),
+    "null": re.compile(r"~|null|Null|NULL|"),
+}
+_FIRST_CHARACTERS = {
+    "bool": "tTfF",
+    "int": "-+0123456789",
+    "float": "-+.0123456789",
+    "null": ["~", "n", "N", ""],
+}
+
+
+def _short_tag(tag: str) -> str:
+    return f"!!{tag.removeprefix(_TAG_PREFIX)}" if tag.startswith(_TAG_PREFIX) else tag
 
 
 def _is_merge_key(node: yaml.Node) -> bool:
@@ -269,9 +292,10 @@ def _is_merge_key(node: yaml.Node) -> bool:
     return isinstance(node, yaml.ScalarNode) and node.value == "<<" and node.style is None
 
 
-def _check_keys(root: yaml.Node) -> None:
+def _check_keys(root: yaml.Node, tagged: set[int]) -> None:
     """Every mapping key is a string, appears once, and is not a merge key (``<<``); the first
-    violation in document order is reported."""
+    violation in document order is reported. ``tagged`` holds the ids of explicitly tagged
+    nodes, whose hint is to remove the tag rather than to quote."""
     stack: list[tuple[yaml.Node, str]] = [(root, "")]
     while stack:
         node, path = stack.pop()
@@ -289,12 +313,15 @@ def _check_keys(root: yaml.Node) -> None:
                 text = key_node.value if isinstance(key_node, yaml.ScalarNode) else "?"
                 key = f"{path}.{text}" if path else text
                 if not isinstance(key_node, yaml.ScalarNode) or key_node.tag != _STR_TAG:
-                    kind = key_node.tag.rsplit(":", 1)[-1]
-                    raise _Rejected(
-                        f'{key}: the key is read as a {kind}, not a string; quote it ("{text}")',
-                        key_node.start_mark,
-                        key,
-                    )
+                    if id(key_node) in tagged:
+                        hint = f"the key is tagged {_short_tag(key_node.tag)}, not a string;"
+                        hint += " remove the tag"
+                    else:
+                        kind = key_node.tag.rsplit(":", 1)[-1]
+                        article = "an" if kind[:1] in ("a", "e", "i", "o", "u") else "a"
+                        hint = f"the key is read as {article} {kind}, not a string;"
+                        hint += f" quote it ({validate.show(text)})"
+                    raise _Rejected(f"{key}: {hint}", key_node.start_mark, key)
                 if text in seen:
                     raise _Rejected(f"{key}: duplicate key", key_node.start_mark, key)
                 seen.add(text)
@@ -302,67 +329,80 @@ def _check_keys(root: yaml.Node) -> None:
             stack.extend(reversed(values))
 
 
+def _core_scalar(loader: yaml.SafeLoader, node: yaml.ScalarNode, kind: str, what: str) -> str:
+    """The text of ``node``, which must be the core schema's form of ``kind``."""
+    value = loader.construct_scalar(node)
+    if not _CORE_FORMS[kind].fullmatch(value):
+        raise _Rejected(f"not {what}: {validate.show(value)}", node.start_mark)
+    return value
+
+
 def _construct_bool(loader: yaml.SafeLoader, node: yaml.ScalarNode) -> bool:
-    value = loader.construct_scalar(node).lower()
-    if value not in ("true", "false"):
-        raise _Rejected(f"not a boolean (use true or false): {value!r}", node.start_mark)
-    return value == "true"
+    return _core_scalar(loader, node, "bool", "a boolean (use true or false)").lower() == "true"
 
 
 def _construct_int(loader: yaml.SafeLoader, node: yaml.ScalarNode) -> int:
-    value = loader.construct_scalar(node)
+    value = _core_scalar(loader, node, "int", "an integer")
     try:
         return int(value, 0) if value[:2] in ("0o", "0x") else int(value, 10)
-    except ValueError:
-        raise _Rejected(f"not an integer: {value!r}", node.start_mark) from None
+    except ValueError:  # more digits than Python converts
+        raise _Rejected(f"integer too large: {validate.show(value)}", node.start_mark) from None
 
 
 def _construct_float(loader: yaml.SafeLoader, node: yaml.ScalarNode) -> float:
-    value = loader.construct_scalar(node)
-    special = {".inf": "inf", "+.inf": "inf", "-.inf": "-inf", ".nan": "nan"}
-    try:
-        return float(special.get(value.lower(), value))
-    except ValueError:
-        raise _Rejected(f"not a number: {value!r}", node.start_mark) from None
+    value = _core_scalar(loader, node, "float", "a number").lower()
+    # Python reads "inf", "+inf", "-inf" and "nan" but not YAML's leading dot.
+    return float(value.replace(".inf", "inf").replace(".nan", "nan"))
+
+
+def _construct_null(loader: yaml.SafeLoader, node: yaml.ScalarNode) -> None:
+    _core_scalar(loader, node, "null", "null (use ~, null or nothing)")
+
+
+def _unsupported(loader: yaml.SafeLoader, node: yaml.Node) -> Any:
+    raise _Rejected(f"unsupported tag {validate.show(_short_tag(node.tag))}", node.start_mark)
 
 
 class _Loader(yaml.SafeLoader):
     """``SafeLoader`` with the YAML 1.2 core schema's scalars (so ``yes``, ``on``, ``017`` and
-    ``1:30`` are not special), without anchors, aliases or merge keys (they enable exponential
-    blow-up and config files need none), with string keys only and no duplicate keys."""
+    ``1:30`` are not special) and tags (so no ``!!timestamp``, ``!!binary``, ``!!set``...),
+    without anchors, aliases or merge keys (they enable exponential blow-up and config files
+    need none), with string keys only and no duplicate keys."""
 
-    # Only the core schema's implicit types (added below).
+    # Only the core schema's implicit types and tags (added below).
     yaml_implicit_resolvers: dict[Any, Any] = {}  # noqa: RUF012 (PyYAML's class attribute)
+    yaml_constructors: dict[Any, Any] = {  # noqa: RUF012 (PyYAML's class attribute)
+        f"{_TAG_PREFIX}{kind}": yaml.SafeLoader.yaml_constructors[f"{_TAG_PREFIX}{kind}"]
+        for kind in ("str", "seq", "map")
+    } | {None: _unsupported}
+
+    def __init__(self, stream: str) -> None:
+        super().__init__(stream)
+        self.tagged: set[int] = set()
 
     def compose_node(self, parent: yaml.Node | None, index: Any) -> yaml.Node | None:
         event = self.peek_event()
         if isinstance(event, yaml.AliasEvent) or getattr(event, "anchor", None) is not None:
             raise _Rejected("anchors and aliases are not allowed", event.start_mark)
-        return super().compose_node(parent, index)  # pyright: ignore[reportUnknownMemberType]
+        node = super().compose_node(parent, index)  # pyright: ignore[reportUnknownMemberType]
+        if getattr(event, "tag", None) not in (None, "!"):
+            self.tagged.add(id(node))
+        return node
 
     def construct_document(self, node: yaml.Node) -> Any:
-        _check_keys(node)
+        _check_keys(node, self.tagged)
         return super().construct_document(node)  # pyright: ignore[reportUnknownMemberType]
 
 
-_CORE_RESOLVERS = [
-    ("bool", r"true|True|TRUE|false|False|FALSE", "tTfF"),
-    ("int", r"[-+]?[0-9]+|0o[0-7]+|0x[0-9a-fA-F]+", "-+0123456789"),
-    (
-        "float",
-        r"[-+]?(?:\.[0-9]+|[0-9]+(?:\.[0-9]*)?)(?:[eE][-+]?[0-9]+)?"
-        r"|[-+]?\.(?:inf|Inf|INF)|\.(?:nan|NaN|NAN)",
-        "-+.0123456789",
-    ),
-    ("null", r"~|null|Null|NULL|", ["~", "n", "N", ""]),
-]
-for _kind, _pattern, _first in _CORE_RESOLVERS:
+for _kind, _pattern in _CORE_FORMS.items():
+    _tag = f"{_TAG_PREFIX}{_kind}"
     _Loader.add_implicit_resolver(  # pyright: ignore[reportUnknownMemberType]
-        f"tag:yaml.org,2002:{_kind}", re.compile(f"^(?:{_pattern})$"), list(_first)
+        _tag, re.compile(rf"^(?:{_pattern.pattern})\Z"), list(_FIRST_CHARACTERS[_kind])
     )
-_Loader.add_constructor("tag:yaml.org,2002:bool", _construct_bool)  # pyright: ignore[reportUnknownMemberType]
-_Loader.add_constructor("tag:yaml.org,2002:int", _construct_int)  # pyright: ignore[reportUnknownMemberType]
-_Loader.add_constructor("tag:yaml.org,2002:float", _construct_float)  # pyright: ignore[reportUnknownMemberType]
+_Loader.add_constructor(f"{_TAG_PREFIX}bool", _construct_bool)  # pyright: ignore[reportUnknownMemberType]
+_Loader.add_constructor(f"{_TAG_PREFIX}int", _construct_int)  # pyright: ignore[reportUnknownMemberType]
+_Loader.add_constructor(f"{_TAG_PREFIX}float", _construct_float)  # pyright: ignore[reportUnknownMemberType]
+_Loader.add_constructor(f"{_TAG_PREFIX}null", _construct_null)  # pyright: ignore[reportUnknownMemberType]
 
 
 def _yaml_error(path: Path, exc: yaml.YAMLError) -> ConfigError:
@@ -401,9 +441,12 @@ def _cannot_read(path: Path, reason: str) -> ConfigError:
 
 
 def _read_bytes(path: Path) -> bytes:
-    """The contents of ``path``, which must be a regular file (after symlinks). Opened without
-    blocking, so a FIFO is reported rather than waited on."""
-    fd = os.open(path, os.O_RDONLY | os.O_NONBLOCK | os.O_CLOEXEC)
+    """The contents of ``path``, which must be a regular file (after symlinks). Checked before
+    opening (so a socket or device is never opened) and again after (in case it was replaced);
+    opened without blocking or taking a controlling terminal, so a FIFO is never waited on."""
+    if not stat.S_ISREG(os.stat(path).st_mode):
+        raise _cannot_read(path, "not a regular file")
+    fd = os.open(path, os.O_RDONLY | os.O_NONBLOCK | os.O_NOCTTY | os.O_CLOEXEC)
     try:
         if not stat.S_ISREG(os.fstat(fd).st_mode):
             raise _cannot_read(path, "not a regular file")
