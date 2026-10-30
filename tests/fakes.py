@@ -14,10 +14,21 @@ class FakeGateway:
     """
 
     def __init__(
-        self, responses: Mapping[tuple[str, ...], subprocess.CompletedProcess[str]] | None = None
+        self,
+        responses: Mapping[tuple[str, ...], subprocess.CompletedProcess[str]] | None = None,
+        *,
+        cwd: str | None = "/",
+        dirs: set[str] | None = None,
+        tty: bool = False,
+        user: str | None = "user",
     ) -> None:
         self.responses = dict(responses or {})
         self.calls: list[list[str]] = []
+        self.cwd = cwd
+        self.dirs = set(dirs or ())
+        self.tty = tty
+        self.user = user
+        self.dir_checks: list[str] = []
 
     def run(
         self,
@@ -32,6 +43,21 @@ class FakeGateway:
             return self.responses[tuple(argv)]
         except KeyError:
             raise AssertionError(f"unexpected gateway call: {argv!r}") from None
+
+    def current_dir(self) -> str:
+        if self.cwd is None:
+            raise FileNotFoundError("current directory removed")
+        return self.cwd
+
+    def is_dir(self, path: str) -> bool:
+        self.dir_checks.append(path)
+        return path in self.dirs
+
+    def stdin_isatty(self) -> bool:
+        return self.tty
+
+    def user_name(self) -> str | None:
+        return self.user
 
 
 class FakeClock:

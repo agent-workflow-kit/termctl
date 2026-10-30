@@ -1,0 +1,1 @@
+{"error": {"code": "ambiguous", "message": "'abcd' matches 2 managed panes", "candidates": [{"id": "tc-abcdefgh", "pane_id": "%1", "session": "termctl"}, {"id": "tc-abcdxxxx", "pane_id": "%2", "session": "work"}]}}

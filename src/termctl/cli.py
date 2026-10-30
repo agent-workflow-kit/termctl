@@ -14,7 +14,7 @@ from collections.abc import Mapping, Sequence
 from dataclasses import dataclass, field
 from typing import Any, NoReturn, TextIO
 
-from . import __version__
+from . import __version__, validate
 from .errors import TermctlError, UsageError
 from .gateway import Clock, Gateway, SystemClock, SystemGateway
 
@@ -349,7 +349,7 @@ def check_tmux(args: argparse.Namespace, ctx: Context) -> None:
 
 def resolve_id(args: argparse.Namespace, ctx: Context) -> None:
     """Step 4: resolve the id to one managed pane (exit 10 or 21)."""
-    # TODO: id resolution - issues #4 and #11
+    # TODO: read the managed panes (issue #11) and pick one with ids.resolve - issue #12
 
 
 def run_command(args: argparse.Namespace, ctx: Context) -> Result:
@@ -361,6 +361,7 @@ def run_command(args: argparse.Namespace, ctx: Context) -> Result:
 def dispatch(args: argparse.Namespace, ctx: Context) -> Result:
     """Run the check order after the flag-level usage checks; stop at the first failure."""
     spec = COMMANDS[args.command]
+    validate.check_args(args)
     load_config(args, ctx)
     if spec.uses_tmux:
         resolve_server(args, ctx)
