@@ -41,10 +41,12 @@ MAX_LABELS = 32
 MAX_ENV = 32
 MAX_DECISION_IDS = 32
 DURATION_MAX_MS = 600_000
+# The most characters of a value ``show`` prints before cutting it.
+SHOW_LIMIT = 64
 _UNIT_MS = {"ms": 1, "s": 1000, "m": 60_000, None: 1000}
 
 
-def show(value: str, limit: int = 64) -> str:
+def show(value: str, limit: int = SHOW_LIMIT) -> str:
     """``value`` quoted for a message: control characters escaped, overlong input cut."""
     if len(value) > limit:
         return f"'{escape(value[:limit])}'... ({len(value)} characters)"

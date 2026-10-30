@@ -567,7 +567,9 @@ def _check_unicode(data: Any, path: tuple[int | str, ...] = ()) -> None:
 
 
 def _key_error(key: str, message: str) -> ConfigError:
-    return ConfigError(f"invalid config: {key}: {message}", key=key)
+    """An error at ``key``; an empty or overlong key is quoted (and cut) so the message reads."""
+    shown = validate.show(key) if not key or len(key) > validate.SHOW_LIMIT else key
+    return ConfigError(f"invalid config: {shown}: {message}", key=key)
 
 
 def _env_adapter(key: str) -> TypeAdapter[Any]:

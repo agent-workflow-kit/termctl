@@ -295,6 +295,29 @@ def test_config_file_over_the_size_cap_is_too_large(home: Path, main_file: Path)
     assert "too large" in err.message and str(main_file) in err.message
 
 
+def test_huge_config_file_is_read_at_most_one_byte_past_the_cap(
+    home: Path, main_file: Path, monkeypatch: pytest.MonkeyPatch
+) -> None:
+    with main_file.open("wb") as file:
+        file.truncate(1024**3)  # sparse 1 GiB: nothing is written
+    sizes: list[int] = []
+
+    class Recording(io.BufferedReader):
+        def read(self, size: int | None = -1, /) -> bytes:
+            sizes.append(-1 if size is None else size)
+            # Fail before an unbounded read pulls the whole gigabyte into memory.
+            assert size is not None and 0 <= size <= config.MAX_FILE_SIZE + 1
+            return super().read(size)
+
+    def recording_open(fd: int, mode: str, closefd: bool = True) -> io.BufferedReader:
+        return Recording(io.FileIO(fd, mode, closefd=closefd))
+
+    monkeypatch.setattr(config, "open", recording_open, raising=False)
+    err = load_error({"HOME": str(home)})
+    assert "too large" in err.message
+    assert sizes
+
+
 def test_drop_in_over_the_size_cap_is_too_large(home: Path, dropins: Path) -> None:
     dropins.mkdir()
     big = dropins / "a.yaml"
@@ -551,6 +574,22 @@ def test_yaml_1_1_boolean_word_as_a_top_level_key_is_unknown(home: Path, main_fi
     write(main_file, "yes: 1\n")
     err = load_error({"HOME": str(home)})
     assert err.details == {"key": "yes"}
+
+
+def test_empty_unknown_top_level_key_is_quoted(home: Path, main_file: Path) -> None:
+    write(main_file, "'': 1\n")
+    err = load_error({"HOME": str(home)})
+    assert err.details == {"key": ""}
+    assert err.message.startswith("invalid config: '': ")
+
+
+def test_overlong_unknown_top_level_key_is_cut(home: Path, main_file: Path) -> None:
+    key = "k" * 300
+    write(main_file, f"{key}: 1\n")
+    err = load_error({"HOME": str(home)})
+    assert err.details == {"key": key}
+    assert err.message.startswith(f"invalid config: {show(key)}: ")
+    assert key not in err.message
 
 
 def parse(text: str) -> Any:
