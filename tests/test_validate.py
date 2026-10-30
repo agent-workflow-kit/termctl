@@ -3,7 +3,7 @@
 from __future__ import annotations
 
 import json
-from collections.abc import Callable
+from collections.abc import Callable, Iterator
 from typing import Any
 
 import pytest
@@ -683,8 +683,27 @@ def test_config_schema_shared_definitions_equal_defs() -> None:
         assert config_defs[name] == defs[name], name
 
 
+def iter_refs(node: object) -> Iterator[object]:
+    """Every ``$ref`` value found anywhere inside ``node``."""
+    if isinstance(node, dict):
+        for key, value in node.items():
+            if key == "$ref":
+                yield value
+            else:
+                yield from iter_refs(value)
+    elif isinstance(node, list):
+        for item in node:
+            yield from iter_refs(item)
+
+
 def test_config_schema_is_standalone() -> None:
-    assert "defs.json" not in CONFIG_PATH.read_text(encoding="utf-8")
+    text = CONFIG_PATH.read_text(encoding="utf-8")
+    assert "defs.json" not in text
+    contents = json.loads(text)
+    local_prefix = "#/$defs/"
+    for ref in iter_refs(contents):
+        assert isinstance(ref, str) and ref.startswith(local_prefix), ref
+        assert ref[len(local_prefix) :] in contents["$defs"], ref
 
 
 @pytest.mark.parametrize(
