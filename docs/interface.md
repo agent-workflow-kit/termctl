@@ -222,7 +222,7 @@ Every command checks in this order and stops at the first failure:
 
 **Dry runs.** `open`, `close`, `focus`, `rename`, `mark`, `unmark`, `label add` and `label remove` accept `--dry-run`: the command makes its checks (read-only tmux queries included) and exits as a real run would, but runs no hooks, changes nothing, writes no log or audit record, and prints what would change. For `rename`, `mark`, `unmark` and the label commands that is the pane object as it would be afterwards, with `dry_run: true` and `display_name` as in [Names](#names).
 
-**Human output.** Each command's human-mode output is stated below; messages and warnings go to stderr. In human mode, every string that comes from tmux (for example a window, session or client name), from a hook (including `hook_stderr`) or from a pane option is printed, on stdout and stderr alike, with each C0, DEL and C1 control character escaped as `\xNN` (its code point in hex), so it cannot drive the user's terminal. `--json` output is not escaped this way; JSON string encoding already escapes C0 and DEL, and a consumer that displays a string escapes it itself.
+**Human output.** Each command's human-mode output is stated below; messages and warnings go to stderr. All human output, on stdout and stderr alike, is printed with each C0, DEL and C1 control character escaped as `\xNN` (its code point in two lowercase hex digits; line breaks between lines of output are kept), so no string from tmux (for example a window, session or client name), a hook (including `hook_stderr`), a pane option or the caller's own arguments echoed in a message (for example an unrecognized argument) can drive the user's terminal. This applies to every message, warning, usage line and help text, in `--json` mode too for what goes to stderr. `--json` output is not escaped this way; JSON string encoding already escapes C0 and DEL, and a consumer that displays a string escapes it itself.
 
 ### `open`
 
@@ -234,7 +234,7 @@ termctl open [--name NAME] [--cwd DIR] [--env VAR=value]... [--label k=v]...
              [--hook NAME=CMD]... [-- ARGV...]
 ```
 
-Opens a managed pane by the rules in [Open order](#open-order). Human output: the id. `--json`: the pane object with `focused` and `decision_ids` added (`schemas/cli/open.json`); `state` may also be `gone`, and then `pid`, `exit_status` and `exit_signal` are null and `pane_id`, `window_id`, `display_name` and `session` are the last known values.
+Opens a managed pane by the rules in [Open order](#open-order). `ARGV` must follow `--`, and everything after the first `--` is argv verbatim (later `--` and flags included); argv without `--`, or a `--` with nothing after it, exits 2. Human output: the id. `--json`: the pane object with `focused` and `decision_ids` added (`schemas/cli/open.json`); `state` may also be `gone`, and then `pid`, `exit_status` and `exit_signal` are null and `pane_id`, `window_id`, `display_name` and `session` are the last known values.
 
 - `--cwd DIR`: a relative `DIR` is resolved against the caller's current directory.
 - `--session SESSION`: a session name (`^[A-Za-z0-9_-]{1,64}$`, exit 2 otherwise); overrides the placement's session.
@@ -310,7 +310,7 @@ Exit 0, 1, 2, 10, 11, 12, 13, 20, 21.
 
 ### `label add` / `label remove`
 
-`termctl label add <id> k=v... [--dry-run]` and `termctl label remove <id> k=v... [--dry-run]` edit the pane's labels ([Labels](#labels)); at least one pair is required (exit 2). A call that changes nothing has `changed: false` and writes no log record. Human output: the pane's labels, space-separated. `--json`: the pane object with `changed`, `display_updated` (always false) and `dry_run` (`schemas/cli/label-add.json`, `schemas/cli/label-remove.json`: `schemas/cli/pane-change.json` with `display_updated: false`). Exit 0, 1, 2, 10, 12 (`locked` too), 21.
+`termctl label add <id> k=v... [--dry-run]` and `termctl label remove <id> k=v... [--dry-run]` edit the pane's labels ([Labels](#labels)); at least one pair is required (exit 2). The pairs are contiguous: an option between two pairs (`label add <id> a=b --dry-run c=d`) exits 2. A call that changes nothing has `changed: false` and writes no log record. Human output: the pane's labels, space-separated. `--json`: the pane object with `changed`, `display_updated` (always false) and `dry_run` (`schemas/cli/label-add.json`, `schemas/cli/label-remove.json`: `schemas/cli/pane-change.json` with `display_updated: false`). Exit 0, 1, 2, 10, 12 (`locked` too), 21.
 
 ### `placements`
 
@@ -318,16 +318,19 @@ Exit 0, 1, 2, 10, 11, 12, 13, 20, 21.
 
 ## Global flags
 
-Global flags may come before or after the subcommand, never after `--`. A `--` may also precede positional arguments, for example `rename <id> -- -name`.
+Global flags may come before or after the subcommand, never after `--`. A `--` may also precede positional arguments, for example `rename <id> -- -name`; a `--` before the subcommand (`termctl -- list`) exits 2, in human mode.
+
+An option that takes a value always consumes the next token as its value, even one that begins with `-` (getopt semantics): `open --name -x -- ls` names the pane `-x`, and in `open --name --json -- ls` the name is `--json` and JSON output is not selected. `--opt=value` is equivalent. Only tokens before the first `--` that are not such values count as flags, for `--json` and `--version` as for the rest.
 
 | Flag | Meaning |
 |---|---|
-| `--json` | machine output (schemas in `schemas/cli/`); errors as `{"error": {...}}` on stdout ([Errors](#errors)) |
+| `--json` | machine output (schemas in `schemas/cli/`); errors as `{"error": {...}}` on stdout ([Errors](#errors)), usage errors included |
 | `--socket NAME\|PATH` | the tmux server ([Server selection](#server-selection)) |
 | `--config PATH` | config file instead of `~/.config/termctl/config.yaml` (drop-ins are read from the `config.d/` next to it) |
 | `--verbose` | also writes each tmux command termctl runs to stderr, with `--env` values replaced by their names |
 | `--quiet` | suppresses all stderr output except errors; with `--verbose`, exit 2 |
-| `--version` | prints the version and exits 0 |
+| `--version` | prints `termctl <version>` and exits 0. `--version` anywhere before `--` does so before any other check: other flags, `--help` and usage errors are ignored |
+| `-h`, `--help` | prints the help of the command it is given to (termctl's own before a subcommand) on stdout and exits 0; human-readable only, `--json` is ignored |
 
 ## Exit codes
 
@@ -347,7 +350,7 @@ termctl defines no tool-specific codes (22+).
 
 ## Errors
 
-With `--json`, every non-zero exit prints `{"error": {...}}` on stdout (`schemas/cli/error.json`), except `exists` exiting 10, which prints its normal output. Messages go to stderr in human mode, with untrusted strings escaped (**Human output** in [Commands](#commands)).
+With `--json`, every non-zero exit prints `{"error": {...}}` on stdout (`schemas/cli/error.json`), except `exists` exiting 10, which prints its normal output; the error object is written first, then the message to stderr. Messages go to stderr in both modes, escaped (**Human output** in [Commands](#commands)); in human mode a usage error also prints the usage of the command it concerns. A failure to write stdout or stderr (a closed descriptor, a pipe with no reader) never changes the exit code.
 
 | Field | Present |
 |---|---|
