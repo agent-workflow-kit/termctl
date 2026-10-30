@@ -610,6 +610,88 @@ def test_guard_target_spoofs_are_refused() -> None:
         command("kill-pane").flag("-t")
 
 
+def test_guard_builds_every_guarded_sequence_of_the_spec() -> None:
+    # interface.md rule 5 and close/Open order: kill-pane, rename-window, set -p, respawn-pane,
+    # and display -p of termctl's own format (close --force).
+    guard, cond, pane5 = tb.pane("%5"), tb.owned(ID), tb.pane("%5")
+    inners = [
+        command("kill-pane").target(pane5).build(),
+        command("rename-window").target(tb.window("@2")).name("n").build(),
+        command("rename-window").target(pane5).name("n").build(),
+        command("set-option").flag("-p").target(pane5).arg("@a").arg("1").build(),
+        command("set").flag("-p").target(pane5).arg("@a").arg("1").build(),
+        command("set-option").flag("-p").flag("-u").target(pane5).arg("@a").build(),
+        command("respawn-pane")
+        .flag("-k")
+        .option("-c", "/tmp")
+        .target(pane5)
+        .env("V", "v")
+        .arg("/usr/bin/env")
+        .arg("--")
+        .arg("sleep")
+        .arg("30")
+        .build(),
+        command("display").flag("-p").target(pane5).format_arg(tb.fields("pane_pid")).build(),
+        command("display-message")
+        .flag("-p")
+        .target(pane5)
+        .format_arg(tb.fields("pane_pid"))
+        .build(),
+    ]
+    for inner in inners:
+        assert tb.guarded(guard, cond, inner).guarded
+    assert tb.guarded(guard, cond, inners[-2], inners[0]).guarded
+
+
+@pytest.mark.parametrize(
+    "inner",
+    [
+        # Acting on panes or windows other than the guarded pane (review round 2, R2-2).
+        command("kill-pane").flag("-a").target(tb.pane("%5")).build(),
+        command("kill-window").target(tb.window("@1")).build(),
+        command("kill-window").target(tb.pane("%5")).build(),
+        command("swap-pane").option("-s", "%7").target(tb.pane("%5")).build(),
+        command("respawn-window").flag("-k").target(tb.window("@1")).build(),
+        command("new-window").target(tb.pane("%5")).build(),
+        # A window target is for rename-window only.
+        command("kill-pane").target(tb.window("@1")).build(),
+        command("set-option").flag("-p").target(tb.window("@1")).arg("@a").arg("1").build(),
+        command("display").flag("-p").target(tb.window("@1")).format_arg(tb.fields("a")).build(),
+        command("respawn-pane").flag("-k").target(tb.window("@1")).build(),
+        # set only at pane scope: not global, server, window or session options.
+        command("set-option").target(tb.pane("%5")).arg("@a").arg("1").build(),
+        command("set-option").flag("-g").target(tb.pane("%5")).arg("@a").arg("1").build(),
+        command("set-option").flag("-w").target(tb.pane("%5")).arg("@a").arg("1").build(),
+        command("set-option").flag("-p").flag("-g").target(tb.pane("%5")).arg("@a").build(),
+        command("set").server_scope().flag("-p").target(tb.pane("%5")).arg("@a").build(),
+        command("set-option").flag("-p").flag("-a").target(tb.pane("%5")).arg("@a").build(),
+        # -a and -s refused on any inner command, as a flag or an option.
+        command("respawn-pane").flag("-a").target(tb.pane("%5")).build(),
+        command("display").option("-s", "x").flag("-p").target(tb.pane("%5")).build(),
+        command("rename-window").flag("-a").target(tb.window("@1")).name("n").build(),
+    ],
+    ids=lambda c: " ".join(c.elements),
+)
+def test_guard_refuses_inner_commands_that_act_outside_the_pane(inner: Command) -> None:
+    with pytest.raises(ValueError):
+        tb.guarded(tb.pane("%5"), tb.owned(ID), inner)
+
+
+def test_a_command_records_its_flags() -> None:
+    cmd = (
+        command("respawn-pane")
+        .flag("-k")
+        .option("-c", "-a")
+        .target(tb.pane("%5"))
+        .env("V", "-s")
+        .arg("-g")
+        .build()
+    )
+    assert cmd.flags == ("-k", "-c", "-t", "-e")
+    # An option value or positional that looks like a flag is data, not a flag.
+    assert tb.guarded(tb.pane("%5"), tb.owned(ID), cmd).guarded
+
+
 def test_guard_accepts_an_option_value_double_dash_before_the_target() -> None:
     inner = command("respawn-pane").option("-c", "--").target(tb.pane("%5")).build()
     assert tb.guarded(tb.pane("%5"), tb.owned(ID), inner).argv[6] == (
@@ -662,18 +744,30 @@ def test_guard_cannot_nest_guards() -> None:
         ("a\n  b", "'a'\\n'  b'"),
         ("a\\\nb", "'a\\'\\n'b'"),
         ("a\n#x", "'a'\\n'#x'"),
+        # Byte 0xff (os.fsdecode's "\udcff") ends tmux's parse even inside quotes; "\377"
+        # outside the quotes is that byte (review round 2, R2-1).
+        ("a\udcffb", "'a'\\377'b'"),
+        ("\udcff", "''\\377''"),
+        ("a\udcff; set -g @pwned 1", "'a'\\377'; set -g @pwned 1'"),
+        ("\udcff\n\udcff", "''\\377''\\n''\\377''"),
+        # Other undecodable bytes stay inside the quotes.
+        ("\udc80\udcc3;\udcfe", "'\udc80\udcc3;\udcfe'"),
     ],
 )
-def test_quote_writes_newlines_as_escapes_outside_the_quotes(value: str, expected: str) -> None:
+def test_quote_writes_newlines_and_0xff_as_escapes_outside_the_quotes(
+    value: str, expected: str
+) -> None:
     # tmux's parser drops "\" + newline anywhere, and blanks and "#..." comments after a
     # newline even inside quotes; "\n" outside quotes is a newline (spike F5). The real-tmux
     # round trips are in test_tmux_integration.py.
     assert tb.quote(value) == expected
 
 
-@pytest.mark.parametrize("value", HOSTILE)
-def test_quote_leaves_no_raw_newline(value: str) -> None:
-    assert "\n" not in tb.quote(value)
+@pytest.mark.parametrize("value", [*HOSTILE, "\udcff", "a\udcff\udcffb\udcff"])
+def test_quote_leaves_no_raw_newline_or_0xff(value: str) -> None:
+    quoted = tb.quote(value)
+    assert "\n" not in quoted
+    assert "\udcff" not in quoted
 
 
 def _result(rc: int, stdout: str) -> subprocess.CompletedProcess[str]:
@@ -809,6 +903,21 @@ def test_runner_maps_an_exec_failure_to_tmux_missing() -> None:
 def test_runner_refuses_a_relative_binary() -> None:
     with pytest.raises(ValueError):
         Tmux(FakeGateway(), "tmux", SOCK, env={})
+
+
+def test_format_cannot_be_forged_with_replace() -> None:
+    # Review round 2, R2-3: replace() would otherwise copy the factory key.
+    with pytest.raises(TypeError):
+        dataclasses.replace(tb.fields("a"), text="#(touch /tmp/x)")
+    with pytest.raises(TypeError):
+        Format("#(touch /tmp/x)", tb._FORMAT_KEY)  # type: ignore[call-arg]
+    with pytest.raises(TypeError):
+        Format(text="#{pane_id}")
+
+
+def test_formats_compare_by_text() -> None:
+    assert tb.fields("a") == tb.fields("a")
+    assert tb.fields("a").text == "#{a}"
 
 
 def test_command_is_immutable() -> None:

@@ -7,6 +7,7 @@ builder; the server is inspected with ``raw`` tmux calls, the oracle.
 
 from __future__ import annotations
 
+import os
 import time
 from pathlib import Path
 
@@ -445,6 +446,85 @@ def test_f5_guarded_argv_and_env_values_round_trip(tmux_server: TmuxServer, valu
     assert wait_for(out.exists)
     assert out.read_bytes().decode().split("\0")[:-1] == [value, value, value + ";"]
     assert tmux_server.raw("show-options", "-g", "-q", "-v", "@pwned").stdout == ""
+
+
+# Every byte through a guard (review round 2, R2-1). Byte 0xff ends tmux's parse even inside
+# quotes, so quote() writes it as "\377" outside them; every other byte stays quoted. Each byte
+# is tried in the middle, alone, at the end and before an injection attempt, plus invalid UTF-8
+# built from valid lead bytes (an overlong "\xc0\xbb" is ";" to a lax decoder). Values reach
+# the builder as os.fsdecode strings, the way undecodable caller bytes arrive.
+BYTE_CHUNKS = [range(low, min(low + 32, 256)) for low in range(1, 256, 32)]
+INVALID_UTF8 = [
+    b"\xc3;", b"\xc3", b"\xe2\x80", b"\xe2\x80;", b"\xc0\xbb", b"\xf0\x9f\x94", b"\xed\xa0\x80",
+    b"\xc3\xff;", b"\xff\xff", b"\xff\n\xff", b"\xff'\xff",
+]  # fmt: skip
+SEQUENCES = [[bytes([b]) for b in chunk] for chunk in BYTE_CHUNKS] + [INVALID_UTF8]
+SEQUENCE_IDS = [f"0x{c[0]:02x}-0x{c[-1]:02x}" for c in BYTE_CHUNKS] + ["invalid-utf8"]
+
+
+def _forms(sequence: bytes) -> list[bytes]:
+    injection = b"a" + sequence + b"; set -g @pwned 1"
+    return [b"a" + sequence + b"b", sequence, b"a" + sequence, injection]
+
+
+def _pane_option_bytes(server: TmuxServer, pane_id: str, name: str) -> bytes:
+    result = server.raw_bytes("show-options", "-p", "-q", "-v", "-t", pane_id, name)
+    assert result.returncode == 0, result.stderr
+    return result.stdout
+
+
+@pytest.mark.parametrize("sequences", SEQUENCES, ids=SEQUENCE_IDS)
+def test_f5_every_byte_round_trips_in_a_guarded_option_value(
+    tmux_server: TmuxServer, sequences: list[bytes]
+) -> None:
+    pane_id = tmux_server.start()
+    _tag(tmux_server, pane_id)
+    for form in (f for s in sequences for f in _forms(s)):
+        value = os.fsdecode(form)
+        cmd = tb.guarded(tb.pane(pane_id), tb.owned(ID), _set_pane(pane_id, "@v", value))
+        assert _guard(tmux_server, cmd) is GuardOutcome.MATCHED, form
+        # The oracle: the same value set unguarded as a plain argument, which no parser sees
+        # (tmux escapes some bytes when printing an option, the same way for both).
+        oracle = tmux_server.raw_bytes(
+            "set-option", "-p", "-t", pane_id, "@w", tb.escape_separator(value)
+        )
+        assert oracle.returncode == 0, oracle.stderr
+        expected = _pane_option_bytes(tmux_server, pane_id, "@w")
+        assert expected, form
+        assert _pane_option_bytes(tmux_server, pane_id, "@v") == expected, form
+        assert tmux_server.raw("show-options", "-g", "-q", "-v", "@pwned").stdout == "", form
+
+
+@pytest.mark.parametrize("sequences", SEQUENCES, ids=SEQUENCE_IDS)
+def test_f5_every_byte_round_trips_in_guarded_argv_and_env(
+    tmux_server: TmuxServer, sequences: list[bytes]
+) -> None:
+    pane_id, _ = _new_window_in_started(tmux_server)
+    _tag(tmux_server, pane_id)
+    out = tmux_server.root / "out"
+    script = 'printf "%s\\0" "$V" "$@" > "$0.tmp" && mv "$0.tmp" "$0"; exec sleep 600'
+    for sequence in sequences:
+        forms = _forms(sequence)
+        out.unlink(missing_ok=True)
+        respawn = (
+            command("respawn-pane")
+            .flag("-k")
+            .target(tb.pane(pane_id))
+            .env("V", os.fsdecode(forms[-1]))
+            .arg("/usr/bin/env")
+            .arg("--")
+            .arg("/bin/sh")
+            .arg("-c")
+            .arg(script)
+            .arg(str(out))
+        )
+        for form in forms:
+            respawn.arg(os.fsdecode(form))
+        guarded = tb.guarded(tb.pane(pane_id), tb.owned(ID), respawn.build())
+        assert _guard(tmux_server, guarded) is GuardOutcome.MATCHED, sequence
+        assert wait_for(out.exists), sequence
+        assert out.read_bytes().split(b"\0")[:-1] == [forms[-1], *forms], sequence
+        assert tmux_server.raw("show-options", "-g", "-q", "-v", "@pwned").stdout == "", sequence
 
 
 def _new_window_in_started(server: TmuxServer) -> tuple[str, str]:

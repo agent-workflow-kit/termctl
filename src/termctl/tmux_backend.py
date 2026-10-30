@@ -12,7 +12,8 @@ Every argument termctl passes to tmux is built here, so the rules cannot be skip
    only a ``Format``.
 4. **Literal positions.** argv, ``-e`` values and option values need only rule 1.
 5. **Guarded writes.** ``guarded`` wraps commands in ``if-shell -F -t %N``; each inner command
-   targets that pane or a window containing it, and its elements are quoted by ``quote``.
+   is one of the guarded mutations (or ``display -p``), targets that pane or, for
+   ``rename-window``, the window containing it, and its elements are quoted by ``quote``.
    ``guard_outcome`` reads the result.
 
 Targets are exact ids (``=S:``, ``@N``, ``%N``, ``=S:@W.%P``); ``Target`` checks that grammar
@@ -94,15 +95,28 @@ def double_hashes(value: str) -> str:
     return value.replace("#", "##")
 
 
+# Characters quote() writes outside the quotes, as escapes tmux's parser turns back into them.
+# "\udcff" is how os.fsdecode carries byte 0xff, which ends tmux's parse even inside quotes.
+_QUOTE_ESCAPES = {"\n": "\\n", "\udcff": "\\377"}
+_QUOTE_SPLIT = re.compile("([\n\udcff])")
+
+
 def quote(element: str) -> str:
     """Quote an element for tmux's command parser so it round-trips exactly (spike F5).
 
-    Each newline-free run is single-quoted with ``'`` written as ``'\\''``, and the runs are
-    joined by ``\\n`` outside the quotes (``"a\\nb"`` becomes ``'a'\\n'b'``). tmux's parser
-    drops a backslash-newline pair anywhere, and blanks and ``#`` comments after a newline even
-    inside quotes, so a raw newline must never reach it; ``\\n`` outside quotes is a newline.
+    Each run without a newline or byte 0xff is single-quoted with ``'`` written as ``'\\''``,
+    and the runs are joined by ``\\n`` or ``\\377`` outside the quotes (``"a\\nb"`` becomes
+    ``'a'\\n'b'``). tmux's parser drops a backslash-newline pair anywhere, and blanks and ``#``
+    comments after a newline even inside quotes, so a raw newline must never reach it; it treats
+    byte 0xff (``"\\udcff"`` after ``os.fsdecode``) as the end of its input, even inside quotes,
+    so the rest would run as commands (review round 2). Outside quotes ``\\n`` is a newline and
+    ``\\377`` that byte. Every byte 0x01-0xff round-trips this way on tmux 3.5a and 3.2a.
     """
-    return "\\n".join("'" + run.replace("'", "'\\''") + "'" for run in element.split("\n"))
+    parts = _QUOTE_SPLIT.split(element)
+    return "".join(
+        _QUOTE_ESCAPES[part] if index % 2 else "'" + part.replace("'", "'\\''") + "'"
+        for index, part in enumerate(parts)
+    )
 
 
 # A lone surrogate outside \udc80-\udcff (where os.fsdecode puts undecodable bytes) cannot be
@@ -131,17 +145,22 @@ class Format:
     Values interpolated into one must come from a grammar without ``#``, ``,`` and ``}``."""
 
     text: str
-    _key: object = field(default=None, repr=False, compare=False)
+    # Not an __init__ argument, so dataclasses.replace cannot copy it: every construction,
+    # replace() included, gets None and is refused; only _format sets the key.
+    _key: object = field(default=None, init=False, repr=False, compare=False)
 
     def __post_init__(self) -> None:
         if self._key is not _FORMAT_KEY:
             raise TypeError("a Format is built only by the tmux_backend factories")
-        if _CONTROL.search(self.text) or self.text.endswith(SEPARATOR):
-            raise ValueError(f"invalid format: {self.text!r}")
 
 
 def _format(text: str) -> Format:
-    return Format(text, _FORMAT_KEY)
+    if not isinstance(text, str) or _CONTROL.search(text) or text.endswith(SEPARATOR):
+        raise ValueError(f"invalid format: {text!r}")
+    fmt = object.__new__(Format)
+    object.__setattr__(fmt, "text", text)
+    object.__setattr__(fmt, "_key", _FORMAT_KEY)
+    return fmt
 
 
 def fields(*names: str) -> Format:
@@ -223,6 +242,8 @@ class Command:
     guarded: bool = False
     # The target given to ``CommandBuilder.target``; ``None`` for a command without one.
     target: Target | None = None
+    # The flags given to the builder, in order (``-t`` included), without their values.
+    flags: tuple[str, ...] = ()
 
     @property
     def name(self) -> str:
@@ -248,10 +269,15 @@ class CommandBuilder:
     _shown: list[str] = field(default_factory=list)
     _positional: bool = False
     _target: Target | None = None
+    _flags: list[str] = field(default_factory=list)
 
     def _add(self, element: str, shown: str | None = None) -> None:
         self._elements.append(_check_text(element))
         self._shown.append(element if shown is None else shown)
+
+    def _add_flag(self, flag: str) -> None:
+        self._add(flag)
+        self._flags.append(flag)
 
     def _before_positionals(self, flag: str) -> None:
         if self._positional:
@@ -275,7 +301,7 @@ class CommandBuilder:
         self._before_positionals(flag)
         if flag in _VALUE_FLAGS:
             raise ValueError(f"{flag} takes a value; use option, target, env or format")
-        self._add(flag)
+        self._add_flag(flag)
         return self
 
     def server_scope(self) -> Self:
@@ -283,7 +309,7 @@ class CommandBuilder:
         self._before_positionals("-s")
         if self._name not in _SERVER_SCOPE_COMMANDS:
             raise ValueError(f"{self._name} has no server scope flag")
-        self._add("-s")
+        self._add_flag("-s")
         return self
 
     def option(self, flag: str, value: str) -> Self:
@@ -292,7 +318,7 @@ class CommandBuilder:
         self._before_positionals(flag)
         if flag in _TYPED_FLAGS:
             raise ValueError(f"{flag} has its own method")
-        self._add(flag)
+        self._add_flag(flag)
         self._add(double_hashes(value) if flag in _FORMAT_EXPANDED_FLAGS else value)
         return self
 
@@ -304,7 +330,7 @@ class CommandBuilder:
         if self._target is not None:
             raise ValueError("a command takes one target")
         self._target = target
-        self._add("-t")
+        self._add_flag("-t")
         self._add(target.text)
         return self
 
@@ -315,7 +341,7 @@ class CommandBuilder:
             raise ValueError(f"{flag} does not take a format")
         if not isinstance(fmt, Format):
             raise TypeError("a format must be a Format")
-        self._add(flag)
+        self._add_flag(flag)
         self._add(fmt.text)
         return self
 
@@ -323,7 +349,7 @@ class CommandBuilder:
         """``-e NAME=value``; shown as ``-e NAME``."""
         self._before_positionals("-e")
         _fullmatch(_ENV_NAME, name, "environment variable name")
-        self._add("-e")
+        self._add_flag("-e")
         self._add(f"{name}={value}", shown=name)
         return self
 
@@ -363,7 +389,12 @@ class CommandBuilder:
         return self
 
     def build(self) -> Command:
-        return Command(tuple(self._elements), tuple(self._shown), target=self._target)
+        return Command(
+            tuple(self._elements),
+            tuple(self._shown),
+            target=self._target,
+            flags=tuple(self._flags),
+        )
 
 
 def command(name: str) -> CommandBuilder:
@@ -489,14 +520,38 @@ def cleanup(window_id: str) -> Format:
 _NOMATCH_COMMAND = command("display").flag("-p").format_arg(_format(NOMATCH)).build()
 
 
+# The commands a guard may run and the flags each may take (interface.md rule 5): the
+# mutations of a managed pane, and display -p for close --force. Anything else, such as -a
+# (all other panes) or -s (a source pane, or server options), could act outside the pane.
+_GUARDED_FLAGS: dict[str, frozenset[str]] = {
+    "kill-pane": frozenset({"-t"}),
+    "rename-window": frozenset({"-t"}),
+    "set-option": frozenset({"-p", "-t", "-u", "-q", "-o"}),
+    "set": frozenset({"-p", "-t", "-u", "-q", "-o"}),
+    "respawn-pane": frozenset({"-k", "-t", "-c", "-e"}),
+    "display": frozenset({"-p", "-t"}),
+    "display-message": frozenset({"-p", "-t"}),
+}
+
+
 def _check_guarded_target(guard: Target, inner: Command) -> Target | None:
     """Refuse an inner command that could act outside the guarded pane; return a window target
     whose containment the condition must check."""
     if inner.guarded or inner.name == "if-shell":
         raise ValueError("guards do not nest")
+    allowed = _GUARDED_FLAGS.get(inner.name)
+    if allowed is None:
+        raise ValueError(f"{inner.name or 'an empty command'} cannot run inside a guard")
+    refused = [f for f in inner.flags if f not in allowed]
+    if refused:
+        raise ValueError(f"{inner.name} inside a guard cannot take {' '.join(refused)}")
+    if inner.name in ("set-option", "set") and "-p" not in inner.flags:
+        raise ValueError(f"{inner.name} inside a guard sets pane options only (-p)")
     if inner.target is None:
         raise ValueError("a guarded command must name its target with target()")
     if inner.target.kind == "window":
+        if inner.name != "rename-window":
+            raise ValueError("only rename-window takes a window target inside a guard")
         return inner.target
     if inner.target != guard:
         raise ValueError(
@@ -510,11 +565,13 @@ def guarded(target: Target, condition: Format, *commands: Command) -> Command:
     """``if-shell -F -t %N -- <condition> '<commands>' 'display -p termctl-nomatch'``.
 
     The inner commands run only while ``condition`` holds for pane ``target``, in the same tmux
-    command; a missing pane evaluates the condition as false (spike F5). Each inner command
-    targets that same pane or a window (``rename-window -t @W``); for a window target the
-    condition also requires the pane to be in that window, so no inner command can act outside
-    the guarded pane. Inner elements are quoted by ``quote``, where rule 1 does not apply;
-    several inner commands are joined by `` ; ``.
+    command; a missing pane evaluates the condition as false (spike F5). Inner commands are
+    limited to ``kill-pane``, ``rename-window``, ``set -p``, ``respawn-pane`` and ``display
+    -p``, each with only the flags it needs (``_GUARDED_FLAGS``; never ``-a`` or ``-s``). Each
+    targets that same pane, or for ``rename-window`` only a window (``-t @W``); for a window
+    target the condition also requires the pane to be in that window, so no inner command can
+    act outside the guarded pane. Inner elements are quoted by ``quote``, where rule 1 does
+    not apply; several inner commands are joined by `` ; ``.
     """
     if not isinstance(target, Target) or not isinstance(condition, Format):
         raise TypeError("a guard takes a Target and a Format")
@@ -542,7 +599,7 @@ def guarded(target: Target, condition: Format, *commands: Command) -> Command:
     built._add(_NOMATCH_COMMAND.quoted())
     plain = built.build()
     shown = (*plain.shown[:-2], inner_shown, plain.shown[-1])
-    return Command(plain.elements, shown, guarded=True, target=target)
+    return Command(plain.elements, shown, guarded=True, target=target, flags=plain.flags)
 
 
 class GuardOutcome(enum.Enum):
