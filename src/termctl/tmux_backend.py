@@ -6,15 +6,18 @@ Every argument termctl passes to tmux is built here, so the rules cannot be skip
 1. **Separators.** The final ``;`` of every element becomes ``\\;`` (tmux turns it back into
    ``;``); only termctl's own separators between chained commands are a bare ``;``.
 2. **Leading ``-``.** ``--`` goes immediately before a command's first positional argument.
+   ``option`` takes only a flag that takes a value for that command, never a value starting
+   with ``-``; ``window_name`` (``-n``) and ``session_name`` (``-s``) take names that may.
 3. **Format expansion.** Values of ``-n``, ``-c`` and ``-s`` and the ``rename-window`` name get
    every ``#`` doubled; ``#[`` there is refused (it is rejected as input earlier, exit 2).
    ``display`` takes only termctl's own ``Format`` as its positional, and ``-F`` and ``-f``
    only a ``Format``.
 4. **Literal positions.** argv, ``-e`` values and option values need only rule 1.
 5. **Guarded writes.** ``guarded`` wraps commands in ``if-shell -F -t %N``; each inner command
-   is one of the guarded mutations (or ``display -p``), targets that pane or, for
-   ``rename-window`` and ``set -w``, the window containing it, and its elements are quoted
-   by ``quote``. ``guard_outcome`` reads the result.
+   is one of the guarded mutations (or ``display -p`` of ids and numbers), sets only the
+   options the spec sets there, targets that pane or, for ``rename-window`` and ``set -w``,
+   the window containing it, and its elements are quoted by ``quote``. ``guard_outcome``
+   reads the result.
 
 Targets are exact ids (``=S:``, ``@N``, ``%N``, ``=S:@W.%P``); ``Target`` checks that grammar
 however it is built. ``Format`` values come only from this module's factories. Value-taking
@@ -46,14 +49,29 @@ TMUX_TIMEOUT = 30.0
 
 _COMMAND_NAME = re.compile(r"[a-z]+(-[a-z]+)*")
 _FLAG = re.compile(r"-[A-Za-z]")
-# Doubling also applies to every command's -c and -s, where the value may be a client name or
-# target rather than text; their grammars have no "#", so it changes nothing there.
+# Doubling also applies to switch-client's -c, a client name rather than text; client names
+# are tty paths without "#", so it changes nothing there.
 _FORMAT_EXPANDED_FLAGS = frozenset({"-n", "-c", "-s"})
 # Flags whose values have their own, typed method.
-_TYPED_FLAGS = frozenset({"-t", "-e", "-F", "-f"})
+_TYPED_FLAGS = frozenset({"-t", "-e", "-F", "-f", "-n", "-s"})
 # Flags that take a value: refused by flag(), where they would take the next element as theirs
 # or (set -F) switch on format expansion of the value.
 _VALUE_FLAGS = _TYPED_FLAGS | _FORMAT_EXPANDED_FLAGS
+# The flags option() takes, per command: each takes a value in tmux, so the next element is
+# always that value (review round 4, R4-1). A flag that takes none would leave its "value" to be
+# parsed as further flags (set -w -g). Values starting with "-" are refused besides; -c is a
+# directory (absolute) or a client name (a tty path), neither of which starts with "-".
+_OPTION_FLAGS: dict[str, frozenset[str]] = {
+    "new-window": frozenset({"-c"}),
+    "new-session": frozenset({"-c"}),
+    "respawn-pane": frozenset({"-c"}),
+    "switch-client": frozenset({"-c"}),
+}
+# window_name() and session_name(): -n and -s on the commands where they take a value. These
+# values may start with "-" (a name "-x"); tmux takes the element after them as the value
+# whatever it starts with (spike E).
+_WINDOW_NAME_COMMANDS = frozenset({"new-window", "new-session"})
+_SESSION_NAME_COMMANDS = frozenset({"new-session"})
 _FORMAT_FLAGS = frozenset({"-F", "-f"})
 # Commands whose positional is a format: they take only termctl's own Format.
 _FORMAT_POSITIONAL_COMMANDS = frozenset({"display", "display-message"})
@@ -248,6 +266,8 @@ class Command:
     target: Target | None = None
     # The flags given to the builder, in order (``-t`` included), without their values.
     flags: tuple[str, ...] = ()
+    # The positional arguments as passed to tmux (after rule 3), without the "--".
+    positionals: tuple[str, ...] = ()
     # As for Format: not an __init__ argument, so direct construction and dataclasses.replace
     # get None and are refused; only _command sets the key (review round 3, R3-3).
     _key: object = field(default=None, init=False, repr=False, compare=False)
@@ -278,6 +298,7 @@ def _command(
     guarded: bool = False,
     target: Target | None,
     flags: tuple[str, ...],
+    positionals: tuple[str, ...],
 ) -> Command:
     cmd = object.__new__(Command)
     for name, value in (
@@ -286,22 +307,34 @@ def _command(
         ("guarded", guarded),
         ("target", target),
         ("flags", flags),
+        ("positionals", positionals),
         ("_key", _COMMAND_KEY),
     ):
         object.__setattr__(cmd, name, value)
     return cmd
 
 
+_BUILDER_KEY = object()
+
+
 @dataclass
 class CommandBuilder:
-    """Builds one ``Command``; start with ``command(name)``. Flags and options come before
-    positionals, so rule 2 can put ``--`` in front of the first positional."""
+    """Builds one ``Command``; start with ``command(name)``, the only entry point (its fields
+    are not constructor arguments, so a builder cannot start with forged state; review round 4,
+    R4-2). Flags and options come before positionals, so rule 2 can put ``--`` in front of the
+    first positional."""
 
-    _elements: list[str] = field(default_factory=list)
-    _shown: list[str] = field(default_factory=list)
-    _positional: bool = False
-    _target: Target | None = None
-    _flags: list[str] = field(default_factory=list)
+    _elements: list[str] = field(default_factory=list, init=False)
+    _shown: list[str] = field(default_factory=list, init=False)
+    _positional: bool = field(default=False, init=False)
+    _target: Target | None = field(default=None, init=False)
+    _flags: list[str] = field(default_factory=list, init=False)
+    _positionals: list[str] = field(default_factory=list, init=False)
+    _key: object = field(default=None, init=False, repr=False, compare=False)
+
+    def __post_init__(self) -> None:
+        if self._key is not _BUILDER_KEY:
+            raise TypeError("a CommandBuilder is started only by command()")
 
     def _add(self, element: str, shown: str | None = None) -> None:
         self._elements.append(_check_text(element))
@@ -345,13 +378,37 @@ class CommandBuilder:
         return self
 
     def option(self, flag: str, value: str) -> Self:
-        """A flag with a data value; ``-n``, ``-c`` and ``-s`` values are format-expanded by
-        tmux, so their ``#`` are doubled (rule 3)."""
+        """A flag with a data value, only one this command takes a value for
+        (``_OPTION_FLAGS``); a value starting with ``-`` is refused. ``-c`` is format-expanded
+        by tmux, so its ``#`` are doubled (rule 3)."""
         self._before_positionals(flag)
         if flag in _TYPED_FLAGS:
             raise ValueError(f"{flag} has its own method")
+        if flag not in _OPTION_FLAGS.get(self._name, frozenset()):
+            raise ValueError(f"{self._name} {flag} takes no value through option")
+        if not isinstance(value, str) or value.startswith("-"):
+            raise ValueError(f"an option value must not look like a flag: {value!r}")
         self._add_flag(flag)
         self._add(double_hashes(value) if flag in _FORMAT_EXPANDED_FLAGS else value)
+        return self
+
+    def window_name(self, value: str) -> Self:
+        """``-n NAME`` of ``new-window`` and ``new-session``: format-expanded, so its ``#`` are
+        doubled (rule 3). The name may start with ``-``; tmux takes it as the value."""
+        self._before_positionals("-n")
+        if self._name not in _WINDOW_NAME_COMMANDS:
+            raise ValueError(f"{self._name} takes no window name")
+        self._add_flag("-n")
+        self._add(double_hashes(value))
+        return self
+
+    def session_name(self, name: str) -> Self:
+        """``-s NAME`` of ``new-session``: a name from the session grammar (no ``#``)."""
+        self._before_positionals("-s")
+        if self._name not in _SESSION_NAME_COMMANDS:
+            raise ValueError(f"{self._name} takes no session name")
+        self._add_flag("-s")
+        self._add(_fullmatch(_SESSION_NAME, name, "session name"))
         return self
 
     def target(self, target: Target) -> Self:
@@ -395,30 +452,31 @@ class CommandBuilder:
             return self.name(value)
         if self._name in _FORMAT_POSITIONAL_COMMANDS:
             raise ValueError(f"the {self._name} positional is a format; use format_arg")
-        self._positional_next()
-        self._add(value)
+        self._add_positional(value)
         return self
 
     def name(self, value: str) -> Self:
         """A format-expanded positional, the ``rename-window`` name (rule 3)."""
-        self._positional_next()
-        self._add(double_hashes(value))
+        self._add_positional(double_hashes(value))
         return self
 
     def format_arg(self, fmt: Format) -> Self:
         """termctl's own format as a positional, such as ``display -p`` output."""
         if not isinstance(fmt, Format):
             raise TypeError("a format must be a Format")
-        self._positional_next()
-        self._add(fmt.text)
+        self._add_positional(fmt.text)
         return self
 
     def env_arg(self, name: str, value: str) -> Self:
         """A ``NAME=value`` argv element for ``/usr/bin/env``; shown as ``NAME``."""
         _fullmatch(_ENV_NAME, name, "environment variable name")
-        self._positional_next()
-        self._add(f"{name}={value}", shown=name)
+        self._add_positional(f"{name}={value}", shown=name)
         return self
+
+    def _add_positional(self, element: str, shown: str | None = None) -> None:
+        self._positional_next()
+        self._add(element, shown)
+        self._positionals.append(element)
 
     def build(self) -> Command:
         return _command(
@@ -426,12 +484,23 @@ class CommandBuilder:
             tuple(self._shown),
             target=self._target,
             flags=tuple(self._flags),
+            positionals=tuple(self._positionals),
         )
 
 
 def command(name: str) -> CommandBuilder:
     """Start a tmux command, such as ``command("kill-pane")``."""
-    builder = CommandBuilder()
+    builder = object.__new__(CommandBuilder)
+    for attr, value in (
+        ("_elements", []),
+        ("_shown", []),
+        ("_positional", False),
+        ("_target", None),
+        ("_flags", []),
+        ("_positionals", []),
+        ("_key", _BUILDER_KEY),
+    ):
+        object.__setattr__(builder, attr, value)
     builder._add(_fullmatch(_COMMAND_NAME, name, "tmux command name"))
     return builder
 
@@ -553,9 +622,9 @@ _NOMATCH_COMMAND = command("display").flag("-p").format_arg(_format(NOMATCH)).bu
 
 
 # The commands a guard may run and the flags each may take (interface.md rule 5): the
-# mutations of a managed pane, and display -p for close --force. Anything else, such as -a
-# (all other panes), -s (a source pane, or server options), -g or -U, could act outside the
-# pane. set takes -p, or -w for the window options of Open order step 6.
+# mutations of a managed pane, and display -p for Open order step 7 and close --force.
+# Anything else, such as -a (all other panes), -s (a source pane, or server options), -g or
+# -U, could act outside the pane. set takes -p, or -w for the window options of Open order step 6.
 _GUARDED_FLAGS: dict[str, frozenset[str]] = {
     "kill-pane": frozenset({"-t"}),
     "rename-window": frozenset({"-t"}),
@@ -565,6 +634,54 @@ _GUARDED_FLAGS: dict[str, frozenset[str]] = {
     "display": frozenset({"-p", "-t"}),
     "display-message": frozenset({"-p", "-t"}),
 }
+
+
+# The options a guard may set (interface.md rule 5): the pane options of "Pane options" and
+# remain-on-exit with set -p; the window options of Open order step 6 with set -w (review
+# round 4, R4-3).
+_GUARDED_PANE_OPTIONS = frozenset(
+    {
+        "@termctl_v",
+        "@termctl_pane",
+        "@termctl_window",
+        "@termctl_id",
+        "@termctl_name",
+        "@termctl_marker",
+        "@termctl_marker_text",
+        "@termctl_labels",
+        "@termctl_placement",
+        "@termctl_keep",
+        "@termctl_created",
+        "@termctl_pid",
+        "@termctl_pid_start",
+        "remain-on-exit",
+    }
+)
+_GUARDED_WINDOW_OPTIONS = frozenset({"automatic-rename", "allow-rename"})
+# The fields a guarded display may print: tmux ids and numbers, never caller or tmux-controlled
+# text, so no output can read as termctl-nomatch (review round 4, R4-4).
+_GUARDED_DISPLAY_FIELDS = ("pane_pid", "pane_dead", "pid", "pane_id", "window_id")
+_GUARDED_DISPLAY_FIELD = "#{(?:" + "|".join(_GUARDED_DISPLAY_FIELDS) + ")}"
+_GUARDED_DISPLAY_FORMAT = re.compile(f"{_GUARDED_DISPLAY_FIELD}( {_GUARDED_DISPLAY_FIELD})*")
+
+
+def _check_guarded_arguments(inner: Command) -> None:
+    """Refuse a guarded set of an option the spec does not set there, and a guarded display
+    that could print anything but ids and numbers."""
+    if inner.name in ("set-option", "set"):
+        allowed = _GUARDED_WINDOW_OPTIONS if "-w" in inner.flags else _GUARDED_PANE_OPTIONS
+        if not inner.positionals or inner.positionals[0] not in allowed:
+            option = inner.positionals[0] if inner.positionals else "no option"
+            raise ValueError(f"{inner.name} cannot set {option} inside a guard")
+    if inner.name in _FORMAT_POSITIONAL_COMMANDS:
+        if "-p" not in inner.flags:
+            raise ValueError(f"{inner.name} inside a guard takes -p")
+        if len(inner.positionals) != 1 or not _GUARDED_DISPLAY_FORMAT.fullmatch(
+            inner.positionals[0]
+        ):
+            raise ValueError(
+                f"{inner.name} inside a guard prints only {', '.join(_GUARDED_DISPLAY_FIELDS)}"
+            )
 
 
 def _check_guarded_target(guard: Target, inner: Command) -> Target | None:
@@ -583,6 +700,7 @@ def _check_guarded_target(guard: Target, inner: Command) -> Target | None:
         if ("-p" in inner.flags) == ("-w" in inner.flags):
             raise ValueError(f"{inner.name} inside a guard takes exactly one of -p and -w")
         window_scoped = "-w" in inner.flags
+    _check_guarded_arguments(inner)
     if inner.target is None:
         raise ValueError("a guarded command must name its target with target()")
     if inner.target.kind == "window":
@@ -602,13 +720,15 @@ def guarded(target: Target, condition: Format, *commands: Command) -> Command:
 
     The inner commands run only while ``condition`` holds for pane ``target``, in the same tmux
     command; a missing pane evaluates the condition as false (spike F5). Inner commands are
-    limited to ``kill-pane``, ``rename-window``, ``set -p``, ``set -w``, ``respawn-pane`` and
-    ``display -p``, each with only the flags it needs (``_GUARDED_FLAGS``; never ``-a``,
-    ``-s``, ``-g`` or ``-U``). Each targets that same pane (``set -w -t %N`` sets the options
-    of the pane's own window), or for ``rename-window`` and ``set -w`` only a window (``-t
-    @W``); for a window target the condition also requires the pane to be in that window, so
-    no inner command can act outside the guarded pane or its window. Inner elements are quoted
-    by ``quote``, where rule 1 does not apply; several inner commands are joined by `` ; ``.
+    limited to ``kill-pane``, ``rename-window``, ``set -p`` and ``set -w`` of the options the
+    spec sets (``_GUARDED_PANE_OPTIONS``, ``_GUARDED_WINDOW_OPTIONS``), ``respawn-pane`` and
+    ``display -p`` of ``_GUARDED_DISPLAY_FIELDS``, each with only the flags it needs
+    (``_GUARDED_FLAGS``; never ``-a``, ``-s``, ``-g`` or ``-U``). Each targets that same pane
+    (``set -w -t %N`` sets the options of the pane's own window), or for ``rename-window`` and
+    ``set -w`` only a window (``-t @W``); for a window target the condition also requires the
+    pane to be in that window, so no inner command can act outside the guarded pane or its
+    window. Inner elements are quoted by ``quote``, where rule 1 does not apply; several inner
+    commands are joined by `` ; ``.
     """
     if not isinstance(target, Target) or not isinstance(condition, Format):
         raise TypeError("a guard takes a Target and a Format")
@@ -636,7 +756,14 @@ def guarded(target: Target, condition: Format, *commands: Command) -> Command:
     built._add(_NOMATCH_COMMAND.quoted())
     plain = built.build()
     shown = (*plain.shown[:-2], inner_shown, plain.shown[-1])
-    return _command(plain.elements, shown, guarded=True, target=target, flags=plain.flags)
+    return _command(
+        plain.elements,
+        shown,
+        guarded=True,
+        target=target,
+        flags=plain.flags,
+        positionals=plain.positionals,
+    )
 
 
 class GuardOutcome(enum.Enum):

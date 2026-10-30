@@ -111,7 +111,7 @@ def test_semicolon_rule_applies_in_every_position() -> None:
         command("new-window")
         .flag("-d")
         .target(tb.session("work"))
-        .option("-n", "n;")
+        .window_name("n;")
         .option("-c", "/d;")
         .env("A", "1;")
         .arg("/usr/bin/env")
@@ -159,7 +159,9 @@ def test_flags_after_a_positional_are_refused() -> None:
     with pytest.raises(ValueError):
         builder.flag("-d")
     with pytest.raises(ValueError):
-        builder.option("-n", "x")
+        builder.option("-c", "/x")
+    with pytest.raises(ValueError):
+        builder.window_name("x")
     with pytest.raises(ValueError):
         builder.target(tb.window("@1"))
     with pytest.raises(ValueError):
@@ -233,16 +235,25 @@ def test_malformed_command_names_are_refused(name: str) -> None:
     ],
 )
 def test_format_expanded_values_double_every_hash(value: str, expected: str) -> None:
-    for flag in ("-n", "-c", "-s"):
-        cmd = command("new-session").option(flag, value).build()
-        assert cmd.argv == ("new-session", flag, expected)
+    assert command("new-session").option("-c", value).build().argv == (
+        "new-session",
+        "-c",
+        expected,
+    )
+    assert command("new-session").window_name(value).build().argv == (
+        "new-session",
+        "-n",
+        expected,
+    )
     assert command("rename-window").name(value).build().argv == ("rename-window", "--", expected)
 
 
 @pytest.mark.parametrize("value", ["#[fg=red]", "a#[b", "##[", "#["])
 def test_status_styles_are_refused_in_format_expanded_values(value: str) -> None:
     with pytest.raises(ValueError):
-        command("new-window").option("-n", value)
+        command("new-window").window_name(value)
+    with pytest.raises(ValueError):
+        command("new-window").option("-c", value)
     with pytest.raises(ValueError):
         command("rename-window").name(value)
     with pytest.raises(ValueError):
@@ -276,15 +287,6 @@ def test_literal_positions_are_not_doubled(value: str) -> None:
     )
     assert cmd.argv[5] == "A=" + tb.escape_separator(value)
     assert cmd.argv[-1] == tb.escape_separator(value)
-
-
-def test_values_of_flags_outside_the_doubled_set_are_literal() -> None:
-    assert command("x").option("-x", "#{a}").build().argv == ("x", "-x", "#{a}")
-    assert command("new-window").option("-T", "a#(b)#").build().argv == (
-        "new-window",
-        "-T",
-        "a#(b)#",
-    )
 
 
 def test_formats_are_passed_verbatim() -> None:
@@ -445,7 +447,7 @@ def test_env_values_are_shown_by_name_only() -> None:
 
 def test_chain_joins_commands_with_bare_separators() -> None:
     a = command("set-option").server_scope().arg("exit-unattached").arg("off").build()
-    b = command("new-session").flag("-d").option("-s", "work").build()
+    b = command("new-session").flag("-d").session_name("work").build()
     inv = Invocation.of(a, b)
     assert inv.argv(TMUX, SOCK) == [
         TMUX,
@@ -563,7 +565,7 @@ def test_guard_quotes_each_element_without_separator_escaping() -> None:
 
 
 def test_guard_chains_inner_commands() -> None:
-    a = command("set-option").flag("-p").target(tb.pane("%5")).arg("@a").arg("1").build()
+    a = command("set-option").flag("-p").target(tb.pane("%5")).arg("@termctl_name").arg("1").build()
     b = (
         command("display")
         .flag("-p")
@@ -573,7 +575,8 @@ def test_guard_chains_inner_commands() -> None:
     )
     cmd = tb.guarded(tb.pane("%5"), tb.owned(ID), a, b)
     assert cmd.argv[6] == (
-        "'set-option' '-p' '-t' '%5' '--' '@a' '1' ; 'display' '-p' '-t' '%5' '--' '#{pane_pid}'"
+        "'set-option' '-p' '-t' '%5' '--' '@termctl_name' '1' ; "
+        "'display' '-p' '-t' '%5' '--' '#{pane_pid}'"
     )
 
 
@@ -592,9 +595,6 @@ def test_guard_on_a_window_target_requires_the_pane_to_be_in_it() -> None:
 def test_guard_target_spoofs_are_refused() -> None:
     guard, cond = tb.pane("%5"), tb.owned(ID)
     spoofs = [
-        # An option value "-t" is not a target.
-        command("set-option").flag("-p").option("-T", "-t").arg("@a").arg("1").build(),
-        command("new-window").option("-c", "-t").build(),
         # Another pane, a session or a pane-in-session target.
         command("kill-pane").target(tb.pane("%6")).build(),
         command("kill-session").target(tb.session("s")).build(),
@@ -607,6 +607,9 @@ def test_guard_target_spoofs_are_refused() -> None:
             tb.guarded(guard, cond, inner)
     with pytest.raises(ValueError):
         command("kill-pane").flag("-t")
+    # An option value "-t" is refused as flag-like, so it cannot pose as a target (R4-1).
+    with pytest.raises(ValueError):
+        command("respawn-pane").option("-c", "-t")
 
 
 def _set_p(name: str, value: str, target: tb.Target | None = None) -> Command:
@@ -711,14 +714,14 @@ def test_guard_accepts_the_spelled_out_forms() -> None:
     guard, cond, pane5 = tb.pane("%5"), tb.owned(ID), tb.pane("%5")
     inners = [
         command("rename-window").target(pane5).name("n").build(),
-        command("set-option").flag("-p").target(pane5).arg("@a").arg("1").build(),
-        command("set-option").flag("-p").flag("-u").target(pane5).arg("@a").build(),
+        command("set-option").flag("-p").target(pane5).arg("@termctl_name").arg("1").build(),
+        command("set-option").flag("-p").flag("-u").target(pane5).arg("@termctl_name").build(),
         command("set-option")
         .flag("-p")
         .flag("-q")
         .flag("-o")
         .target(pane5)
-        .arg("@a")
+        .arg("@termctl_name")
         .arg("1")
         .build(),
         command("set-option").flag("-w").target(pane5).arg("allow-rename").arg("off").build(),
@@ -755,30 +758,71 @@ def test_guard_window_option_on_a_window_requires_containment() -> None:
         command("kill-pane").flag("-a").target(tb.pane("%5")).build(),
         command("kill-window").target(tb.window("@1")).build(),
         command("kill-window").target(tb.pane("%5")).build(),
-        command("swap-pane").option("-s", "%7").target(tb.pane("%5")).build(),
+        command("swap-pane").target(tb.pane("%5")).build(),
         command("respawn-window").flag("-k").target(tb.window("@1")).build(),
         command("new-window").target(tb.pane("%5")).build(),
         # A window target is for rename-window only.
         command("kill-pane").target(tb.window("@1")).build(),
-        command("set-option").flag("-p").target(tb.window("@1")).arg("@a").arg("1").build(),
+        command("set-option")
+        .flag("-p")
+        .target(tb.window("@1"))
+        .arg("@termctl_name")
+        .arg("1")
+        .build(),
         command("display").flag("-p").target(tb.window("@1")).format_arg(tb.fields("a")).build(),
         command("respawn-pane").flag("-k").target(tb.window("@1")).build(),
         # set only at pane scope: not global, server, window or session options.
-        command("set-option").target(tb.pane("%5")).arg("@a").arg("1").build(),
-        command("set-option").flag("-g").target(tb.pane("%5")).arg("@a").arg("1").build(),
-        command("set-option").flag("-w").flag("-g").target(tb.pane("%5")).arg("@a").build(),
-        command("set-option").flag("-w").flag("-a").target(tb.pane("%5")).arg("@a").build(),
-        command("set-option").flag("-w").flag("-U").target(tb.pane("%5")).arg("@a").build(),
-        command("set").server_scope().flag("-w").target(tb.pane("%5")).arg("@a").build(),
-        command("set").flag("-p").flag("-w").target(tb.pane("%5")).arg("@a").arg("1").build(),
+        command("set-option").target(tb.pane("%5")).arg("@termctl_name").arg("1").build(),
+        command("set-option")
+        .flag("-g")
+        .target(tb.pane("%5"))
+        .arg("@termctl_name")
+        .arg("1")
+        .build(),
+        command("set-option")
+        .flag("-w")
+        .flag("-g")
+        .target(tb.pane("%5"))
+        .arg("@termctl_name")
+        .build(),
+        command("set-option")
+        .flag("-w")
+        .flag("-a")
+        .target(tb.pane("%5"))
+        .arg("@termctl_name")
+        .build(),
+        command("set-option")
+        .flag("-w")
+        .flag("-U")
+        .target(tb.pane("%5"))
+        .arg("@termctl_name")
+        .build(),
+        command("set").server_scope().flag("-w").target(tb.pane("%5")).arg("@termctl_name").build(),
+        command("set")
+        .flag("-p")
+        .flag("-w")
+        .target(tb.pane("%5"))
+        .arg("@termctl_name")
+        .arg("1")
+        .build(),
         command("set").flag("-w").target(tb.pane("%6")).arg("allow-rename").arg("off").build(),
         command("set").flag("-w").target(tb.session("s")).arg("allow-rename").arg("off").build(),
-        command("set-option").flag("-p").flag("-g").target(tb.pane("%5")).arg("@a").build(),
-        command("set").server_scope().flag("-p").target(tb.pane("%5")).arg("@a").build(),
-        command("set-option").flag("-p").flag("-a").target(tb.pane("%5")).arg("@a").build(),
+        command("set-option")
+        .flag("-p")
+        .flag("-g")
+        .target(tb.pane("%5"))
+        .arg("@termctl_name")
+        .build(),
+        command("set").server_scope().flag("-p").target(tb.pane("%5")).arg("@termctl_name").build(),
+        command("set-option")
+        .flag("-p")
+        .flag("-a")
+        .target(tb.pane("%5"))
+        .arg("@termctl_name")
+        .build(),
         # -a and -s refused on any inner command, as a flag or an option.
         command("respawn-pane").flag("-a").target(tb.pane("%5")).build(),
-        command("display").option("-s", "x").flag("-p").target(tb.pane("%5")).build(),
+        command("display").flag("-a").flag("-p").target(tb.pane("%5")).build(),
         command("rename-window").flag("-a").target(tb.window("@1")).name("n").build(),
     ],
     ids=lambda c: " ".join(c.elements),
@@ -792,22 +836,20 @@ def test_a_command_records_its_flags() -> None:
     cmd = (
         command("respawn-pane")
         .flag("-k")
-        .option("-c", "-a")
+        .option("-c", "/a")
         .target(tb.pane("%5"))
         .env("V", "-s")
         .arg("-g")
         .build()
     )
     assert cmd.flags == ("-k", "-c", "-t", "-e")
-    # An option value or positional that looks like a flag is data, not a flag.
+    # An -e value or positional that looks like a flag is data, not a flag.
     assert tb.guarded(tb.pane("%5"), tb.owned(ID), cmd).guarded
 
 
-def test_guard_accepts_an_option_value_double_dash_before_the_target() -> None:
-    inner = command("respawn-pane").option("-c", "--").target(tb.pane("%5")).build()
-    assert tb.guarded(tb.pane("%5"), tb.owned(ID), inner).argv[6] == (
-        "'respawn-pane' '-c' '--' '-t' '%5'"
-    )
+def test_an_option_value_double_dash_is_refused() -> None:
+    with pytest.raises(ValueError):
+        command("respawn-pane").option("-c", "--")
 
 
 @pytest.mark.parametrize(
@@ -1071,3 +1113,166 @@ def test_missing_tmux_fails_under_ci_and_skips_elsewhere(
     environ: dict[str, str], outcome: str
 ) -> None:
     assert tmux_missing_outcome(environ) == outcome
+
+
+# --- review round 4 -----------------------------------------------------------------------------
+
+
+@pytest.mark.parametrize(
+    ("name", "flag", "value"),
+    [
+        # A flag that takes no value: its "value" would be parsed as the next flag (R4-1).
+        ("set", "-w", "-g"),
+        ("set-option", "-p", "-g"),
+        ("set", "-q", "-a"),
+        ("set", "-p", "x"),
+        ("display", "-s", "x"),
+        ("swap-pane", "-s", "%7"),
+        ("new-window", "-T", "x"),
+        ("x", "-x", "v"),
+        ("set-option", "-c", "x"),
+        # -n and -s have their own methods.
+        ("new-window", "-n", "x"),
+        ("new-session", "-s", "x"),
+    ],
+)
+def test_option_takes_only_the_value_taking_flags_of_its_command(
+    name: str, flag: str, value: str
+) -> None:
+    with pytest.raises(ValueError):
+        command(name).option(flag, value)
+
+
+def test_flags_smuggled_as_option_values_never_reach_a_guard() -> None:
+    # The reviewer's R4-1 probe: set -w -g -t %1 -- window-status-format '#(touch PWN)'.
+    with pytest.raises(ValueError):
+        tb.guarded(
+            tb.pane("%1"),
+            tb.owned(ID),
+            command("set")
+            .option("-w", "-g")
+            .target(tb.pane("%1"))
+            .arg("window-status-format")
+            .arg("#(touch PWN)")
+            .build(),
+        )
+    for flag, value in (("-p", "-g"), ("-q", "-a")):
+        with pytest.raises(ValueError):
+            tb.guarded(
+                tb.pane("%1"),
+                tb.owned(ID),
+                command("set")
+                .flag("-p")
+                .option(flag, value)
+                .target(tb.pane("%1"))
+                .arg("@termctl_name")
+                .arg("x")
+                .build(),
+            )
+
+
+@pytest.mark.parametrize("value", ["-", "--", "-t", "-a", "-g", "--json"])
+@pytest.mark.parametrize("name", ["new-window", "new-session", "respawn-pane", "switch-client"])
+def test_option_refuses_flag_like_values(name: str, value: str) -> None:
+    with pytest.raises(ValueError):
+        command(name).option("-c", value)
+
+
+@pytest.mark.parametrize("name", ["new-window", "new-session", "respawn-pane", "switch-client"])
+def test_option_takes_c_on_the_commands_that_have_it(name: str) -> None:
+    assert command(name).option("-c", "/d#x").build().argv == (name, "-c", "/d##x")
+
+
+@pytest.mark.parametrize("value", ["-x", "--", "-t", "a#b", "n;"])
+@pytest.mark.parametrize("name", ["new-window", "new-session"])
+def test_window_name_takes_any_valid_name(name: str, value: str) -> None:
+    # tmux takes the element after -n as its value even when it starts with "-" (spike E).
+    expected = tb.escape_separator(tb.double_hashes(value))
+    assert command(name).window_name(value).build().argv == (name, "-n", expected)
+
+
+def test_window_name_is_only_for_new_window_and_new_session() -> None:
+    for name in ("select-window", "rename-window", "set", "x"):
+        with pytest.raises(ValueError):
+            command(name).window_name("x")
+    with pytest.raises(ValueError):
+        command("new-window").window_name("#[fg=red]")
+
+
+def test_session_name_takes_the_session_grammar() -> None:
+    assert command("new-session").session_name("-w").build().argv == ("new-session", "-s", "-w")
+    for value in ("", "a b", "a#b", "a;", "x" * 65):
+        with pytest.raises(ValueError):
+            command("new-session").session_name(value)
+    with pytest.raises(ValueError):
+        command("new-window").session_name("w")
+
+
+def test_builder_has_one_entry_point() -> None:
+    # R4-2: the builder's fields are not constructor arguments, and a bare builder is refused.
+    with pytest.raises(TypeError):
+        tb.CommandBuilder()
+    with pytest.raises(TypeError):
+        tb.CommandBuilder(_elements=["kill-pane", "-a"], _flags=["-t"])  # type: ignore[call-arg]
+    with pytest.raises(TypeError):
+        dataclasses.replace(command("kill-pane"))
+
+
+@pytest.mark.parametrize(
+    "inner",
+    [
+        # R4-3: only the option names the spec sets inside a guard.
+        _set_p("@a", "1"),
+        _set_p("@termctl_other", "1"),
+        _set_p("window-status-format", "#(x)"),
+        _set_p("default-command", "x"),
+        _set_p("automatic-rename", "off"),
+        _set_w("@termctl_name", "x"),
+        _set_w("remain-on-exit", "on"),
+        _set_w("window-status-format", "#(x)"),
+        command("set").flag("-p").target(tb.pane("%5")).build(),
+        command("set").flag("-p").flag("-u").target(tb.pane("%5")).arg("status-left").build(),
+    ],
+    ids=lambda c: " ".join(c.elements),
+)
+def test_guard_sets_only_the_options_of_the_spec(inner: Command) -> None:
+    with pytest.raises(ValueError):
+        tb.guarded(tb.pane("%5"), tb.owned(ID), inner)
+
+
+@pytest.mark.parametrize(
+    "inner",
+    [
+        # R4-4 and R4-6: display inside a guard prints only ids and numbers, with -p.
+        command("display").target(tb.pane("%5")).format_arg(tb.fields("pane_pid")).build(),
+        command("display-message").target(tb.pane("%5")).format_arg(tb.fields("pane_pid")).build(),
+        command("display").flag("-p").target(tb.pane("%5")).build(),
+        command("display")
+        .flag("-p")
+        .target(tb.pane("%5"))
+        .format_arg(tb.fields("@termctl_name"))
+        .build(),
+        command("display")
+        .flag("-p")
+        .target(tb.pane("%5"))
+        .format_arg(tb.fields("window_name"))
+        .build(),
+        command("display")
+        .flag("-p")
+        .target(tb.pane("%5"))
+        .format_arg(tb.fields("pane_pid", "pane_title"))
+        .build(),
+        command("display").flag("-p").target(tb.pane("%5")).format_arg(tb.owned(ID)).build(),
+    ],
+    ids=lambda c: " ".join(c.elements),
+)
+def test_guarded_display_prints_only_termctl_controlled_text(inner: Command) -> None:
+    with pytest.raises(ValueError):
+        tb.guarded(tb.pane("%5"), tb.owned(ID), inner)
+
+
+def test_guarded_display_takes_the_id_and_number_fields() -> None:
+    names = ("pane_pid", "pane_dead", "pid", "pane_id", "window_id")
+    for name in ("display", "display-message"):
+        inner = command(name).flag("-p").target(tb.pane("%5")).format_arg(tb.fields(*names))
+        assert tb.guarded(tb.pane("%5"), tb.owned(ID), inner.build()).guarded

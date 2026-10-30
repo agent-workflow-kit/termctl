@@ -81,7 +81,8 @@ OPTION_VALUES = [v for v in LITERALS if "\x1b" not in v and "\r" not in v]
 
 # TODO(#25): tmux 3.2 differs from 3.3+ where these tests expect 3.5a's behaviour: rename-window
 # stores "$" as "\\$" in window_name, and defers a "#(...)" job in a rename-window name
-# ("<'...' not ready>") instead of running it (design.md spikes A and E). #25 covers tmux 3.2.
+# ("<'...' not ready>") instead of running it (design.md spikes A and E). #25 covers tmux 3.2;
+# the "$" divergence also affects the displayed-name comparisons of #19 (rename) and #20 (mark).
 TMUX_3_2 = TMUX_VERSION is not None and TMUX_VERSION < (3, 3)
 XFAIL_3_2_DOLLAR = pytest.mark.xfail(
     TMUX_3_2,
@@ -307,7 +308,7 @@ def test_e4_names_round_trip_in_new_window_and_rename_window(
         .flag("-P")
         .format("-F", tb.fields("pane_id", "window_id"))
         .target(tb.session("base"))
-        .option("-n", name)
+        .window_name(name)
         .arg("/usr/bin/env")
         .arg("--")
         .arg("sleep")
@@ -367,7 +368,7 @@ def test_e4_command_formats_never_run(tmux_server: TmuxServer) -> None:
         command("new-window")
         .flag("-d")
         .target(tb.session("base"))
-        .option("-n", payload)
+        .window_name(payload)
         .option("-c", str(cwd))
         .arg("/usr/bin/env")
         .arg("--")
@@ -378,8 +379,8 @@ def test_e4_command_formats_never_run(tmux_server: TmuxServer) -> None:
     new_session = (
         command("new-session")
         .flag("-d")
-        .option("-s", payload)
-        .option("-n", payload)
+        .session_name("-s2")
+        .window_name(payload)
         .option("-c", str(cwd))
         .arg("/usr/bin/env")
         .arg("--")
@@ -399,18 +400,60 @@ def test_e4_command_formats_never_run(tmux_server: TmuxServer) -> None:
         assert tb.guard_outcome(result) is GuardOutcome.MATCHED, result.stderr
     assert _no_canary(canary)
     assert _display(tmux_server, pane_id, "#{window_name}") == payload + "g"
-    sessions = tmux_server.raw("list-sessions", "-F", "#{session_name}").stdout.splitlines()
-    assert payload in sessions
+    windows = tmux_server.raw("list-windows", "-a", "-F", "#{session_name}|#{window_name}")
+    assert f"-s2|{payload}" in windows.stdout.splitlines()
 
 
 # --- C9: doubling does not neutralize "#[" ------------------------------------------------------
 
 
+def _attached_status_line(server: TmuxServer) -> str:
+    """The status line of a client attached to ``server``'s ``base`` session, with its colours
+    as SGR sequences: the client runs in a pane of a second private server, which captures it."""
+    outer = TmuxServer(server.tmux_bin, server.root, str(server.root / "outer"), server.env)
+    attach = [server.tmux_bin, "-S", server.socket_path, "attach", "-t", "=base:"]
+    try:
+        result = outer.raw(
+            "-f", "/dev/null", "new-session", "-d", "-s", "outer", "-x", "80", "-y", "24",
+            "--", "/usr/bin/env", "--", *attach,
+        )  # fmt: skip
+        assert result.returncode == 0, result.stderr
+        lines: list[str] = []
+
+        def rendered() -> bool:
+            capture = outer.raw("capture-pane", "-e", "-p", "-t", "=outer:")
+            lines[:] = capture.stdout.rstrip("\n").splitlines()[-1:]
+            return bool(lines) and "[base]" in lines[0]
+
+        assert wait_for(rendered)
+        return lines[0]
+    finally:
+        outer.raw("kill-server")
+
+
+def test_c9_control_a_status_style_in_a_window_name_applies(tmux_server: TmuxServer) -> None:
+    # Proves the hazard on this tmux (spike C9): "#[" in a window name is a style on the status
+    # line, and doubling does not make it round-trip, so termctl refuses "#[" instead.
+    pane_id = tmux_server.start()
+    window_id = _display(tmux_server, pane_id, "#{window_id}")
+    tmux_server.raw("set-option", "-g", "status-right", "")
+    tmux_server.raw("rename-window", "-t", window_id, "--", "#[fg=red]x")
+    status = _attached_status_line(tmux_server)
+    # x is drawn red (SGR 31), and the style text is not shown.
+    assert "\x1b[31mx" in status and "fg=red" not in status
+    # Doubled, "##[fg=red]x" reads back as given rather than as the name "#[fg=red]x".
+    tmux_server.raw("rename-window", "-t", window_id, "--", "##[fg=red]x")
+    assert _display(tmux_server, pane_id, "#{window_name}") == "##[fg=red]x"
+
+
 @pytest.mark.parametrize("value", ["#[fg=red]x", "a##[b"])
 def test_c9_status_styles_never_reach_a_format_expanded_position(value: str) -> None:
-    for flag in ("-n", "-c", "-s"):
-        with pytest.raises(ValueError):
-            command("new-window").option(flag, value)
+    with pytest.raises(ValueError):
+        command("new-window").window_name(value)
+    with pytest.raises(ValueError):
+        command("new-window").option("-c", "/" + value)
+    with pytest.raises(ValueError):
+        command("new-session").session_name(value)
     with pytest.raises(ValueError):
         command("rename-window").name(value)
 
@@ -501,7 +544,7 @@ def test_f5_every_byte_round_trips_in_a_guarded_option_value(
     _tag(tmux_server, pane_id)
     for form in (f for s in sequences for f in _forms(s)):
         value = os.fsdecode(form)
-        cmd = tb.guarded(tb.pane(pane_id), tb.owned(ID), _set_pane(pane_id, "@v", value))
+        cmd = tb.guarded(tb.pane(pane_id), tb.owned(ID), _set_pane(pane_id, "@termctl_name", value))
         assert _guard(tmux_server, cmd) is GuardOutcome.MATCHED, form
         # The oracle: the same value set unguarded as a plain argument, which no parser sees
         # (tmux escapes some bytes when printing an option, the same way for both).
@@ -511,7 +554,7 @@ def test_f5_every_byte_round_trips_in_a_guarded_option_value(
         assert oracle.returncode == 0, oracle.stderr
         expected = _pane_option_bytes(tmux_server, pane_id, "@w")
         assert expected, form
-        assert _pane_option_bytes(tmux_server, pane_id, "@v") == expected, form
+        assert _pane_option_bytes(tmux_server, pane_id, "@termctl_name") == expected, form
         assert tmux_server.raw("show-options", "-g", "-q", "-v", "@pwned").stdout == "", form
 
 
@@ -555,18 +598,21 @@ def _new_window_in_started(server: TmuxServer) -> tuple[str, str]:
 def test_f5_guard_chains_inner_commands_and_reports_their_output(tmux_server: TmuxServer) -> None:
     pane_id = tmux_server.start()
     _tag(tmux_server, pane_id)
+    window_id = _display(tmux_server, pane_id, "#{window_id}")
+    # Only ids and numbers are printed inside a guard (review round 4, R4-4).
     display = (
         command("display-message")
         .flag("-p")
         .target(tb.pane(pane_id))
-        .format_arg(tb.fields("pane_id", "@termctl_name"))
+        .format_arg(tb.fields("pane_id", "window_id"))
         .build()
     )
     cmd = tb.guarded(
         tb.pane(pane_id), tb.owned(ID), _set_pane(pane_id, "@termctl_name", "n;"), display
     )
     rc, out, err = _run(tmux_server, cmd)
-    assert (rc, out) == (0, f"{pane_id} n;\n"), err
+    assert (rc, out) == (0, f"{pane_id} {window_id}\n"), err
+    assert _show_pane_option(tmux_server, pane_id, "@termctl_name") == "n;"
 
 
 def test_f5_wrong_id_is_a_nomatch_and_changes_nothing(tmux_server: TmuxServer) -> None:
@@ -583,9 +629,9 @@ def test_f5_wrong_id_is_a_nomatch_and_changes_nothing(tmux_server: TmuxServer) -
 
 def test_f5_untagged_pane_is_a_nomatch(tmux_server: TmuxServer) -> None:
     pane_id = tmux_server.start()
-    cmd = tb.guarded(tb.pane(pane_id), tb.owned(ID), _set_pane(pane_id, "@x", "1"))
+    cmd = tb.guarded(tb.pane(pane_id), tb.owned(ID), _set_pane(pane_id, "@termctl_marker", "1"))
     assert _guard(tmux_server, cmd) is GuardOutcome.NOMATCH
-    assert _show_pane_option(tmux_server, pane_id, "@x") == ""
+    assert _show_pane_option(tmux_server, pane_id, "@termctl_marker") == ""
 
 
 def test_f5_inherited_window_option_is_a_nomatch(tmux_server: TmuxServer) -> None:
@@ -667,8 +713,8 @@ def test_f5_window_target_outside_the_guarded_pane_is_a_nomatch(tmux_server: Tmu
 def test_f5_failing_inner_command_is_a_failure_not_a_match(tmux_server: TmuxServer) -> None:
     pane_id = tmux_server.start()
     _tag(tmux_server, pane_id)
-    # An unknown (non-@) option: the guard matches and the inner command fails.
-    cmd = tb.guarded(tb.pane(pane_id), tb.owned(ID), _set_pane(pane_id, "no-such-option", "1"))
+    # An invalid value: the guard matches and the inner command fails.
+    cmd = tb.guarded(tb.pane(pane_id), tb.owned(ID), _set_pane(pane_id, "remain-on-exit", "bogus"))
     rc, out, err = _run(tmux_server, cmd)
     assert (rc, out) == (1, "") and err
     assert _guard(tmux_server, cmd) is GuardOutcome.FAILED
@@ -686,7 +732,7 @@ def test_f5_no_server_is_a_failure_not_a_match(tmux_server: TmuxServer) -> None:
 def test_untagged_and_cleanup_guards(tmux_server: TmuxServer) -> None:
     pane_id = tmux_server.start()
     window_id = _display(tmux_server, pane_id, "#{window_id}")
-    mark = _set_pane(pane_id, "@seen", "1")
+    mark = _set_pane(pane_id, "@termctl_labels", "seen=1")
     pane = tb.pane(pane_id)
     nomatch, matched = GuardOutcome.NOMATCH, GuardOutcome.MATCHED
     assert _guard(tmux_server, tb.guarded(pane, tb.untagged_in_window("@999"), mark)) is nomatch
