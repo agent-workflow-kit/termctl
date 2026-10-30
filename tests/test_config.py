@@ -82,7 +82,8 @@ def load_error(environ: dict[str, str], explicit: str | None = None) -> ConfigEr
 
 
 def example() -> dict[str, Any]:
-    return yaml.safe_load((ROOT / "config.example.yaml").read_text(encoding="utf-8"))
+    """``config.example.yaml`` as termctl's own loader reads it."""
+    return parse((ROOT / "config.example.yaml").read_text(encoding="utf-8"))
 
 
 def test_defaults_equal_config_example() -> None:
@@ -274,6 +275,34 @@ def test_fifo_drop_in_is_not_a_regular_file(home: Path, dropins: Path) -> None:
     err = load_error({"HOME": str(home)})
     assert err.details == {"file": str(fifo)}
     assert "not a regular file" in err.message
+
+
+MAX_SIZE = 1024 * 1024
+
+
+def test_config_file_at_the_size_cap_is_read(home: Path, main_file: Path) -> None:
+    text = "tmux_bin: /opt/tmux\n#"
+    write(main_file, text + "x" * (MAX_SIZE - len(text) - 1) + "\n")
+    assert main_file.stat().st_size == MAX_SIZE
+    assert load_home(home).tmux_bin == "/opt/tmux"
+
+
+def test_config_file_over_the_size_cap_is_too_large(home: Path, main_file: Path) -> None:
+    with main_file.open("wb") as file:
+        file.truncate(MAX_SIZE + 1)  # sparse: nothing is written
+    err = load_error({"HOME": str(home)})
+    assert err.details == {"file": str(main_file)}
+    assert "too large" in err.message and str(main_file) in err.message
+
+
+def test_drop_in_over_the_size_cap_is_too_large(home: Path, dropins: Path) -> None:
+    dropins.mkdir()
+    big = dropins / "a.yaml"
+    with big.open("wb") as file:
+        file.truncate(MAX_SIZE + 1)
+    err = load_error({"HOME": str(home)})
+    assert err.details == {"file": str(big)}
+    assert "too large" in err.message
 
 
 def test_unix_socket_as_the_config_file_is_not_a_regular_file(
@@ -662,6 +691,83 @@ def test_tags_outside_the_core_schema_are_unsupported(
     err = load_error({"HOME": str(home)})
     assert err.details == {"file": str(main_file), "line": 1, "column": 11}
     assert "unsupported tag" in err.message
+
+
+@pytest.mark.parametrize(
+    ("text", "column"),
+    [
+        ("tmux_bin: ! 17\n", 11),
+        ("tmux_bin: !<!> 17\n", 11),
+        ("tmux_bin: ! x\n", 11),
+        ("server_env_allow: ! [PATH]\n", 19),
+        ("markers: ! {m: {text: x}}\n", 10),
+        ("! tmux_bin: x\n", 1),
+        ("!<!> tmux_bin: x\n", 1),
+        ("! [a]: 1\n", 1),
+        ("! {a: 1}: 1\n", 1),
+    ],
+)
+def test_non_specific_tag_is_unsupported(
+    home: Path, main_file: Path, text: str, column: int
+) -> None:
+    write(main_file, text)
+    err = load_error({"HOME": str(home)})
+    assert err.details == {"file": str(main_file), "line": 1, "column": column}
+    assert "unsupported tag '!'" in err.message
+
+
+@pytest.mark.parametrize(
+    ("text", "kind", "key"),
+    [
+        ("!!str [a]: 1\n", "sequence", None),
+        ("? [a]\n: 1\n", "sequence", None),
+        ("? {a: 1}\n: 1\n", "mapping", None),
+        ("markers: {? [a] : {text: x}}\n", "sequence", "markers"),
+        ("markers:\n  !!str {a: 1}: {text: x}\n", "mapping", "markers"),
+    ],
+)
+def test_non_scalar_keys_are_not_allowed(
+    home: Path, main_file: Path, text: str, kind: str, key: str | None
+) -> None:
+    write(main_file, text)
+    err = load_error({"HOME": str(home)})
+    expected = {"file": str(main_file)} | ({"key": key} if key else {})
+    assert without_position(err.details) == expected
+    assert f"a {kind} key is not allowed" in err.message
+    for word in ("quote", "tag", "seq ", "map ", "'?'"):
+        assert word not in err.message
+
+
+def test_empty_duplicate_key_is_shown_quoted(home: Path, main_file: Path) -> None:
+    write(main_file, "markers: {'': {text: x}, '': {text: y}}\n")
+    err = load_error({"HOME": str(home)})
+    assert without_position(err.details) == {"file": str(main_file), "key": "markers."}
+    assert err.message.endswith(": 'markers.': duplicate key")
+
+
+def test_empty_top_level_non_string_key_is_readable(home: Path, main_file: Path) -> None:
+    write(main_file, "? !!null ''\n: 1\n")
+    err = load_error({"HOME": str(home)})
+    assert without_position(err.details) == {"file": str(main_file), "key": ""}
+    assert ": '': the key is tagged !!null" in err.message
+
+
+def test_long_keys_are_shortened_in_messages(home: Path, main_file: Path) -> None:
+    long = "k" * 1000
+    write(main_file, f"markers: {{{long}: {{text: x}}, {long}: {{text: y}}}}\n")
+    err = load_error({"HOME": str(home)})
+    assert without_position(err.details) == {"file": str(main_file), "key": f"markers.{long}"}
+    assert "(1008 characters)" in err.message
+    assert len(err.message) - len(str(main_file)) < 300
+
+
+def test_long_non_string_key_is_shortened_in_messages(home: Path, main_file: Path) -> None:
+    number = "1" * 1000
+    write(main_file, f"markers: {{{number}: {{text: x}}}}\n")
+    err = load_error({"HOME": str(home)})
+    assert without_position(err.details) == {"file": str(main_file), "key": f"markers.{number}"}
+    assert "quote it" in err.message and "(1000 characters)" in err.message
+    assert len(err.message) - len(str(main_file)) < 300
 
 
 @pytest.mark.parametrize(

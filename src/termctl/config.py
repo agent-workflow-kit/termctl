@@ -295,7 +295,8 @@ def _is_merge_key(node: yaml.Node) -> bool:
 def _check_keys(root: yaml.Node, tagged: set[int]) -> None:
     """Every mapping key is a string, appears once, and is not a merge key (``<<``); the first
     violation in document order is reported. ``tagged`` holds the ids of explicitly tagged
-    nodes, whose hint is to remove the tag rather than to quote."""
+    nodes: a tagged scalar key's hint is to remove the tag rather than to quote. A sequence or
+    mapping key names the mapping it is in (it has no text of its own)."""
     stack: list[tuple[yaml.Node, str]] = [(root, "")]
     while stack:
         node, path = stack.pop()
@@ -310,9 +311,17 @@ def _check_keys(root: yaml.Node, tagged: set[int]) -> None:
             for key_node, value_node in pairs:
                 if _is_merge_key(key_node):
                     raise _Rejected("merge keys (<<) are not allowed", key_node.start_mark)
-                text = key_node.value if isinstance(key_node, yaml.ScalarNode) else "?"
+                if not isinstance(key_node, yaml.ScalarNode):
+                    kind = "sequence" if isinstance(key_node, yaml.SequenceNode) else "mapping"
+                    problem = f"a {kind} key is not allowed; keys must be strings"
+                    if path:
+                        raise _Rejected(
+                            f"{validate.show(path)}: {problem}", key_node.start_mark, path
+                        )
+                    raise _Rejected(problem, key_node.start_mark)
+                text: str = key_node.value
                 key = f"{path}.{text}" if path else text
-                if not isinstance(key_node, yaml.ScalarNode) or key_node.tag != _STR_TAG:
+                if key_node.tag != _STR_TAG:
                     if id(key_node) in tagged:
                         hint = f"the key is tagged {_short_tag(key_node.tag)}, not a string;"
                         hint += " remove the tag"
@@ -321,9 +330,11 @@ def _check_keys(root: yaml.Node, tagged: set[int]) -> None:
                         article = "an" if kind[:1] in ("a", "e", "i", "o", "u") else "a"
                         hint = f"the key is read as {article} {kind}, not a string;"
                         hint += f" quote it ({validate.show(text)})"
-                    raise _Rejected(f"{key}: {hint}", key_node.start_mark, key)
+                    raise _Rejected(f"{validate.show(key)}: {hint}", key_node.start_mark, key)
                 if text in seen:
-                    raise _Rejected(f"{key}: duplicate key", key_node.start_mark, key)
+                    raise _Rejected(
+                        f"{validate.show(key)}: duplicate key", key_node.start_mark, key
+                    )
                 seen.add(text)
                 values.append((value_node, key))
             stack.extend(reversed(values))
@@ -367,7 +378,8 @@ class _Loader(yaml.SafeLoader):
     """``SafeLoader`` with the YAML 1.2 core schema's scalars (so ``yes``, ``on``, ``017`` and
     ``1:30`` are not special) and tags (so no ``!!timestamp``, ``!!binary``, ``!!set``...),
     without anchors, aliases or merge keys (they enable exponential blow-up and config files
-    need none), with string keys only and no duplicate keys."""
+    need none), without the non-specific tag ``!``, with string keys only and no duplicate
+    keys."""
 
     # Only the core schema's implicit types and tags (added below).
     yaml_implicit_resolvers: dict[Any, Any] = {}  # noqa: RUF012 (PyYAML's class attribute)
@@ -384,8 +396,11 @@ class _Loader(yaml.SafeLoader):
         event = self.peek_event()
         if isinstance(event, yaml.AliasEvent) or getattr(event, "anchor", None) is not None:
             raise _Rejected("anchors and aliases are not allowed", event.start_mark)
+        tag = getattr(event, "tag", None)
+        if tag == "!":  # the non-specific tag, written ! or !<!>
+            raise _Rejected("unsupported tag '!'", event.start_mark)
         node = super().compose_node(parent, index)  # pyright: ignore[reportUnknownMemberType]
-        if getattr(event, "tag", None) not in (None, "!"):
+        if tag is not None:
             self.tagged.add(id(node))
         return node
 
@@ -440,10 +455,15 @@ def _cannot_read(path: Path, reason: str) -> ConfigError:
     return ConfigError(f"cannot read config {path}: {reason}", file=str(path))
 
 
+# The largest config file or drop-in termctl reads.
+MAX_FILE_SIZE = 1024 * 1024
+
+
 def _read_bytes(path: Path) -> bytes:
-    """The contents of ``path``, which must be a regular file (after symlinks). Checked before
-    opening (so a socket or device is never opened) and again after (in case it was replaced);
-    opened without blocking or taking a controlling terminal, so a FIFO is never waited on."""
+    """The contents of ``path``, which must be a regular file (after symlinks) of at most
+    ``MAX_FILE_SIZE`` bytes. Checked before opening (so a socket or device is never opened) and
+    again after (in case it was replaced); opened without blocking or taking a controlling
+    terminal, so a FIFO is never waited on. At most one byte past the cap is read."""
     if not stat.S_ISREG(os.stat(path).st_mode):
         raise _cannot_read(path, "not a regular file")
     fd = os.open(path, os.O_RDONLY | os.O_NONBLOCK | os.O_NOCTTY | os.O_CLOEXEC)
@@ -451,9 +471,12 @@ def _read_bytes(path: Path) -> bytes:
         if not stat.S_ISREG(os.fstat(fd).st_mode):
             raise _cannot_read(path, "not a regular file")
         with open(fd, "rb", closefd=False) as file:
-            return file.read()
+            data = file.read(MAX_FILE_SIZE + 1)
     finally:
         os.close(fd)
+    if len(data) > MAX_FILE_SIZE:
+        raise _cannot_read(path, f"file too large (more than {MAX_FILE_SIZE} bytes)")
+    return data
 
 
 def _read(path: Path, *, optional: bool = False) -> dict[str, Any]:
