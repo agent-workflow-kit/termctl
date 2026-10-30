@@ -195,6 +195,6 @@ Run on 2026-10-30 against tmux 3.5a and 3.2a, each on a private `-S` socket with
 ## Testing
 
 - Unit tests with a fake gateway for every module.
-- Integration tests against real tmux in CI (tmux from apt): each test pre-starts its own server with `tmux -f /dev/null -S <path>` on a private socket path and passes `--socket <path>` to termctl, so the server never loads a user's config; a `make verify-floor` target runs them with tmux 3.2 when available locally.
+- Integration tests against real tmux in CI (tmux from apt, in termctl's own `tmux` job with `TERMCTL_REQUIRE_TMUX` set, since the shared awkit-ci workflow cannot install packages): each test pre-starts its own server with `tmux -f /dev/null -S <path>` on a private socket path and passes `--socket <path>` to termctl, so the server never loads a user's config; a `make verify-floor` target runs them with tmux 3.2 when available locally.
 - Golden `--json` files, validated against `schemas/`.
 - No `live` tests: nothing termctl touches needs credentials or a model.

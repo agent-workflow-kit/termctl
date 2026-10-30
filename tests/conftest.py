@@ -3,8 +3,9 @@
 Each test gets its own server, started with ``tmux -f /dev/null -S <tmp path>``, so it never
 loads a user's config or touches a user's server; teardown stops exactly that server with
 ``kill-server`` on its socket. Tests using it are marked ``tmux``. They are not ``live``: a
-missing tmux skips them locally but fails them when the ``CI`` environment variable is set, so
-a CI runner without tmux cannot pass by skipping them all (the CI workflow must provide tmux).
+missing tmux skips them, but fails them when ``TERMCTL_REQUIRE_TMUX`` is set, so the CI job
+that installs tmux (``tmux`` in .github/workflows/ci.yml) cannot pass by skipping them all.
+The shared CI's ``verify`` job cannot install tmux, so there they skip.
 """
 
 from __future__ import annotations
@@ -97,15 +98,16 @@ def wait_for(predicate: Callable[[], bool], timeout: float = 5.0) -> bool:
 
 
 def tmux_missing_outcome(environ: Mapping[str, str]) -> str:
-    """What a missing tmux does to a ``tmux`` test: ``"fail"`` under CI, else ``"skip"``."""
-    return "fail" if environ.get("CI") else "skip"
+    """What a missing tmux does to a ``tmux`` test: ``"fail"`` when ``TERMCTL_REQUIRE_TMUX``
+    is set, else ``"skip"``."""
+    return "fail" if environ.get("TERMCTL_REQUIRE_TMUX") else "skip"
 
 
 @pytest.fixture
 def tmux_server() -> Iterator[TmuxServer]:
     if TMUX_BIN is None:
         if tmux_missing_outcome(os.environ) == "fail":
-            pytest.fail("tmux is not installed, and CI must run the tmux tests")
+            pytest.fail("tmux is not installed, and TERMCTL_REQUIRE_TMUX requires the tmux tests")
         pytest.skip("tmux is not installed")
     # A short path: Unix socket paths are limited to about 100 bytes.
     root = Path(tempfile.mkdtemp(prefix="tc-"))

@@ -42,7 +42,7 @@ pythonVersion = "3.12"
 testpaths = ["tests"]
 markers = [
     "live: needs real models/hosts/credentials; never run in CI",
-    "tmux: runs real tmux on a private socket; skipped without tmux, failed without it in CI",
+    "tmux: runs real tmux on a private socket; skipped without tmux, failed if TERMCTL_REQUIRE_TMUX",
 ]
 addopts = "-m 'not live'"
 

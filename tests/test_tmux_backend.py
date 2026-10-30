@@ -1107,9 +1107,17 @@ def test_command_is_immutable() -> None:
 
 @pytest.mark.parametrize(
     ("environ", "outcome"),
-    [({}, "skip"), ({"CI": "true"}, "fail"), ({"CI": "1"}, "fail"), ({"CI": ""}, "skip")],
+    [
+        ({}, "skip"),
+        # The shared CI's verify job has no tmux (it cannot install packages); termctl's own
+        # tmux job installs it and sets TERMCTL_REQUIRE_TMUX.
+        ({"CI": "true"}, "skip"),
+        ({"TERMCTL_REQUIRE_TMUX": "1"}, "fail"),
+        ({"CI": "true", "TERMCTL_REQUIRE_TMUX": "1"}, "fail"),
+        ({"TERMCTL_REQUIRE_TMUX": ""}, "skip"),
+    ],
 )
-def test_missing_tmux_fails_under_ci_and_skips_elsewhere(
+def test_missing_tmux_fails_where_required_and_skips_elsewhere(
     environ: dict[str, str], outcome: str
 ) -> None:
     assert tmux_missing_outcome(environ) == outcome
