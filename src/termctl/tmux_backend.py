@@ -13,8 +13,8 @@ Every argument termctl passes to tmux is built here, so the rules cannot be skip
 4. **Literal positions.** argv, ``-e`` values and option values need only rule 1.
 5. **Guarded writes.** ``guarded`` wraps commands in ``if-shell -F -t %N``; each inner command
    is one of the guarded mutations (or ``display -p``), targets that pane or, for
-   ``rename-window``, the window containing it, and its elements are quoted by ``quote``.
-   ``guard_outcome`` reads the result.
+   ``rename-window`` and ``set -w``, the window containing it, and its elements are quoted
+   by ``quote``. ``guard_outcome`` reads the result.
 
 Targets are exact ids (``=S:``, ``@N``, ``%N``, ``=S:@W.%P``); ``Target`` checks that grammar
 however it is built. ``Format`` values come only from this module's factories. Value-taking
@@ -227,9 +227,13 @@ def pane_in_session(name: str, window_id: str, pane_id: str) -> Target:
 # --- one tmux command ---------------------------------------------------------------------------
 
 
+_COMMAND_KEY = object()
+
+
 @dataclass(frozen=True)
 class Command:
-    """One tmux command after rules 2 to 4.
+    """One tmux command after rules 2 to 4. Only ``CommandBuilder.build`` and ``guarded``
+    make one, since ``guarded`` trusts its ``target`` and ``flags``.
 
     ``elements`` are the values tmux must receive; ``shown`` are the same with ``--env``
     values replaced by their names (``--verbose``, dry runs). ``argv`` applies rule 1 for
@@ -244,6 +248,13 @@ class Command:
     target: Target | None = None
     # The flags given to the builder, in order (``-t`` included), without their values.
     flags: tuple[str, ...] = ()
+    # As for Format: not an __init__ argument, so direct construction and dataclasses.replace
+    # get None and are refused; only _command sets the key (review round 3, R3-3).
+    _key: object = field(default=None, init=False, repr=False, compare=False)
+
+    def __post_init__(self) -> None:
+        if self._key is not _COMMAND_KEY:
+            raise TypeError("a Command is built only by CommandBuilder.build or guarded")
 
     @property
     def name(self) -> str:
@@ -258,6 +269,27 @@ class Command:
 
     def quoted_shown(self) -> str:
         return " ".join(quote(element) for element in self.shown)
+
+
+def _command(
+    elements: tuple[str, ...],
+    shown: tuple[str, ...],
+    *,
+    guarded: bool = False,
+    target: Target | None,
+    flags: tuple[str, ...],
+) -> Command:
+    cmd = object.__new__(Command)
+    for name, value in (
+        ("elements", elements),
+        ("shown", shown),
+        ("guarded", guarded),
+        ("target", target),
+        ("flags", flags),
+        ("_key", _COMMAND_KEY),
+    ):
+        object.__setattr__(cmd, name, value)
+    return cmd
 
 
 @dataclass
@@ -389,7 +421,7 @@ class CommandBuilder:
         return self
 
     def build(self) -> Command:
-        return Command(
+        return _command(
             tuple(self._elements),
             tuple(self._shown),
             target=self._target,
@@ -522,12 +554,13 @@ _NOMATCH_COMMAND = command("display").flag("-p").format_arg(_format(NOMATCH)).bu
 
 # The commands a guard may run and the flags each may take (interface.md rule 5): the
 # mutations of a managed pane, and display -p for close --force. Anything else, such as -a
-# (all other panes) or -s (a source pane, or server options), could act outside the pane.
+# (all other panes), -s (a source pane, or server options), -g or -U, could act outside the
+# pane. set takes -p, or -w for the window options of Open order step 6.
 _GUARDED_FLAGS: dict[str, frozenset[str]] = {
     "kill-pane": frozenset({"-t"}),
     "rename-window": frozenset({"-t"}),
-    "set-option": frozenset({"-p", "-t", "-u", "-q", "-o"}),
-    "set": frozenset({"-p", "-t", "-u", "-q", "-o"}),
+    "set-option": frozenset({"-p", "-w", "-t", "-u", "-q", "-o"}),
+    "set": frozenset({"-p", "-w", "-t", "-u", "-q", "-o"}),
     "respawn-pane": frozenset({"-k", "-t", "-c", "-e"}),
     "display": frozenset({"-p", "-t"}),
     "display-message": frozenset({"-p", "-t"}),
@@ -545,13 +578,16 @@ def _check_guarded_target(guard: Target, inner: Command) -> Target | None:
     refused = [f for f in inner.flags if f not in allowed]
     if refused:
         raise ValueError(f"{inner.name} inside a guard cannot take {' '.join(refused)}")
-    if inner.name in ("set-option", "set") and "-p" not in inner.flags:
-        raise ValueError(f"{inner.name} inside a guard sets pane options only (-p)")
+    window_scoped = inner.name == "rename-window"
+    if inner.name in ("set-option", "set"):
+        if ("-p" in inner.flags) == ("-w" in inner.flags):
+            raise ValueError(f"{inner.name} inside a guard takes exactly one of -p and -w")
+        window_scoped = "-w" in inner.flags
     if inner.target is None:
         raise ValueError("a guarded command must name its target with target()")
     if inner.target.kind == "window":
-        if inner.name != "rename-window":
-            raise ValueError("only rename-window takes a window target inside a guard")
+        if not window_scoped:
+            raise ValueError("only rename-window and set -w take a window target inside a guard")
         return inner.target
     if inner.target != guard:
         raise ValueError(
@@ -566,12 +602,13 @@ def guarded(target: Target, condition: Format, *commands: Command) -> Command:
 
     The inner commands run only while ``condition`` holds for pane ``target``, in the same tmux
     command; a missing pane evaluates the condition as false (spike F5). Inner commands are
-    limited to ``kill-pane``, ``rename-window``, ``set -p``, ``respawn-pane`` and ``display
-    -p``, each with only the flags it needs (``_GUARDED_FLAGS``; never ``-a`` or ``-s``). Each
-    targets that same pane, or for ``rename-window`` only a window (``-t @W``); for a window
-    target the condition also requires the pane to be in that window, so no inner command can
-    act outside the guarded pane. Inner elements are quoted by ``quote``, where rule 1 does
-    not apply; several inner commands are joined by `` ; ``.
+    limited to ``kill-pane``, ``rename-window``, ``set -p``, ``set -w``, ``respawn-pane`` and
+    ``display -p``, each with only the flags it needs (``_GUARDED_FLAGS``; never ``-a``,
+    ``-s``, ``-g`` or ``-U``). Each targets that same pane (``set -w -t %N`` sets the options
+    of the pane's own window), or for ``rename-window`` and ``set -w`` only a window (``-t
+    @W``); for a window target the condition also requires the pane to be in that window, so
+    no inner command can act outside the guarded pane or its window. Inner elements are quoted
+    by ``quote``, where rule 1 does not apply; several inner commands are joined by `` ; ``.
     """
     if not isinstance(target, Target) or not isinstance(condition, Format):
         raise TypeError("a guard takes a Target and a Format")
@@ -599,7 +636,7 @@ def guarded(target: Target, condition: Format, *commands: Command) -> Command:
     built._add(_NOMATCH_COMMAND.quoted())
     plain = built.build()
     shown = (*plain.shown[:-2], inner_shown, plain.shown[-1])
-    return Command(plain.elements, shown, guarded=True, target=target, flags=plain.flags)
+    return _command(plain.elements, shown, guarded=True, target=target, flags=plain.flags)
 
 
 class GuardOutcome(enum.Enum):

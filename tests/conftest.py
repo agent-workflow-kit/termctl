@@ -10,6 +10,7 @@ a CI runner without tmux cannot pass by skipping them all (the CI workflow must 
 from __future__ import annotations
 
 import os
+import re
 import shutil
 import subprocess
 import tempfile
@@ -24,6 +25,18 @@ from termctl.gateway import SystemGateway
 from termctl.tmux_backend import Tmux
 
 TMUX_BIN = shutil.which("tmux")
+
+
+def tmux_version(tmux_bin: str | None = TMUX_BIN) -> tuple[int, int] | None:
+    """``(major, minor)`` of ``tmux_bin`` (``tmux 3.2a`` is ``(3, 2)``); ``None`` without one."""
+    if tmux_bin is None:
+        return None
+    out = subprocess.run([tmux_bin, "-V"], capture_output=True, text=True, timeout=10).stdout
+    match = re.search(r"([0-9]+)\.([0-9]+)", out)
+    return (int(match.group(1)), int(match.group(2))) if match else None
+
+
+TMUX_VERSION = tmux_version()
 
 
 @dataclass

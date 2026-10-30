@@ -601,7 +601,6 @@ def test_guard_target_spoofs_are_refused() -> None:
         command("kill-pane").target(tb.pane_in_session("s", "@1", "%5")).build(),
         # if-shell inside a guard, however built.
         command("if-shell").target(guard).arg("1").arg("kill-server").build(),
-        Command(("if-shell", "-t", "%5", "--", "1", "kill-server"), ("if-shell",)),
     ]
     for inner in spoofs:
         with pytest.raises(ValueError):
@@ -610,28 +609,119 @@ def test_guard_target_spoofs_are_refused() -> None:
         command("kill-pane").flag("-t")
 
 
-def test_guard_builds_every_guarded_sequence_of_the_spec() -> None:
-    # interface.md rule 5 and close/Open order: kill-pane, rename-window, set -p, respawn-pane,
-    # and display -p of termctl's own format (close --force).
-    guard, cond, pane5 = tb.pane("%5"), tb.owned(ID), tb.pane("%5")
-    inners = [
-        command("kill-pane").target(pane5).build(),
-        command("rename-window").target(tb.window("@2")).name("n").build(),
-        command("rename-window").target(pane5).name("n").build(),
-        command("set-option").flag("-p").target(pane5).arg("@a").arg("1").build(),
-        command("set").flag("-p").target(pane5).arg("@a").arg("1").build(),
-        command("set-option").flag("-p").flag("-u").target(pane5).arg("@a").build(),
+def _set_p(name: str, value: str, target: tb.Target | None = None) -> Command:
+    return command("set").flag("-p").target(target or tb.pane("%5")).arg(name).arg(value).build()
+
+
+def _set_w(name: str, value: str, target: tb.Target | None = None) -> Command:
+    return command("set").flag("-w").target(target or tb.pane("%5")).arg(name).arg(value).build()
+
+
+def _step6_tagging() -> tuple[Command, ...]:
+    """Open order step 6 with argv: the pane options, the window options automatic-rename off
+    and allow-rename off, remain-on-exit, respawn-pane -k and the query of step 7."""
+    pane_options = [
+        ("@termctl_v", "1"),
+        ("@termctl_pane", "%5"),
+        ("@termctl_window", "@2"),
+        ("@termctl_id", ID),
+        ("@termctl_name", "PR#42 review"),
+        ("@termctl_marker", ""),
+        ("@termctl_marker_text", ""),
+        ("@termctl_labels", "a=b"),
+        ("@termctl_placement", "window"),
+        ("@termctl_keep", "failed"),
+        ("@termctl_created", "2026-10-30T00:00:00.000Z"),
+        ("@termctl_pid", ""),
+        ("@termctl_pid_start", ""),
+    ]
+    return (
+        *(_set_p(name, value) for name, value in pane_options),
+        _set_w("automatic-rename", "off"),
+        _set_w("allow-rename", "off"),
+        _set_p("remain-on-exit", "failed"),
         command("respawn-pane")
         .flag("-k")
         .option("-c", "/tmp")
-        .target(pane5)
+        .target(tb.pane("%5"))
         .env("V", "v")
         .arg("/usr/bin/env")
         .arg("--")
         .arg("sleep")
         .arg("30")
         .build(),
-        command("display").flag("-p").target(pane5).format_arg(tb.fields("pane_pid")).build(),
+        command("display")
+        .flag("-p")
+        .target(tb.pane("%5"))
+        .format_arg(tb.fields("pane_pid", "pane_dead", "pid"))
+        .build(),
+    )
+
+
+def test_guard_builds_every_guarded_sequence_of_the_spec() -> None:
+    # Every guarded sequence of interface.md, each as one guard (review round 3, R3-1).
+    pane5, window2 = tb.pane("%5"), tb.window("@2")
+    kill = command("kill-pane").target(pane5).build()
+    sequences: list[tuple[Format, tuple[Command, ...]]] = [
+        # Open order step 6 with argv (the tagging invocation).
+        (tb.untagged_in_window("@2"), _step6_tagging()),
+        # Open order step 6 without argv: the same options, then the query of step 7.
+        (
+            tb.untagged_in_window("@2"),
+            tuple(c for c in _step6_tagging() if c.name != "respawn-pane"),
+        ),
+        # The kill after a failed tagging (Open order).
+        (tb.cleanup("@2"), (kill,)),
+        # rename, mark, unmark: the pane options, then the window rename.
+        (
+            tb.owned(ID),
+            (
+                _set_p("@termctl_name", "n"),
+                _set_p("@termctl_marker", "attention"),
+                _set_p("@termctl_marker_text", "\U0001f514 "),
+            ),
+        ),
+        (
+            tb.owned_single_pane_window(ID),
+            (command("rename-window").target(window2).name("\U0001f514 n").build(),),
+        ),
+        # label add / remove.
+        (tb.owned(ID), (_set_p("@termctl_labels", "a=b c=d"),)),
+        # close of a dead pane; close --force reads the PID and kills in one guard.
+        (tb.owned(ID), (kill,)),
+        (
+            tb.owned(ID),
+            (
+                command("display")
+                .flag("-p")
+                .target(pane5)
+                .format_arg(tb.fields("pane_pid"))
+                .build(),
+                kill,
+            ),
+        ),
+    ]
+    for condition, inners in sequences:
+        built = tb.guarded(pane5, condition, *inners)
+        assert built.guarded
+        assert built.elements[-2] == " ; ".join(c.quoted() for c in inners)
+
+
+def test_guard_accepts_the_spelled_out_forms() -> None:
+    guard, cond, pane5 = tb.pane("%5"), tb.owned(ID), tb.pane("%5")
+    inners = [
+        command("rename-window").target(pane5).name("n").build(),
+        command("set-option").flag("-p").target(pane5).arg("@a").arg("1").build(),
+        command("set-option").flag("-p").flag("-u").target(pane5).arg("@a").build(),
+        command("set-option")
+        .flag("-p")
+        .flag("-q")
+        .flag("-o")
+        .target(pane5)
+        .arg("@a")
+        .arg("1")
+        .build(),
+        command("set-option").flag("-w").target(pane5).arg("allow-rename").arg("off").build(),
         command("display-message")
         .flag("-p")
         .target(pane5)
@@ -640,7 +730,22 @@ def test_guard_builds_every_guarded_sequence_of_the_spec() -> None:
     ]
     for inner in inners:
         assert tb.guarded(guard, cond, inner).guarded
-    assert tb.guarded(guard, cond, inners[-2], inners[0]).guarded
+
+
+def test_guard_window_option_on_the_pane_needs_no_window_condition() -> None:
+    # set -w -t %N acts on the window containing the guarded pane itself.
+    cond = tb.untagged_in_window("@2")
+    built = tb.guarded(tb.pane("%5"), cond, _set_w("automatic-rename", "off"))
+    assert built.elements[built.elements.index("--") + 1] == cond.text
+
+
+def test_guard_window_option_on_a_window_requires_containment() -> None:
+    # set -w -t @W: like rename-window -t @W, the condition also requires the pane in @W.
+    cond = tb.owned(ID)
+    built = tb.guarded(tb.pane("%5"), cond, _set_w("allow-rename", "off", tb.window("@3")))
+    assert (
+        built.elements[built.elements.index("--") + 1] == tb.all_of(cond, tb.in_window("@3")).text
+    )
 
 
 @pytest.mark.parametrize(
@@ -661,7 +766,13 @@ def test_guard_builds_every_guarded_sequence_of_the_spec() -> None:
         # set only at pane scope: not global, server, window or session options.
         command("set-option").target(tb.pane("%5")).arg("@a").arg("1").build(),
         command("set-option").flag("-g").target(tb.pane("%5")).arg("@a").arg("1").build(),
-        command("set-option").flag("-w").target(tb.pane("%5")).arg("@a").arg("1").build(),
+        command("set-option").flag("-w").flag("-g").target(tb.pane("%5")).arg("@a").build(),
+        command("set-option").flag("-w").flag("-a").target(tb.pane("%5")).arg("@a").build(),
+        command("set-option").flag("-w").flag("-U").target(tb.pane("%5")).arg("@a").build(),
+        command("set").server_scope().flag("-w").target(tb.pane("%5")).arg("@a").build(),
+        command("set").flag("-p").flag("-w").target(tb.pane("%5")).arg("@a").arg("1").build(),
+        command("set").flag("-w").target(tb.pane("%6")).arg("allow-rename").arg("off").build(),
+        command("set").flag("-w").target(tb.session("s")).arg("allow-rename").arg("off").build(),
         command("set-option").flag("-p").flag("-g").target(tb.pane("%5")).arg("@a").build(),
         command("set").server_scope().flag("-p").target(tb.pane("%5")).arg("@a").build(),
         command("set-option").flag("-p").flag("-a").target(tb.pane("%5")).arg("@a").build(),
@@ -913,6 +1024,28 @@ def test_format_cannot_be_forged_with_replace() -> None:
         Format("#(touch /tmp/x)", tb._FORMAT_KEY)  # type: ignore[call-arg]
     with pytest.raises(TypeError):
         Format(text="#{pane_id}")
+
+
+def test_command_cannot_be_built_directly() -> None:
+    # Review round 3, R3-3: guarded() trusts a Command's target and flags, so only
+    # CommandBuilder.build() (and guarded() itself) may make one.
+    with pytest.raises(TypeError):
+        Command(
+            ("kill-pane", "-a", "-t", "%5"), ("kill-pane",), target=tb.pane("%5"), flags=("-t",)
+        )
+    with pytest.raises(TypeError):
+        Command(("if-shell", "-t", "%5", "--", "1", "kill-server"), ("if-shell",))
+
+
+def test_command_cannot_be_forged_with_replace() -> None:
+    cmd = command("kill-pane").flag("-a").target(tb.pane("%5")).build()
+    with pytest.raises(TypeError):
+        dataclasses.replace(cmd, flags=("-t",))
+    guarded = tb.guarded(
+        tb.pane("%5"), tb.owned(ID), command("kill-pane").target(tb.pane("%5")).build()
+    )
+    with pytest.raises(TypeError):
+        dataclasses.replace(guarded, guarded=False)
 
 
 def test_formats_compare_by_text() -> None:

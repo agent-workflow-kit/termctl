@@ -16,7 +16,7 @@ import pytest
 from termctl import tmux_backend as tb
 from termctl.tmux_backend import Command, GuardOutcome, Invocation, command
 
-from .conftest import TmuxServer, wait_for
+from .conftest import TMUX_VERSION, TmuxServer, wait_for
 
 pytestmark = pytest.mark.tmux
 
@@ -79,6 +79,21 @@ LITERALS = [
 # (tab and newline are kept), so those are left to the argv and -e tests, which read them raw.
 OPTION_VALUES = [v for v in LITERALS if "\x1b" not in v and "\r" not in v]
 
+# TODO(#25): tmux 3.2 differs from 3.3+ where these tests expect 3.5a's behaviour: rename-window
+# stores "$" as "\\$" in window_name, and defers a "#(...)" job in a rename-window name
+# ("<'...' not ready>") instead of running it (design.md spikes A and E). #25 covers tmux 3.2.
+TMUX_3_2 = TMUX_VERSION is not None and TMUX_VERSION < (3, 3)
+XFAIL_3_2_DOLLAR = pytest.mark.xfail(
+    TMUX_3_2,
+    reason="#25: tmux 3.2 rename-window reports '$' as '\\$' in window_name",
+    strict=True,
+)
+XFAIL_3_2_JOB = pytest.mark.xfail(
+    TMUX_3_2,
+    reason="#25: tmux 3.2 defers a #() job in a rename-window name instead of running it",
+    strict=True,
+)
+
 # Values for format-expanded positions: valid names (no control characters, no "#[").
 NAMES = [
     "#",
@@ -104,6 +119,10 @@ NAMES = [
     "a,b",
     "é中\U0001f514",
     "🔔 KEY-12",
+]
+# NAMES as test parameters, with the tmux 3.2 "$" divergence marked (TODO(#25) above).
+NAME_PARAMS = [
+    pytest.param(n, marks=XFAIL_3_2_DOLLAR) if "$" in n else pytest.param(n) for n in NAMES
 ]
 
 
@@ -277,7 +296,7 @@ def test_e3_leading_dash_positionals_are_not_flags(tmux_server: TmuxServer) -> N
 # --- E4: "#" doubling; "#(" never executes ------------------------------------------------------
 
 
-@pytest.mark.parametrize("name", NAMES)
+@pytest.mark.parametrize("name", NAME_PARAMS)
 def test_e4_names_round_trip_in_new_window_and_rename_window(
     tmux_server: TmuxServer, name: str
 ) -> None:
@@ -327,6 +346,7 @@ def test_e4_cwd_round_trips(tmux_server: TmuxServer, dirname: str) -> None:
     assert wait_for(lambda: _display(tmux_server, pane_id, "#{pane_current_path}") == str(cwd))
 
 
+@XFAIL_3_2_JOB  # TODO(#25): tmux 3.2 defers the job instead of running it.
 def test_e4_control_an_undoubled_command_format_runs(tmux_server: TmuxServer) -> None:
     # Proves "#(" executes in a rename-window name on this tmux, so the next tests can fail.
     pane_id = tmux_server.start()
@@ -409,7 +429,7 @@ def test_f5_guarded_option_values_round_trip(tmux_server: TmuxServer, value: str
     assert tmux_server.raw("show-options", "-g", "-q", "-v", "@termctl_name").stdout == ""
 
 
-@pytest.mark.parametrize("name", NAMES)
+@pytest.mark.parametrize("name", NAME_PARAMS)
 def test_f5_guarded_rename_round_trips(tmux_server: TmuxServer, name: str) -> None:
     pane_id = tmux_server.start()
     window_id = _display(tmux_server, pane_id, "#{window_id}")
@@ -677,6 +697,42 @@ def test_untagged_and_cleanup_guards(tmux_server: TmuxServer) -> None:
     # Tagged by someone else (another pane id): the cleanup kill refuses.
     tmux_server.raw("set-option", "-p", "-t", pane_id, "@termctl_pane", "%999")
     assert _guard(tmux_server, tb.guarded(pane, tb.cleanup(window_id), mark)) is nomatch
+
+
+def _window_option(server: TmuxServer, window_id: str, name: str) -> str:
+    """The window's own value of ``name``, empty when only inherited."""
+    return server.raw("show-options", "-w", "-q", "-v", "-t", window_id, name).stdout.strip()
+
+
+def test_guarded_tagging_sets_the_window_rename_options(tmux_server: TmuxServer) -> None:
+    # Open order step 6: set -w -t %N inside the tagging guard acts on the pane's own window
+    # (review round 3, R3-1).
+    pane_id, window_id = _new_window_in_started(tmux_server)
+    pane = tb.pane(pane_id)
+
+    def tagging(window: str) -> Command:
+        return tb.guarded(
+            pane,
+            tb.untagged_in_window(window),
+            _set_pane(pane_id, "@termctl_pane", pane_id),
+            command("set").flag("-w").target(pane).arg("automatic-rename").arg("off").build(),
+            command("set").flag("-w").target(pane).arg("allow-rename").arg("off").build(),
+            _set_pane(pane_id, "remain-on-exit", "failed"),
+        )
+
+    # A non-match (another window) changes nothing.
+    assert _guard(tmux_server, tagging("@999")) is GuardOutcome.NOMATCH
+    assert _window_option(tmux_server, window_id, "automatic-rename") == ""
+    assert _window_option(tmux_server, window_id, "allow-rename") == ""
+    assert _show_pane_option(tmux_server, pane_id, "@termctl_pane") == ""
+    assert _guard(tmux_server, tagging(window_id)) is GuardOutcome.MATCHED
+    assert _window_option(tmux_server, window_id, "automatic-rename") == "off"
+    assert _window_option(tmux_server, window_id, "allow-rename") == "off"
+    assert _show_pane_option(tmux_server, pane_id, "remain-on-exit") == "failed"
+    # The other window is untouched.
+    other_window = _display(tmux_server, "=base:", "#{window_id}")
+    assert other_window != window_id
+    assert _window_option(tmux_server, other_window, "automatic-rename") == ""
 
 
 # --- chains and exact targets -------------------------------------------------------------------
