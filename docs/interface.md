@@ -20,13 +20,13 @@ termctl keeps no database. Everything it knows about a managed pane is stored on
 | tmux pane id | `%N` | Reported for humans and debugging only. tmux restarts numbering when its server restarts, so callers never store it. |
 | tmux window id | `@N` | Same. |
 
-Commands accept the full id or a unique prefix. Input is lower-cased; the `tc-` is optional; the rest must be 4 to 8 characters from `[a-z2-7]` (anything else, including a prefix longer than a full id, exits 2). A *full id* is 8 characters after normalization, with or without the `tc-`. A prefix that matches no managed pane exits 10; one that matches several exits 21 (`ambiguous`, with `candidates`). Two panes carrying the same full id (possible only if someone copied the options) are also ambiguous: exit 21, and termctl acts on neither. `close --force` takes only a full id (exit 2 for a prefix).
+Commands accept the full id or a unique prefix. Input is lower-cased; the `tc-` is optional; the rest must be 4 to 8 characters from `[a-z2-7]` (anything else, including a prefix longer than a full id, exits 2). A *full id* is 8 characters after normalization, with or without the `tc-`. A full id matches only a pane carrying exactly that id; a prefix matches every id that starts with it. A prefix that matches no managed pane exits 10; one that matches several exits 21 (`ambiguous`, with `candidates`). Two panes carrying the same full id (possible only if someone copied the options) are also ambiguous: exit 21, and termctl acts on neither. `close --force` takes only a full id (exit 2 for a prefix).
 
 A caller that stores a termctl id also stores the `socket_path` from the same output and passes it back with `--socket` ([Server selection](#server-selection)).
 
 ### Names
 
-A **name** is the friendly base name of a managed pane (for example `KEY-12` or `PR#42 review`). It is 1 to 64 Unicode code points, with no control characters (C0, DEL, C1; this includes tab and newline) and not containing `#[` (tmux would apply it as a status-line style). Any other text is accepted and displayed literally: termctl escapes it so that tmux interprets nothing in it ([tmux argument rules](#tmux-argument-rules)). A name that breaks these rules is rejected (exit 2); termctl never shortens or cleans a name. Two managed panes may have the same name; callers address panes by id.
+A **name** is the friendly base name of a managed pane (for example `KEY-12` or `PR#42 review`). It is 1 to 64 Unicode code points of valid Unicode text (lone surrogates, such as undecodable bytes in an argument, are rejected), with no control characters (C0, DEL, C1; this includes tab and newline) and not containing `#[` (tmux would apply it as a status-line style). Any other text is accepted and displayed literally: termctl escapes it so that tmux interprets nothing in it ([tmux argument rules](#tmux-argument-rules)). A name that breaks these rules is rejected (exit 2); termctl never shortens or cleans a name. Two managed panes may have the same name; callers address panes by id.
 
 Names are trusted input: callers build them from trusted data (for example a ticket key), never from third-party text such as an issue title or a review comment. The rules above stop tmux from interpreting a name, not a misleading name from being shown to the user.
 
@@ -74,9 +74,9 @@ Every command talks to exactly one tmux server, resolved in this order:
 3. when the caller's environment has `TMUX` (termctl runs inside tmux), the server named there (its first comma-separated field is the socket path);
 4. tmux's default socket, `default`.
 
-A value containing `/` is a socket path; a relative one (allowed only for `--socket`) is resolved against the current directory. Any other value is a socket name, matching `^[A-Za-z0-9._-]{1,64}$` except `.` and `..`, and resolves to `${TMUX_TMPDIR:-/tmp}/tmux-<uid>/<name>` (the *default directory* form), using the caller's `TMUX_TMPDIR` (read before the environment is filtered) and the real uid. The config `socket` and `TERMCTL_SOCKET` must be a socket name or an absolute path. A socket path must contain no control characters, must not end in `;`, and must have a basename (`/` and paths ending in `/` are rejected). Each violation exits 2 (`config_invalid` for config and environment, else `usage`).
+A value containing `/` is a socket path; a relative one (allowed only for `--socket`) is resolved against the current directory. Any other value is a socket name, matching `^[A-Za-z0-9._-]{1,64}$` except `.` and `..`, and resolves to `${TMUX_TMPDIR:-/tmp}/tmux-<uid>/<name>` (the *default directory* form), using the caller's `TMUX_TMPDIR` (read before the environment is filtered) and the real uid. The config `socket` and `TERMCTL_SOCKET` must be a socket name or an absolute path. A socket path must be valid Unicode text (lone surrogates are rejected), must contain no control characters and no `,` (the first comma-separated field of `TMUX` is the socket path), must not end in `;`, must have a basename other than `.` and `..` (`/`, paths ending in `/`, and paths such as `/a/.`, `/a/..` or `rel/..` are rejected), and must be at most 100 bytes as given. A socket name contains no `,` by its grammar. Each violation exits 2 (`config_invalid` for config and environment, else `usage`).
 
-The resolved **`socket_path`** is canonical: the real path (symlinks resolved) of the deepest existing ancestor of the parent directory, joined with the remaining components of the parent directory and the socket's basename. termctl uses it in every output, for the lock file name ([Audit and log](#audit-and-log)) and for the inside-tmux comparison of [`focus`](#focus). It must be at most 100 bytes (Unix socket paths have a platform limit; exit 2 otherwise). termctl always passes it to tmux as `-S <socket_path>`, never `-L`, and never scans other sockets. Every `--json` output that describes a managed pane carries `socket_path`.
+The resolved **`socket_path`** is canonical: the real path (symlinks resolved) of the deepest existing ancestor of the parent directory, joined with the remaining components of the parent directory and the socket's basename. termctl uses it in every output, for the lock file name ([Audit and log](#audit-and-log)) and for the inside-tmux comparison of [`focus`](#focus). It must follow the socket path rules above, including at most 100 bytes (Unix socket paths have a platform limit; exit 2 otherwise). termctl always passes it to tmux as `-S <socket_path>`, never `-L`, and never scans other sockets. Every `--json` output that describes a managed pane carries `socket_path`.
 
 Resolution has no side effects: it creates no directory and runs no tmux command.
 
@@ -112,8 +112,8 @@ A placement name matches `^[a-z0-9][a-z0-9_-]{0,63}$`. A rule naming an undefine
 
 `open` follows the [Check order](#check-order) with these steps:
 
-1. **Usage checks** (exit 2; nothing is touched): flags; the name, label, marker, env-name, actor, decision-id and session-name grammars; at most 32 labels, at most 32 `--env` and at most 32 `--decision-id`; no variable name given twice in `--env`; the cwd (`--cwd`, resolved against the caller's current directory, else that directory) must exist, be a directory, and contain no control characters and no `#[`; the socket ([Server selection](#server-selection)); an explicit `--` with no argv after it; an argv[0] containing `=` (`/usr/bin/env` would take it as a variable assignment); `--env PATH=...` without argv; `--override-escalation` without a TTY or a `human:` actor ([Hooks](#hooks)).
-2. **Resolve**, without side effects: the server ([Server selection](#server-selection)); `tmux_bin`, once, to an absolute path on the caller's `PATH` ([Config](#config)); the placement ([Placement](#placement); exit 2, `not_supported`); the cwd; the id. Then the **command check** (exit 12, `command_not_found`): an argv[0] containing `/` must be an executable regular file (a relative one is resolved against the cwd); any other argv[0] must be found on the `PATH` the command will get (the `--env PATH` value if given, else the filtered `PATH`, [Environment](#environment)). Finally the **size check** (exit 2): for the largest tmux invocation of steps 5 and 6, built for the new-session case, the UTF-8 lengths of its argv elements must sum to at most 12288 bytes (tmux rejects commands near 16 KB).
+1. **Usage checks** (exit 2; nothing is touched): flags; the name, label, marker, env-name, actor, decision-id and session-name grammars; at most 32 labels, at most 32 `--env` and at most 32 `--decision-id`; no variable name given twice in `--env`; the cwd (`--cwd`, resolved against the caller's current directory, else that directory) must exist, be a directory, be valid Unicode text (lone surrogates are rejected), and contain no control characters and no `#[`; an absolute `--cwd` does not need a readable current directory; the socket ([Server selection](#server-selection)); an explicit `--` with no argv after it; an argv[0] containing `=` (`/usr/bin/env` would take it as a variable assignment); `--env PATH=...` without argv; `--override-escalation` without a TTY or a `human:` actor ([Hooks](#hooks)).
+2. **Resolve**, without side effects: the server ([Server selection](#server-selection)); `tmux_bin`, once, to an absolute path on the caller's `PATH` ([Config](#config)); the placement ([Placement](#placement); exit 2, `not_supported`); the id. Then the **command check** (exit 12, `command_not_found`): an argv[0] containing `/` must be an executable regular file (a relative one is resolved against the cwd from step 1); any other argv[0] must be found on the `PATH` the command will get (the `--env PATH` value if given, else the filtered `PATH`, [Environment](#environment)). Finally the **size check** (exit 2): for the largest tmux invocation of steps 5 and 6, built for the new-session case, the UTF-8 lengths of its argv elements must sum to at most 12288 bytes (tmux rejects commands near 16 KB).
 3. **tmux checks** (exit 12, [Check order](#check-order)), then the **id-collision check**: a read-only `list-panes -a`; if a managed pane already carries the id, termctl generates another and checks again. With no server running there is nothing to collide with. With `--dry-run`, termctl stops here: it prints the result ([`open`](#open)) and exits as a real run would, having run only read-only tmux queries (`tmux -V`, `has-session`, `list-panes`), no hooks, and changed nothing.
 4. **`pre-open` hooks** ([Hooks](#hooks)), run once: a veto exits 11, an escalation exits 13; nothing is created.
 5. **Server and session.** The hooks may have run long, so termctl first repeats the socket checks ([Server selection](#server-selection)) and probes again for a running server. When that probe finds none, termctl creates the default directory if it is missing (default directory form only): `mkdir` with mode 0700, and if the directory appeared meanwhile (`EEXIST`), `lstat` and the default-directory checks again. It then starts the server with the invocation that creates the session, prefixed with `set -s exit-unattached off \;` (a user's `exit-unattached on` would otherwise end a server that termctl starts without a client; the prefix runs after the user's config is loaded, spike F2). The prefix is used only when this probe found no server; termctl never changes the settings of a server it did not start (a server started by someone else between the probe and the start is a [residual risk](#residual-risks)). After starting a server it confirms with `has-session`; if the server is not there, exit 12 (`server_unavailable`). There are two creation paths:
@@ -222,7 +222,7 @@ Every command checks in this order and stops at the first failure:
 
 **Dry runs.** `open`, `close`, `focus`, `rename`, `mark`, `unmark`, `label add` and `label remove` accept `--dry-run`: the command makes its checks (read-only tmux queries included) and exits as a real run would, but runs no hooks, changes nothing, writes no log or audit record, and prints what would change. For `rename`, `mark`, `unmark` and the label commands that is the pane object as it would be afterwards, with `dry_run: true` and `display_name` as in [Names](#names).
 
-**Human output.** Each command's human-mode output is stated below; messages and warnings go to stderr. In human mode, every string that comes from tmux (for example a window, session or client name), from a hook (including `hook_stderr`) or from a pane option is printed, on stdout and stderr alike, with each C0, DEL and C1 control character escaped as `\xNN` (its code point in hex), so it cannot drive the user's terminal. `--json` output is not escaped this way; JSON string encoding already escapes C0 and DEL, and a consumer that displays a string escapes it itself.
+**Human output.** Each command's human-mode output is stated below; messages and warnings go to stderr. All human output, on stdout and stderr alike, is printed with each C0, DEL and C1 control character escaped as `\xNN` (its code point in two lowercase hex digits; line breaks between lines of output are kept), so no string from tmux (for example a window, session or client name), a hook (including `hook_stderr`), a pane option or the caller's own arguments echoed in a message (for example an unrecognized argument) can drive the user's terminal. This applies to every message, warning, usage line and help text, in `--json` mode too for what goes to stderr. `--json` output is not escaped this way; JSON string encoding already escapes C0 and DEL, and a consumer that displays a string escapes it itself. An argument that is not valid UTF-8 reaches termctl with each undecodable byte held as a lone surrogate (U+DC80 to U+DCFF, Python's surrogateescape); wherever termctl prints such a string, human output and `--json` alike, each of those is printed as the text `\xNN` (the byte in two lowercase hex digits) and any other lone surrogate as the text `\uXXXX` (four lowercase hex digits), so `--json` output never holds a lone surrogate and is valid for a strict JSON parser. Characters the output encoding cannot represent are written as backslash escapes (Python's `backslashreplace`).
 
 ### `open`
 
@@ -234,7 +234,7 @@ termctl open [--name NAME] [--cwd DIR] [--env VAR=value]... [--label k=v]...
              [--hook NAME=CMD]... [-- ARGV...]
 ```
 
-Opens a managed pane by the rules in [Open order](#open-order). Human output: the id. `--json`: the pane object with `focused` and `decision_ids` added (`schemas/cli/open.json`); `state` may also be `gone`, and then `pid`, `exit_status` and `exit_signal` are null and `pane_id`, `window_id`, `display_name` and `session` are the last known values.
+Opens a managed pane by the rules in [Open order](#open-order). `ARGV` must follow `--`, and everything after the first `--` is argv verbatim (later `--` and flags included); argv without `--`, or a `--` with nothing after it, exits 2. Human output: the id. `--json`: the pane object with `focused` and `decision_ids` added (`schemas/cli/open.json`); `state` may also be `gone`, and then `pid`, `exit_status` and `exit_signal` are null and `pane_id`, `window_id`, `display_name` and `session` are the last known values.
 
 - `--cwd DIR`: a relative `DIR` is resolved against the caller's current directory.
 - `--session SESSION`: a session name (`^[A-Za-z0-9_-]{1,64}$`, exit 2 otherwise); overrides the placement's session.
@@ -310,7 +310,7 @@ Exit 0, 1, 2, 10, 11, 12, 13, 20, 21.
 
 ### `label add` / `label remove`
 
-`termctl label add <id> k=v... [--dry-run]` and `termctl label remove <id> k=v... [--dry-run]` edit the pane's labels ([Labels](#labels)); at least one pair is required (exit 2). A call that changes nothing has `changed: false` and writes no log record. Human output: the pane's labels, space-separated. `--json`: the pane object with `changed`, `display_updated` (always false) and `dry_run` (`schemas/cli/label-add.json`, `schemas/cli/label-remove.json`: `schemas/cli/pane-change.json` with `display_updated: false`). Exit 0, 1, 2, 10, 12 (`locked` too), 21.
+`termctl label add <id> k=v... [--dry-run]` and `termctl label remove <id> k=v... [--dry-run]` edit the pane's labels ([Labels](#labels)); at least one pair is required (exit 2). The pairs are contiguous: an option between two pairs (`label add <id> a=b --dry-run c=d`) exits 2. A call that changes nothing has `changed: false` and writes no log record. Human output: the pane's labels, space-separated. `--json`: the pane object with `changed`, `display_updated` (always false) and `dry_run` (`schemas/cli/label-add.json`, `schemas/cli/label-remove.json`: `schemas/cli/pane-change.json` with `display_updated: false`). Exit 0, 1, 2, 10, 12 (`locked` too), 21.
 
 ### `placements`
 
@@ -318,16 +318,19 @@ Exit 0, 1, 2, 10, 11, 12, 13, 20, 21.
 
 ## Global flags
 
-Global flags may come before or after the subcommand, never after `--`. A `--` may also precede positional arguments, for example `rename <id> -- -name`.
+Global flags may come before or after the subcommand, never after `--`. A `--` may also precede positional arguments, for example `rename <id> -- -name`; a `--` before the subcommand (`termctl -- list`) exits 2, and a `--json` after that `--` is not a flag.
+
+An option that takes a value always consumes the next token as its value, even one that begins with `-` (getopt semantics): `open --name -x -- ls` names the pane `-x`, and in `open --name --json -- ls` the name is `--json` and JSON output is not selected. `--opt=value` is equivalent. Only tokens before the first `--` that are not such values count as flags, for `--json` and `--version` as for the rest. A flag that takes no value rejects `=VALUE` (`--json=x`, `--version=x`, `-h=1`) as a usage error, exit 2.
 
 | Flag | Meaning |
 |---|---|
-| `--json` | machine output (schemas in `schemas/cli/`); errors as `{"error": {...}}` on stdout ([Errors](#errors)) |
+| `--json` | machine output (schemas in `schemas/cli/`); errors as `{"error": {...}}` on stdout ([Errors](#errors)), usage errors included |
 | `--socket NAME\|PATH` | the tmux server ([Server selection](#server-selection)) |
 | `--config PATH` | config file instead of `~/.config/termctl/config.yaml` (drop-ins are read from the `config.d/` next to it) |
 | `--verbose` | also writes each tmux command termctl runs to stderr, with `--env` values replaced by their names |
 | `--quiet` | suppresses all stderr output except errors; with `--verbose`, exit 2 |
-| `--version` | prints the version and exits 0 |
+| `--version` | prints `termctl <version>` and exits 0. `--version` (without `=VALUE`) anywhere before `--` does so before any other check: other flags, `--help` and usage errors are ignored |
+| `-h`, `--help` | prints the help of the command it is given to (termctl's own before a subcommand) on stdout and exits 0; human-readable only, `--json` is ignored. `-h` or `--help` (without `=VALUE`) anywhere before `--` does so before any check but `--version`, which wins over it: usage errors are ignored, and `label --bogus -h` prints the help of `label`. Short options do not combine: `-hx` is an unrecognized argument |
 
 ## Exit codes
 
@@ -347,7 +350,7 @@ termctl defines no tool-specific codes (22+).
 
 ## Errors
 
-With `--json`, every non-zero exit prints `{"error": {...}}` on stdout (`schemas/cli/error.json`), except `exists` exiting 10, which prints its normal output. Messages go to stderr in human mode, with untrusted strings escaped (**Human output** in [Commands](#commands)).
+With `--json`, every non-zero exit prints `{"error": {...}}` on stdout (`schemas/cli/error.json`), except `exists` exiting 10, which prints its normal output; the error object is written first, then the message to stderr. Messages go to stderr in both modes, escaped (**Human output** in [Commands](#commands)); in human mode a usage error also prints the usage of the command it concerns. A failure to write stdout or stderr (a closed descriptor, a pipe with no reader) never changes the exit code.
 
 | Field | Present |
 |---|---|
@@ -356,7 +359,7 @@ With `--json`, every non-zero exit prints `{"error": {...}}` on stdout (`schemas
 | `reason` | only with `refused`: `running` |
 | `hook`, `hook_stderr` | only with `vetoed` and `escalated`: the `cmd` of the first hook that vetoed (else escalated), and its stderr, **untrusted**, cut to 4096 bytes at a UTF-8 character boundary |
 | `decision_ids` | when there are any: the `--decision-id` values, then the ids returned by hooks ([Hooks](#hooks)) |
-| `candidates` | only with `ambiguous`: the matching panes (`id`, `pane_id`, `session`) |
+| `candidates` | only with `ambiguous`: the matching panes (`id`, `pane_id`, `session`), sorted by id, then by pane id (tmux's `%N` by number, so `%9` comes before `%10`) |
 | `details` | optional, code-specific context |
 
 | Code | Exit | Commands |

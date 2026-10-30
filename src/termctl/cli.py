@@ -7,71 +7,22 @@ normative for everything here.
 from __future__ import annotations
 
 import argparse
-import json
+import io
 import os
 import sys
 from collections.abc import Mapping, Sequence
 from dataclasses import dataclass, field
 from typing import Any, NoReturn, TextIO
 
-from . import __version__
+from . import __version__, ids, validate
 from . import config as config_module
+from .argv import Scan, scan
 from .config import Config
 from .errors import TermctlError, UsageError
 from .gateway import Clock, Gateway, SystemClock, SystemGateway
+from .output import PROG, Output, Result, flush_standard_streams
 
-PROG = "termctl"
-
-
-# --- output -------------------------------------------------------------------------------------
-
-
-@dataclass(frozen=True)
-class Result:
-    """A command's output: ``data`` for ``--json``, ``human`` for human mode.
-
-    ``exit_code`` is non-zero only for outcomes that print normal output rather than an
-    error object (``exists`` exiting 10).
-    """
-
-    data: dict[str, Any]
-    human: str
-    exit_code: int = 0
-
-
-@dataclass
-class Output:
-    """Where and how termctl writes. stdout carries results; stderr carries everything else."""
-
-    stdout: TextIO
-    stderr: TextIO
-    json: bool = False
-    verbose: bool = False
-    quiet: bool = False
-
-    def result(self, result: Result) -> None:
-        if self.json:
-            # ensure_ascii escapes C0, DEL and every non-ASCII character.
-            self.stdout.write(json.dumps(result.data) + "\n")
-        elif result.human:
-            self.stdout.write(result.human + "\n")
-
-    def error(self, err: TermctlError) -> None:
-        """Errors always reach stderr (even with ``--quiet``); with ``--json`` also stdout."""
-        self.stderr.write(f"{PROG}: {err.message}\n")
-        if isinstance(err, UsageError) and err.usage and not self.json:
-            self.stderr.write(err.usage)
-        if self.json:
-            self.stdout.write(json.dumps(err.envelope()) + "\n")
-
-    def warn(self, message: str) -> None:
-        if not self.quiet:
-            self.stderr.write(f"{PROG}: warning: {message}\n")
-
-    def trace(self, message: str) -> None:
-        """``--verbose`` detail, such as each tmux command termctl runs."""
-        if self.verbose:
-            self.stderr.write(f"{PROG}: {message}\n")
+__all__ = ["Context", "Output", "Result", "main", "parse_args"]
 
 
 @dataclass
@@ -92,8 +43,15 @@ class _VersionRequested(Exception):
     pass
 
 
+class _HelpRequested(Exception):
+    def __init__(self, parser: argparse.ArgumentParser) -> None:
+        super().__init__()
+        self.parser = parser
+
+
 class _VersionAction(argparse.Action):
-    """``--version`` anywhere before ``--`` wins over every other check."""
+    """Lists ``--version`` in the help. ``parse_args`` finds ``--version`` in its pre-scan
+    before argparse runs, so this action only raises as a fallback."""
 
     def __init__(self, option_strings: Sequence[str], dest: str, **kwargs: Any) -> None:
         super().__init__(option_strings, dest=argparse.SUPPRESS, nargs=0, **kwargs)
@@ -102,11 +60,31 @@ class _VersionAction(argparse.Action):
         raise _VersionRequested
 
 
+class _HelpAction(argparse.Action):
+    """Lists ``-h``/``--help`` in the help. ``parse_args`` finds it in its pre-scan, so this
+    action only raises as a fallback; ``main`` prints the help of the parser that met it."""
+
+    def __init__(self, option_strings: Sequence[str], dest: str, **kwargs: Any) -> None:
+        super().__init__(option_strings, dest=argparse.SUPPRESS, nargs=0, **kwargs)
+
+    def __call__(self, parser: argparse.ArgumentParser, *args: Any, **kwargs: Any) -> NoReturn:
+        raise _HelpRequested(parser)
+
+
 class _Parser(argparse.ArgumentParser):
     """An ArgumentParser that raises ``UsageError`` instead of exiting."""
 
     def error(self, message: str) -> NoReturn:
         raise UsageError(message, usage=self.format_usage())
+
+    def _check_value(self, action: argparse.Action, value: Any) -> None:
+        # argparse quotes the value with repr(), which would print an undecodable byte as
+        # `\udcff`; quoting it as text lets the output escape it as `\xff`.
+        if action.choices is not None and value not in action.choices:
+            choices = ", ".join(map(str, action.choices))
+            raise argparse.ArgumentError(
+                action, f"invalid choice: '{value}' (choose from {choices})"
+            )
 
 
 def _add_global_flags(parser: argparse.ArgumentParser, *, top: bool) -> None:
@@ -139,12 +117,15 @@ def _add_global_flags(parser: argparse.ArgumentParser, *, top: bool) -> None:
         help="suppress stderr output except errors",
     )
     group.add_argument("--version", action=_VersionAction, help="print the version and exit")
+    group.add_argument("-h", "--help", action=_HelpAction, help="print this help and exit")
 
 
 def _subparser(
     subparsers: argparse._SubParsersAction[_Parser], name: str, command: str, help_text: str
 ) -> _Parser:
-    parser = subparsers.add_parser(name, help=help_text, description=help_text, allow_abbrev=False)
+    parser = subparsers.add_parser(
+        name, help=help_text, description=help_text, allow_abbrev=False, add_help=False
+    )
     parser.set_defaults(command=command)
     _add_global_flags(parser, top=False)
     return parser
@@ -188,7 +169,10 @@ def _add_labels(parser: argparse.ArgumentParser, help_text: str) -> None:
 
 def build_parser() -> _Parser:
     parser = _Parser(
-        prog=PROG, description="Terminal placement (tmux backend).", allow_abbrev=False
+        prog=PROG,
+        description="Terminal placement (tmux backend).",
+        allow_abbrev=False,
+        add_help=False,
     )
     _add_global_flags(parser, top=True)
     commands = parser.add_subparsers(
@@ -275,39 +259,61 @@ def build_parser() -> _Parser:
     return parser
 
 
-def _before_double_dash(raw: Sequence[str]) -> Sequence[str]:
-    return raw[: raw.index("--")] if "--" in raw else raw
-
-
-def _check_open_argv(args: argparse.Namespace, raw: Sequence[str]) -> None:
+def _check_open_argv(args: argparse.Namespace, tokens: Sequence[str], usage: str) -> None:
     """argv is accepted only after ``--``, and ``--`` must be followed by argv.
 
-    No option takes ``--`` as its value, so the first ``--`` in ``raw`` is the separator.
+    ``tokens`` are the scanned tokens, in which every option value is joined to its option,
+    so their first ``--`` is the separator.
     """
-    if "--" not in raw:
+    if "--" not in tokens:
         if args.argv:
-            raise UsageError("the command to run must follow '--'")
+            raise UsageError("the command to run must follow '--'", usage=usage)
         return
-    tail = list(raw[raw.index("--") + 1 :])
+    tail = list(tokens[tokens.index("--") + 1 :])
     if not tail:
-        raise UsageError("'--' must be followed by the command to run")
+        raise UsageError("'--' must be followed by the command to run", usage=usage)
     if args.argv != tail:
-        raise UsageError("the command to run must follow '--'")
+        raise UsageError("the command to run must follow '--'", usage=usage)
+
+
+def _is_short_cluster(token: str) -> bool:
+    """``-h`` followed by more text, which argparse would read as ``-h`` and further flags
+    (``-h`` is termctl's only short option)."""
+    return token.startswith("-h") and token != "-h"
+
+
+def _parse(parser: _Parser, scanned: Scan) -> argparse.Namespace:
+    if scanned.version:
+        raise _VersionRequested
+    if scanned.help is not None:
+        raise _HelpRequested(scanned.help)
+    usage = scanned.parser.format_usage()
+    if scanned.early_separator:
+        raise UsageError("'--' cannot come before the command", usage=usage)
+    if scanned.unknown and (not scanned.complete or any(map(_is_short_cluster, scanned.unknown))):
+        # argparse would report the missing command instead of the unknown flag, and would
+        # read `-hx` as `-h -x`.
+        raise UsageError(f"unrecognized arguments: {' '.join(scanned.unknown)}", usage=usage)
+    args, extra = parser.parse_known_args(scanned.args)
+    if extra:
+        raise UsageError(f"unrecognized arguments: {' '.join(extra)}", usage=usage)
+    if args.verbose and args.quiet:
+        raise UsageError("--verbose and --quiet cannot be combined", usage=usage)
+    if args.command == "open":
+        _check_open_argv(args, scanned.args, usage)
+    if args.command == "close" and args.grace is not None and not args.force:
+        raise UsageError("--grace requires --force", usage=usage)
+    return args
 
 
 def parse_args(raw: Sequence[str]) -> argparse.Namespace:
     """Parse ``raw`` and make the flag-level usage checks (step 1 of the check order).
 
-    Raises ``UsageError`` on any usage error and ``_VersionRequested`` for ``--version``.
+    Raises ``UsageError`` on any usage error, ``_VersionRequested`` for ``--version`` and
+    ``_HelpRequested`` for ``--help``.
     """
-    args = build_parser().parse_args(list(raw))
-    if args.verbose and args.quiet:
-        raise UsageError("--verbose and --quiet cannot be combined")
-    if args.command == "open":
-        _check_open_argv(args, raw)
-    if args.command == "close" and args.grace is not None and not args.force:
-        raise UsageError("--grace requires --force")
-    return args
+    parser = build_parser()
+    return _parse(parser, scan(parser, raw))
 
 
 # --- the check order ----------------------------------------------------------------------------
@@ -335,6 +341,58 @@ COMMANDS: dict[str, CommandSpec] = {
 }
 
 
+def check_args(args: argparse.Namespace, ctx: Context) -> None:
+    """Part of step 1: the grammars and limits of the arguments, and ``open``'s cwd (exit 2).
+
+    Replaces ``open``'s ``args.cwd`` with the resolved working directory. Checks that need
+    config (a marker or placement being defined) or the pane list (the label limit of
+    ``label add``) belong to later steps. Some step-1 checks are not here yet (see the TODO).
+    """
+    # TODO: remaining step-1 usage checks, owned by later issues: an argv[0] containing '='
+    # and --env PATH=... without argv (#15); the --override-escalation gate (TTY or a human:
+    # actor) and --hook name validity (#6, #17).
+    if args.socket is not None:
+        validate.check_socket_flag(args.socket)
+    command = args.command
+    if hasattr(args, "id"):
+        if command == "close" and args.force:
+            ids.require_full(args.id)
+        else:
+            ids.parse(args.id)
+    if getattr(args, "actor", None) is not None:
+        validate.check_actor(args.actor)
+    if hasattr(args, "decision_ids"):
+        validate.check_decision_ids(args.decision_ids)
+    if hasattr(args, "labels"):
+        labels = validate.parse_labels(args.labels)
+        if command == "open":
+            validate.check_label_count(labels)
+
+    if command == "open":
+        if args.name is not None:
+            validate.check_name(args.name)
+        if args.cwd is not None:
+            validate.check_cwd_flag(args.cwd)
+        validate.parse_env(args.env)
+        if args.placement is not None:
+            validate.check_placement_name(args.placement)
+        if args.session is not None:
+            validate.check_session_name(args.session)
+        args.cwd = validate.resolve_cwd(args.cwd, ctx.gateway)
+    elif command == "list" and args.session is not None:
+        validate.check_session_filter(args.session)
+    elif command == "rename":
+        validate.check_name(args.name)
+    elif command == "mark":
+        validate.check_marker_name(args.marker)
+    elif command == "focus" and args.client is not None:
+        validate.check_client(args.client)
+    elif command == "close" and args.grace is not None:
+        validate.parse_duration(args.grace)
+    elif command in ("label add", "label remove"):
+        validate.parse_labels(args.pairs)
+
+
 def load_config(args: argparse.Namespace, ctx: Context) -> None:
     """Step 1 (rest): the config file, drop-ins and ``TERMCTL_*`` variables (exit 2)."""
     ctx.config = config_module.load(ctx.environ, args.config)
@@ -352,7 +410,7 @@ def check_tmux(args: argparse.Namespace, ctx: Context) -> None:
 
 def resolve_id(args: argparse.Namespace, ctx: Context) -> None:
     """Step 4: resolve the id to one managed pane (exit 10 or 21)."""
-    # TODO: id resolution - issues #4 and #11
+    # TODO: read the managed panes (issue #11) and pick one with ids.resolve - issue #12
 
 
 def run_command(args: argparse.Namespace, ctx: Context) -> Result:
@@ -364,6 +422,7 @@ def run_command(args: argparse.Namespace, ctx: Context) -> Result:
 def dispatch(args: argparse.Namespace, ctx: Context) -> Result:
     """Run the check order after the flag-level usage checks; stop at the first failure."""
     spec = COMMANDS[args.command]
+    check_args(args, ctx)
     load_config(args, ctx)
     if spec.uses_tmux:
         resolve_server(args, ctx)
@@ -385,31 +444,54 @@ def main(
     stdout: TextIO | None = None,
     stderr: TextIO | None = None,
 ) -> int:
-    raw = list(sys.argv[1:] if argv is None else argv)
-    # Decided before parsing so that usage errors get the envelope too; never after `--`.
+    # sys.stdout and sys.stderr are None when termctl starts with that descriptor closed.
+    if stdout is None or stderr is None:
+        _backslashreplace_standard_streams()
     out = Output(
-        stdout=stdout or sys.stdout,
-        stderr=stderr or sys.stderr,
-        json="--json" in _before_double_dash(raw),
+        stdout=stdout or sys.stdout or io.StringIO(),
+        stderr=stderr or sys.stderr or io.StringIO(),
     )
     try:
-        args = parse_args(raw)
+        return _run(
+            list(sys.argv[1:] if argv is None else argv),
+            out,
+            gateway=gateway or SystemGateway(),
+            clock=clock or SystemClock(),
+            environ=os.environ if environ is None else environ,
+        )
+    finally:
+        if stdout is None or stderr is None:
+            flush_standard_streams()
+
+
+def _backslashreplace_standard_streams() -> None:
+    """Write characters the locale cannot encode as backslash escapes instead of failing."""
+    for stream in (sys.stdout, sys.stderr):
+        if isinstance(stream, io.TextIOWrapper):
+            stream.reconfigure(errors="backslashreplace")
+
+
+def _run(
+    raw: list[str], out: Output, *, gateway: Gateway, clock: Clock, environ: Mapping[str, str]
+) -> int:
+    parser = build_parser()
+    scanned = scan(parser, raw)
+    # Decided before parsing so that usage errors get the envelope too; never after `--`.
+    out.json = "--json" in scanned.options
+    try:
+        args = _parse(parser, scanned)
     except _VersionRequested:
-        out.stdout.write(f"{PROG} {__version__}\n")
+        out.text(f"{PROG} {__version__}\n")
+        return 0
+    except _HelpRequested as help_request:
+        out.text(help_request.parser.format_help())
         return 0
     except TermctlError as err:
         out.error(err)
         return err.exit_code
-    except SystemExit as exc:  # --help
-        return exc.code if isinstance(exc.code, int) else 0
 
     out.json, out.verbose, out.quiet = args.json, args.verbose, args.quiet
-    ctx = Context(
-        gateway=gateway or SystemGateway(),
-        clock=clock or SystemClock(),
-        environ=os.environ if environ is None else environ,
-        out=out,
-    )
+    ctx = Context(gateway=gateway, clock=clock, environ=environ, out=out)
     try:
         result = dispatch(args, ctx)
     except TermctlError as err:

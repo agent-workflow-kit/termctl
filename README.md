@@ -38,7 +38,7 @@ termctl label add|remove <id> k=v... [--dry-run]
 termctl placements [--label k=v]...
 ```
 
-Global flags: `--json`, `--socket NAME|PATH`, `--config PATH`, `--verbose`, `--quiet`, `--version`. Full rules: [docs/interface.md](docs/interface.md).
+Global flags: `--json`, `--socket NAME|PATH`, `--config PATH`, `--verbose`, `--quiet`, `--version`, `-h`/`--help`. Full rules: [docs/interface.md](docs/interface.md).
 
 ## Exit codes
 
