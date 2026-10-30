@@ -40,7 +40,10 @@ pythonVersion = "3.12"
 
 [tool.pytest.ini_options]
 testpaths = ["tests"]
-markers = ["live: needs real models/hosts/credentials; never run in CI"]
+markers = [
+    "live: needs real models/hosts/credentials; never run in CI",
+    "tmux: runs real tmux on a private socket; skipped when tmux is not installed",
+]
 addopts = "-m 'not live'"
 
 [tool.semantic_release]
