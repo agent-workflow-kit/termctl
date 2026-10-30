@@ -5,7 +5,8 @@ loads a user's config or touches a user's server; teardown stops exactly that se
 ``kill-server`` on its socket. Tests using it are marked ``tmux``. They are not ``live``: a
 missing tmux skips them, but fails them when ``TERMCTL_REQUIRE_TMUX`` is set, so the CI job
 that installs tmux (``tmux`` in .github/workflows/ci.yml) cannot pass by skipping them all.
-The shared CI's ``verify`` job cannot install tmux, so there they skip.
+The shared CI's ``verify`` job cannot install packages: they run there only when the runner
+image ships tmux (ubuntu-26.04 ships 3.6a) and skip otherwise.
 """
 
 from __future__ import annotations

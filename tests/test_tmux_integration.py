@@ -80,18 +80,12 @@ LITERALS = [
 OPTION_VALUES = [v for v in LITERALS if "\x1b" not in v and "\r" not in v]
 
 # TODO(#25): tmux 3.2 differs from 3.3+ where these tests expect 3.5a's behaviour: rename-window
-# stores "$" as "\\$" in window_name, and defers a "#(...)" job in a rename-window name
-# ("<'...' not ready>") instead of running it (design.md spikes A and E). #25 covers tmux 3.2;
-# the "$" divergence also affects the displayed-name comparisons of #19 (rename) and #20 (mark).
+# stores "$" as "\\$" in window_name (design.md spikes A and E). #25 covers tmux 3.2; the "$"
+# divergence also affects the displayed-name comparisons of #19 (rename) and #20 (mark).
 TMUX_3_2 = TMUX_VERSION is not None and TMUX_VERSION < (3, 3)
 XFAIL_3_2_DOLLAR = pytest.mark.xfail(
     TMUX_3_2,
     reason="#25: tmux 3.2 rename-window reports '$' as '\\$' in window_name",
-    strict=True,
-)
-XFAIL_3_2_JOB = pytest.mark.xfail(
-    TMUX_3_2,
-    reason="#25: tmux 3.2 defers a #() job in a rename-window name instead of running it",
     strict=True,
 )
 
@@ -347,12 +341,19 @@ def test_e4_cwd_round_trips(tmux_server: TmuxServer, dirname: str) -> None:
     assert wait_for(lambda: _display(tmux_server, pane_id, "#{pane_current_path}") == str(cwd))
 
 
-@XFAIL_3_2_JOB  # TODO(#25): tmux 3.2 defers the job instead of running it.
 def test_e4_control_an_undoubled_command_format_runs(tmux_server: TmuxServer) -> None:
     # Proves "#(" executes in a rename-window name on this tmux, so the next tests can fail.
+    # The job belongs to the client that sent rename-window, and tmux kills a client's jobs
+    # when it exits (format_lost_client), so a lone rename-window races its own client: tmux
+    # 3.2a and 3.6a lose that race every time, 3.5a wins it. A bounded run-shell (no "#" in
+    # it, as run-shell expands formats) keeps the client until the canary exists or ~5 s pass.
     pane_id = tmux_server.start()
     canary = tmux_server.root / "control"
-    tmux_server.raw("rename-window", "-t", pane_id, "--", f"#(touch {canary})")
+    hold = f"i=0; while [ ! -e {canary} ] && [ $i -lt 250 ]; do sleep 0.02; i=$((i + 1)); done"
+    result = tmux_server.raw(
+        "rename-window", "-t", pane_id, "--", f"#(touch {canary})", ";", "run-shell", hold
+    )
+    assert result.returncode == 0, result.stderr
     assert wait_for(canary.exists)
 
 

@@ -1109,8 +1109,8 @@ def test_command_is_immutable() -> None:
     ("environ", "outcome"),
     [
         ({}, "skip"),
-        # The shared CI's verify job has no tmux (it cannot install packages); termctl's own
-        # tmux job installs it and sets TERMCTL_REQUIRE_TMUX.
+        # The shared CI's verify job cannot install packages, so tmux there depends on the
+        # runner image; termctl's own tmux job installs it and sets TERMCTL_REQUIRE_TMUX.
         ({"CI": "true"}, "skip"),
         ({"TERMCTL_REQUIRE_TMUX": "1"}, "fail"),
         ({"CI": "true", "TERMCTL_REQUIRE_TMUX": "1"}, "fail"),

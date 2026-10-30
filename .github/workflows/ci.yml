@@ -21,8 +21,9 @@ jobs:
   ci:
     uses: agent-workflow-kit/awkit-ci/.github/workflows/python-ci.yml@v0.1.0
 
-  # The shared verify job cannot install packages, so it skips the real-tmux tests; this job
-  # installs tmux and runs make verify with TERMCTL_REQUIRE_TMUX set, so a missing tmux fails.
+  # The shared verify job cannot install packages, so it runs the real-tmux tests only when the
+  # runner image ships tmux; this job installs tmux and runs make verify with
+  # TERMCTL_REQUIRE_TMUX set, so a missing tmux fails.
   tmux:
     name: tmux
     runs-on: ubuntu-latest
