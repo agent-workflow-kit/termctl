@@ -3,8 +3,9 @@
 argparse refuses an option value that begins with ``-``. termctl follows getopt instead: an
 option that takes a value always consumes the next token as its value. ``scan`` walks the
 tokens with the parsers' own option tables, so it knows which options take values, which
-(sub)parser each token belongs to and where the ``--`` separator is. The ``--json``, ``--version`` and
-``--help`` checks read its result, so they agree with argparse about what is a value.
+(sub)parser each token belongs to and where the ``--`` separator is. The ``--json``,
+``--version`` and ``--help`` checks read its result, so they agree with argparse about what
+is a value.
 """
 
 from __future__ import annotations
