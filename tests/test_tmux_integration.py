@@ -8,7 +8,8 @@ builder; the server is inspected with ``raw`` tmux calls, the oracle.
 from __future__ import annotations
 
 import os
-import time
+import shlex
+import subprocess
 from pathlib import Path
 
 import pytest
@@ -183,10 +184,32 @@ def _as_window_name(name: str) -> str:
     return name.replace("\\", "\\\\")
 
 
-def _no_canary(canary: Path) -> bool:
-    # #() jobs run asynchronously; give one a moment to show up before concluding it did not.
-    time.sleep(0.3)
-    return not canary.exists()
+# How long _run_holding_client keeps the client open for a "#(" job: the control test proves
+# an undoubled job fires well within it on every tmux tested (3.2a, 3.5a, 3.6a).
+JOB_WINDOW = 1.0
+
+
+def _run_holding_client(
+    server: TmuxServer, args: tuple[str, ...] | list[str], canary: Path
+) -> subprocess.CompletedProcess[str]:
+    """Run tmux ``args`` (no binary, no ``-S``), then, in the same invocation, a ``run-shell``
+    that waits until ``canary`` exists or ``JOB_WINDOW`` seconds pass.
+
+    A "#(" job started while a command expands a format belongs to the client that sent the
+    command, and tmux kills a client's jobs when it exits (format_lost_client). A lone command
+    races its own client: tmux 3.2a and 3.6a lose that race every time, 3.5a wins it. Holding
+    the client gives every job the same chance to run, so a test that a "#(" never runs cannot
+    pass only because its client exited first. The hold has no "#": run-shell expands formats.
+    """
+    path = shlex.quote(str(canary))
+    polls = round(JOB_WINDOW / 0.02)
+    hold = f"i=0; while [ ! -e {path} ] && [ $i -lt {polls} ]; do sleep 0.02; i=$((i + 1)); done"
+    return server.raw(*args, tb.SEPARATOR, "run-shell", hold)
+
+
+def _builder_args(server: TmuxServer, *commands: Command) -> list[str]:
+    """The builder's argv for ``commands``, without the binary and ``-S <socket>``."""
+    return Invocation.of(*commands).argv(server.tmux_bin, server.socket_path)[3:]
 
 
 # --- E1: a trailing ";" never splits the invocation ---------------------------------------------
@@ -342,19 +365,14 @@ def test_e4_cwd_round_trips(tmux_server: TmuxServer, dirname: str) -> None:
 
 
 def test_e4_control_an_undoubled_command_format_runs(tmux_server: TmuxServer) -> None:
-    # Proves "#(" executes in a rename-window name on this tmux, so the next tests can fail.
-    # The job belongs to the client that sent rename-window, and tmux kills a client's jobs
-    # when it exits (format_lost_client), so a lone rename-window races its own client: tmux
-    # 3.2a and 3.6a lose that race every time, 3.5a wins it. A bounded run-shell (no "#" in
-    # it, as run-shell expands formats) keeps the client until the canary exists or ~5 s pass.
+    # Proves "#(" executes in a rename-window name on this tmux, within the JOB_WINDOW the
+    # next test gives its payloads, so that test can fail (_run_holding_client).
     pane_id = tmux_server.start()
     canary = tmux_server.root / "control"
-    hold = f"i=0; while [ ! -e {canary} ] && [ $i -lt 250 ]; do sleep 0.02; i=$((i + 1)); done"
-    result = tmux_server.raw(
-        "rename-window", "-t", pane_id, "--", f"#(touch {canary})", ";", "run-shell", hold
-    )
+    rename = ("rename-window", "-t", pane_id, "--", f"#(touch {canary})")
+    result = _run_holding_client(tmux_server, rename, canary)
     assert result.returncode == 0, result.stderr
-    assert wait_for(canary.exists)
+    assert canary.exists()
 
 
 def test_e4_command_formats_never_run(tmux_server: TmuxServer) -> None:
@@ -396,10 +414,11 @@ def test_e4_command_formats_never_run(tmux_server: TmuxServer) -> None:
         tb.owned_single_pane_window(ID),
         command("rename-window").target(tb.window(window_id)).name(payload + "g").build(),
     )
-    for cmd in (new_window, new_session, rename, guarded_rename):
-        result = tmux_server.tmux().run(Invocation.of(cmd))
-        assert tb.guard_outcome(result) is GuardOutcome.MATCHED, result.stderr
-    assert _no_canary(canary)
+    # One invocation, so one client held open for JOB_WINDOW covers every payload's job.
+    args = _builder_args(tmux_server, new_window, new_session, rename, guarded_rename)
+    result = _run_holding_client(tmux_server, args, canary)
+    assert tb.guard_outcome(result) is GuardOutcome.MATCHED, result.stderr
+    assert not canary.exists()
     assert _display(tmux_server, pane_id, "#{window_name}") == payload + "g"
     windows = tmux_server.raw("list-windows", "-a", "-F", "#{session_name}|#{window_name}")
     assert f"-s2|{payload}" in windows.stdout.splitlines()
