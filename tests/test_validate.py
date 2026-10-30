@@ -20,10 +20,10 @@ CONTROL = ["\x00", "\x01", "\t", "\n", "\r", "\x1b", "\x1f", "\x7f", "\x80", "\x
 INJECTIONS = ["a;b", "a b", "$(id)", "`id`", "a|b", "'a'", '"a"', "a\\b", "#(id)", "#[fg=red]"]
 
 
-def schema_matches(definition: str, value: object) -> bool:
-    """A cross-check of the grammar against ``schemas/defs.json``."""
+def schema_matches(definition: str, value: object, schema: str = "defs") -> bool:
+    """A cross-check of the grammar against ``schemas/<schema>.json`` (default ``defs.json``)."""
     try:
-        validate_instance(value, f"termctl/defs.json#/$defs/{definition}")
+        validate_instance(value, f"termctl/{schema}.json#/$defs/{definition}")
     except ValidationError:
         return False
     return True
@@ -629,6 +629,52 @@ def test_socket_path_bad_agrees_with_schema(value: str) -> None:
     if len(value.encode("utf-8", "surrogatepass")) > 100 and len(value) <= 100:
         return
     assert not schema_matches("socket_path", value)
+
+
+# --- config.json ----------------------------------------------------------------------------------
+
+# config.json's $defs must accept and reject what defs.json does, so the two cannot drift.
+CONFIG_GRAMMARS = [
+    (
+        "socket",
+        SOCKET_NAMES_OK + SOCKET_PATHS_OK,
+        SOCKET_NAMES_BAD + SOCKET_PATHS_BAD + RELATIVE_PATHS,
+    ),
+    ("marker_name", MARKER_NAMES_OK, MARKER_NAMES_BAD),
+    ("marker_text", MARKER_TEXTS_OK, MARKER_TEXTS_BAD),
+    ("placement_name", PLACEMENTS_OK, PLACEMENTS_BAD),
+    ("session_name", SESSIONS_OK, SESSIONS_BAD),
+    ("duration", [value for value, _ in DURATIONS_OK], DURATIONS_BAD),
+]
+
+
+@pytest.mark.parametrize(
+    ("definition", "value"),
+    [(definition, value) for definition, ok, _ in CONFIG_GRAMMARS for value in ok],
+)
+def test_config_schema_accepts_what_defs_accepts(definition: str, value: str) -> None:
+    assert schema_matches(definition, value)
+    assert schema_matches(definition, value, schema="config")
+
+
+@pytest.mark.parametrize(
+    ("definition", "value"),
+    [(definition, value) for definition, _, bad in CONFIG_GRAMMARS for value in bad],
+)
+def test_config_schema_rejects_what_defs_rejects(definition: str, value: str) -> None:
+    assert schema_matches(definition, value, schema="config") == schema_matches(definition, value)
+
+
+@pytest.mark.parametrize(
+    "value", ["/.", "/..", "/a/.", "/a/..", "/a,b", "/a ;", "/a /", "/a\udcff"]
+)
+def test_config_socket_rejects_review_findings(value: str) -> None:
+    assert not schema_matches("socket", value, schema="config")
+
+
+@pytest.mark.parametrize("value", ["a #[", "a #", "\ud800", "a\udc00", "\udc80x"])
+def test_config_marker_text_rejects_review_findings(value: str) -> None:
+    assert not schema_matches("marker_text", value, schema="config")
 
 
 # --- cwd ----------------------------------------------------------------------------------------
