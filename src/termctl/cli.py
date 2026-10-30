@@ -15,6 +15,8 @@ from dataclasses import dataclass, field
 from typing import Any, NoReturn, TextIO
 
 from . import __version__
+from . import config as config_module
+from .config import Config
 from .errors import TermctlError, UsageError
 from .gateway import Clock, Gateway, SystemClock, SystemGateway
 
@@ -80,6 +82,7 @@ class Context:
     clock: Clock
     environ: Mapping[str, str]
     out: Output = field(repr=False)
+    config: Config = field(default_factory=config_module.defaults)
 
 
 # --- argument parsing ---------------------------------------------------------------------------
@@ -334,7 +337,7 @@ COMMANDS: dict[str, CommandSpec] = {
 
 def load_config(args: argparse.Namespace, ctx: Context) -> None:
     """Step 1 (rest): the config file, drop-ins and ``TERMCTL_*`` variables (exit 2)."""
-    # TODO: config loading - issue #3 (config.py)
+    ctx.config = config_module.load(ctx.environ, args.config)
 
 
 def resolve_server(args: argparse.Namespace, ctx: Context) -> None:

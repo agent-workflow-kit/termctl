@@ -1,0 +1,1 @@
+{"error": {"code": "config_invalid", "message": "invalid TERMCTL_KEEP_ON_EXIT: Input should be 'never', 'failed' or 'always'", "details": {"variable": "TERMCTL_KEEP_ON_EXIT"}}}

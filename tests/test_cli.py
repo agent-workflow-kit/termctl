@@ -16,6 +16,8 @@ from .fakes import FakeClock, FakeGateway
 from .schemas import validate
 
 GOLDEN = Path(__file__).parent / "golden"
+# A config directory that does not exist, so tests never read the user's own config.
+NO_CONFIG = {"XDG_CONFIG_HOME": str(Path(__file__).parent / "no-config")}
 ID = "tc-abcdefgh"
 
 # The shortest valid invocation of every command in interface.md "Commands".
@@ -57,7 +59,7 @@ class Run:
             argv,
             gateway=self.gateway,
             clock=FakeClock(),
-            environ={},
+            environ=NO_CONFIG,
             stdout=stdout,
             stderr=stderr,
         )
