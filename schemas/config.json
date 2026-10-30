@@ -17,7 +17,7 @@
       "description": "Resolved once to an absolute path from the caller's PATH."
     },
     "socket": {
-      "$ref": "#/$defs/socket",
+      "$ref": "defs.json#/$defs/socket",
       "default": null
     },
     "server_env_allow": {
@@ -43,11 +43,11 @@
       ]
     },
     "keep_on_exit": {
-      "$ref": "#/$defs/keep_on_exit",
+      "$ref": "defs.json#/$defs/keep_on_exit",
       "default": "never"
     },
     "close_grace": {
-      "$ref": "#/$defs/duration",
+      "$ref": "defs.json#/$defs/duration",
       "default": "10s"
     },
     "marker_display": {
@@ -60,13 +60,13 @@
     "markers": {
       "type": "object",
       "propertyNames": {
-        "$ref": "#/$defs/marker_name"
+        "$ref": "defs.json#/$defs/marker_name"
       },
       "additionalProperties": {
         "type": "object",
         "properties": {
           "text": {
-            "$ref": "#/$defs/marker_text"
+            "$ref": "defs.json#/$defs/marker_text"
           },
           "bell": {
             "type": "boolean",
@@ -88,10 +88,10 @@
     "placements": {
       "type": "object",
       "propertyNames": {
-        "$ref": "#/$defs/placement_name"
+        "$ref": "defs.json#/$defs/placement_name"
       },
       "additionalProperties": {
-        "$ref": "#/$defs/placement"
+        "$ref": "defs.json#/$defs/placement"
       },
       "default": {
         "default": {
@@ -103,7 +103,7 @@
     "rules": {
       "type": "array",
       "items": {
-        "$ref": "#/$defs/rule"
+        "$ref": "defs.json#/$defs/rule"
       },
       "default": []
     },
@@ -113,25 +113,25 @@
         "pre-open": {
           "type": "array",
           "items": {
-            "$ref": "#/$defs/pre_hook_entry"
+            "$ref": "defs.json#/$defs/pre_hook_entry"
           }
         },
         "pre-close": {
           "type": "array",
           "items": {
-            "$ref": "#/$defs/pre_hook_entry"
+            "$ref": "defs.json#/$defs/pre_hook_entry"
           }
         },
         "post-open": {
           "type": "array",
           "items": {
-            "$ref": "#/$defs/post_hook_entry"
+            "$ref": "defs.json#/$defs/post_hook_entry"
           }
         },
         "post-close": {
           "type": "array",
           "items": {
-            "$ref": "#/$defs/post_hook_entry"
+            "$ref": "defs.json#/$defs/post_hook_entry"
           }
         }
       },
@@ -141,148 +141,5 @@
   },
   "additionalProperties": false,
   "required": [],
-  "description": "Schema-level shape. Placement fields missing from an entry inherit from default. termctl additionally rejects at load time a rule naming an undefined placement (config_invalid). target: pane, max_panes, layout and group_by are rejected (not_supported) only when open or placements resolves a placement that uses them.",
-  "$defs": {
-    "duration": {
-      "type": "string",
-      "pattern": "^((0|[1-9][0-9]{0,4}|[1-5][0-9]{5}|600000)ms|(0|[1-9][0-9]?|[1-5][0-9]{2}|600)s?|([0-9]|10)m)$",
-      "description": "A non-negative integer without leading zeros followed by ms, s or m (bare: seconds); at most 10m."
-    },
-    "keep_on_exit": {
-      "enum": [
-        "never",
-        "failed",
-        "always"
-      ]
-    },
-    "marker_name": {
-      "type": "string",
-      "pattern": "^[a-z0-9][a-z0-9_-]{0,31}$"
-    },
-    "marker_text": {
-      "type": "string",
-      "minLength": 1,
-      "maxLength": 16,
-      "pattern": "^(?!.*#\\[)(?!.*#$)[^\\u0000-\\u001f\\u007f-\\u009f]+$",
-      "description": "1-16 code points, the name rules, and not ending in '#'."
-    },
-    "placement": {
-      "type": "object",
-      "properties": {
-        "session": {
-          "$ref": "#/$defs/session_name"
-        },
-        "target": {
-          "$ref": "#/$defs/target"
-        },
-        "max_panes": {
-          "type": "integer",
-          "minimum": 1
-        },
-        "layout": {
-          "type": "string"
-        },
-        "group_by": {
-          "type": [
-            "string",
-            "null"
-          ]
-        }
-      },
-      "additionalProperties": false,
-      "required": [],
-      "description": "A configured placement; missing fields inherit from default."
-    },
-    "placement_name": {
-      "type": "string",
-      "pattern": "^[a-z0-9][a-z0-9_-]{0,63}$"
-    },
-    "post_hook_entry": {
-      "type": "object",
-      "properties": {
-        "cmd": {
-          "type": "string",
-          "minLength": 1
-        },
-        "timeout": {
-          "type": "integer",
-          "minimum": 1,
-          "default": 30
-        },
-        "async": {
-          "type": "boolean",
-          "default": false
-        }
-      },
-      "additionalProperties": false,
-      "required": [
-        "cmd"
-      ]
-    },
-    "pre_hook_entry": {
-      "type": "object",
-      "properties": {
-        "cmd": {
-          "type": "string",
-          "minLength": 1
-        },
-        "timeout": {
-          "type": "integer",
-          "minimum": 1,
-          "default": 30
-        }
-      },
-      "additionalProperties": false,
-      "required": [
-        "cmd"
-      ]
-    },
-    "rule": {
-      "type": "object",
-      "properties": {
-        "match": {
-          "type": "object",
-          "additionalProperties": {
-            "type": "string",
-            "pattern": "^[A-Za-z0-9._:/#@+=,-]{0,256}$"
-          },
-          "propertyNames": {
-            "pattern": "^[a-z0-9][a-z0-9_.-]{0,63}$"
-          }
-        },
-        "placement": {
-          "$ref": "#/$defs/placement_name"
-        }
-      },
-      "additionalProperties": false,
-      "required": [
-        "match",
-        "placement"
-      ]
-    },
-    "session_name": {
-      "type": "string",
-      "pattern": "^[A-Za-z0-9_-]{1,64}$",
-      "description": "A session name termctl creates or targets (config, open --session, pre-open payload)."
-    },
-    "socket": {
-      "oneOf": [
-        {
-          "type": "string",
-          "pattern": "^((?!\\.\\.?$)[A-Za-z0-9._-]{1,64}|(?!.*/$)/(?!.*;$)[^\\u0000-\\u001f\\u007f-\\u009f]*)$",
-          "maxLength": 100
-        },
-        {
-          "type": "null"
-        }
-      ],
-      "description": "A socket name (not '.' or '..') or an absolute socket path (no control characters, not ending in ';' or '/'; '/' itself is rejected)."
-    },
-    "target": {
-      "enum": [
-        "window",
-        "pane"
-      ]
-    }
-  }
+  "description": "Schema-level shape. Placement fields missing from an entry inherit from default. termctl additionally rejects at load time a rule naming an undefined placement (config_invalid). target: pane, max_panes, layout and group_by are rejected (not_supported) only when open or placements resolves a placement that uses them."
 }

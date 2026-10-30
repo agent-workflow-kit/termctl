@@ -11,8 +11,7 @@ from __future__ import annotations
 import copy
 import os
 import pwd
-import re
-from collections.abc import Mapping
+from collections.abc import Callable, Mapping
 from pathlib import Path
 from typing import Annotated, Any, Literal
 
@@ -28,6 +27,7 @@ from pydantic import (
     field_validator,
 )
 
+from . import validate
 from .errors import TermctlError
 
 # Every key with its built-in default; equal to config.example.yaml (tested).
@@ -72,63 +72,41 @@ class ConfigError(TermctlError):
         super().__init__("config_invalid", message, details=details)
 
 
-# --- grammars (schemas/config.json) -------------------------------------------------------------
-# TODO: share these with validate.py once issue #4 lands its grammars; kept here so config
-# loading does not depend on that issue. Keep both in step with schemas/config.json.
-
-_CONTROL = re.compile("[\x00-\x1f\x7f-\x9f]")
-_SOCKET_NAME = re.compile(r"[A-Za-z0-9._-]{1,64}")
-_DURATION = re.compile(
-    r"(0|[1-9][0-9]{0,4}|[1-5][0-9]{5}|600000)ms|(0|[1-9][0-9]?|[1-5][0-9]{2}|600)s?|([0-9]|10)m"
-)
-_MARKER_NAME = re.compile(r"[a-z0-9][a-z0-9_-]{0,31}")
-_PLACEMENT_NAME = re.compile(r"[a-z0-9][a-z0-9_-]{0,63}")
-_SESSION_NAME = re.compile(r"[A-Za-z0-9_-]{1,64}")
-_LABEL_KEY = re.compile(r"[a-z0-9][a-z0-9_.-]{0,63}")
-_LABEL_VALUE = re.compile(r"[A-Za-z0-9._:/#@+=,-]{0,256}")
-_ENV_ALLOW = re.compile(r"[A-Za-z_][A-Za-z0-9_]*\*?")
+# --- grammars (schemas/defs.json, through schemas/config.json) ----------------------------------
+# The predicates are validate.py's, so config and the command line share one grammar each.
 
 
-def _grammar(pattern: re.Pattern[str], what: str) -> AfterValidator:
+def _grammar(is_valid: Callable[[str], bool], what: str) -> AfterValidator:
     def check(value: str) -> str:
-        if not pattern.fullmatch(value):
-            raise ValueError(f"not a valid {what}: {value!r}")
+        if not is_valid(value):
+            raise ValueError(f"not a valid {what}: {validate.show(value)}")
         return value
 
     return AfterValidator(check)
 
 
-def check_socket(value: str) -> str:
-    """A socket name (not ``.`` or ``..``) or an absolute socket path (interface.md
-    "Server selection"). Relative paths are allowed only for ``--socket``."""
-    if "/" not in value:
-        if not _SOCKET_NAME.fullmatch(value) or value in (".", ".."):
-            raise ValueError(
-                f"not a socket name ([A-Za-z0-9._-], 1 to 64, not . or ..) "
-                f"or an absolute path: {value!r}"
-            )
-    elif not value.startswith("/"):
-        raise ValueError(f"a socket path must be absolute here: {value!r}")
-    elif _CONTROL.search(value):
-        raise ValueError("a socket path must contain no control characters")
-    elif value.endswith(";"):
-        raise ValueError(f"a socket path must not end in ';': {value!r}")
-    elif value.endswith("/"):
-        raise ValueError(f"a socket path must have a basename: {value!r}")
-    if len(value) > 100:
-        raise ValueError("a socket path must be at most 100 characters")
-    return value
+def _problem(problem: Callable[[str], str | None], what: str) -> AfterValidator:
+    def check(value: str) -> str:
+        if message := problem(value):
+            raise ValueError(f"not a valid {what} {validate.show(value)}: {message}")
+        return value
+
+    return AfterValidator(check)
 
 
-def _check_marker_text(value: str) -> str:
-    if not 1 <= len(value) <= 16:
-        raise ValueError("a marker text must be 1 to 16 characters")
-    if _CONTROL.search(value) or "#[" in value or value.endswith("#"):
-        raise ValueError(
-            f"a marker text must contain no control characters or '#[' "
-            f"and must not end in '#': {value!r}"
-        )
-    return value
+def _config_socket_problem(value: str) -> str | None:
+    """Config and ``TERMCTL_SOCKET`` take a socket name or an absolute path; relative paths
+    are allowed only for ``--socket`` (interface.md "Server selection")."""
+    return validate.socket_problem(value, allow_relative=False)
+
+
+def _is_duration(value: str) -> bool:
+    return validate.duration_ms(value) is not None
+
+
+def _is_env_allow(value: str) -> bool:
+    """A variable name, or a ``PREFIX*`` glob whose prefix is one."""
+    return validate.is_env_name(value.removesuffix("*"))
 
 
 def _integral(value: Any) -> Any:
@@ -140,15 +118,15 @@ def _integral(value: Any) -> Any:
 
 NonEmpty = Annotated[str, Field(min_length=1)]
 PositiveInt = Annotated[int, BeforeValidator(_integral), Field(ge=1)]
-Socket = Annotated[str, AfterValidator(check_socket)]
-Duration = Annotated[str, _grammar(_DURATION, "duration (e.g. 10s, 500ms, 2m; at most 10m)")]
-MarkerName = Annotated[str, _grammar(_MARKER_NAME, "marker name")]
-MarkerText = Annotated[str, AfterValidator(_check_marker_text)]
-PlacementName = Annotated[str, _grammar(_PLACEMENT_NAME, "placement name")]
-SessionName = Annotated[str, _grammar(_SESSION_NAME, "session name")]
-LabelKey = Annotated[str, _grammar(_LABEL_KEY, "label key")]
-LabelValue = Annotated[str, _grammar(_LABEL_VALUE, "label value")]
-EnvAllow = Annotated[str, _grammar(_ENV_ALLOW, "variable name or PREFIX* glob")]
+Socket = Annotated[str, _problem(_config_socket_problem, "socket")]
+Duration = Annotated[str, _grammar(_is_duration, "duration (e.g. 10s, 500ms, 2m; at most 10m)")]
+MarkerName = Annotated[str, _grammar(validate.is_marker_name, "marker name")]
+MarkerText = Annotated[str, _problem(validate.marker_text_problem, "marker text")]
+PlacementName = Annotated[str, _grammar(validate.is_placement_name, "placement name")]
+SessionName = Annotated[str, _grammar(validate.is_session_name, "session name")]
+LabelKey = Annotated[str, _grammar(validate.is_label_key, "label key")]
+LabelValue = Annotated[str, _grammar(validate.is_label_value, "label value")]
+EnvAllow = Annotated[str, _grammar(_is_env_allow, "variable name or PREFIX* glob")]
 
 
 # --- models -------------------------------------------------------------------------------------

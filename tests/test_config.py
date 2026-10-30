@@ -546,6 +546,11 @@ def test_socket_name_or_absolute_path_is_accepted(home: Path, main_file: Path, s
         "/tmp/a\tb",
         "/tmp/a\x85b",
         "/" + "a" * 100,
+        "/tmp/a,b",
+        "/tmp/.",
+        "/tmp/..",
+        "/tmp/a\ud800b",
+        "x\udcff",
     ],
 )
 def test_socket_must_be_a_name_or_absolute_path(home: Path, main_file: Path, socket: str) -> None:
@@ -554,6 +559,33 @@ def test_socket_must_be_a_name_or_absolute_path(home: Path, main_file: Path, soc
     assert err.details == {"key": "socket"}
     with pytest.raises(SchemaError):
         validate({"socket": socket}, "termctl/config.json")
+
+
+def test_socket_path_limit_counts_bytes(home: Path, main_file: Path) -> None:
+    # 99 and 101 bytes in 50 and 51 code points: the limit is bytes (interface.md "Server
+    # selection"); the schema's maxLength counts code points and only approximates it.
+    write(main_file, {"socket": "/" + "\u00e9" * 49})
+    assert load_home(home).socket == "/" + "\u00e9" * 49
+    write(main_file, {"socket": "/" + "\u00e9" * 50})
+    err = load_error({"HOME": str(home)})
+    assert err.details == {"key": "socket"}
+    assert "100 bytes" in err.message
+
+
+@pytest.mark.parametrize("socket", ["/tmp/a,b", "/tmp/..", "rel/sock", "/tmp/\udcff"])
+def test_termctl_socket_uses_the_config_socket_grammar(home: Path, socket: str) -> None:
+    err = load_error({"HOME": str(home), "TERMCTL_SOCKET": socket})
+    assert err.details == {"variable": "TERMCTL_SOCKET"}
+    assert err.message.startswith("invalid TERMCTL_SOCKET: ")
+
+
+def test_config_schema_shares_the_grammars_in_defs() -> None:
+    """config.json refers to defs.json for every definition the two would otherwise both hold,
+    so the config grammars cannot drift from the command-line ones."""
+    schema = json.loads((ROOT / "schemas" / "config.json").read_text(encoding="utf-8"))
+    defs = json.loads((ROOT / "schemas" / "defs.json").read_text(encoding="utf-8"))["$defs"]
+    assert set(schema.get("$defs", {})) & set(defs) == set()
+    assert schema["properties"]["socket"]["$ref"] == "defs.json#/$defs/socket"
 
 
 def test_unsupported_placement_fields_load(home: Path, main_file: Path) -> None:
@@ -598,6 +630,7 @@ VALID: list[dict[str, Any]] = [
     {"server_env_allow": ["PATH", "LC_*", "_X1"]},
     {"markers": {"a-b_1": {"text": "x" * 16, "bell": True}}},
     {"markers": {"done": {"text": "a#b"}}},
+    {"markers": {"m": {"text": "\U0001f514\u2028x"}}},
     {"placements": {"a": {"session": "S_1-x"}}},
     {"rules": [{"match": {"kind.sub-x": "A-z0.9:/#@+=,-", "e": ""}, "placement": "default"}]},
     {"hooks": {"pre-open": [{"cmd": "x", "timeout": 1}]}},
@@ -627,6 +660,8 @@ INVALID: list[tuple[dict[str, Any], str]] = [
     ({"markers": {"m": {"text": "ends#"}}}, "markers.m.text"),
     ({"markers": {"m": {"text": "a#[b"}}}, "markers.m.text"),
     ({"markers": {"m": {"text": "a\nb"}}}, "markers.m.text"),
+    ({"markers": {"m": {"text": "a\ud800"}}}, "markers.m.text"),
+    ({"markers": {"m": {"text": "\udc80b"}}}, "markers.m.text"),
     ({"markers": {"m": {"text": "x", "bell": "yes"}}}, "markers.m.bell"),
     ({"markers": {"m": {"text": "x", "colour": 1}}}, "markers.m.colour"),
     ({"placements": {"-bad": {}}}, "placements.-bad"),
@@ -763,3 +798,18 @@ def test_config_invalid_golden(
     code, stdout, _ = run(["--json", "--config", str(explicit), "placements"], environ)
     assert code == 2
     assert json.loads(stdout) == expected
+
+
+def test_cli_undecodable_termctl_socket_is_reported_escaped(tmp_path: Path) -> None:
+    # Bytes that are not UTF-8 reach os.environ as lone surrogates (surrogateescape).
+    explicit = write(tmp_path / "c.yaml", {})
+    code, stdout, stderr = run(
+        ["--json", "--config", str(explicit), "placements"], {"TERMCTL_SOCKET": "/tmp/s\udcff"}
+    )
+    assert code == 2
+    envelope = json.loads(stdout)
+    validate(envelope, "termctl/cli/error.json")
+    assert envelope["error"]["code"] == "config_invalid"
+    assert envelope["error"]["details"] == {"variable": "TERMCTL_SOCKET"}
+    assert stderr.startswith("termctl: invalid TERMCTL_SOCKET: ")
+    stderr.encode()  # no lone surrogate reaches the stream
