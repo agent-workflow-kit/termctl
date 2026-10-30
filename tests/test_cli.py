@@ -2,7 +2,9 @@ from __future__ import annotations
 
 import io
 import json
-from importlib.metadata import version
+import subprocess
+import sys
+import tomllib
 from pathlib import Path
 from typing import Any
 
@@ -325,6 +327,29 @@ def test_option_values_may_start_with_dash_in_equals_form() -> None:
     assert_parsed(["open", "--name=-x"], {"name": "-x"})
 
 
+def test_option_value_may_start_with_dash() -> None:
+    assert_parsed(["open", "--name", "-x", "--", "ls"], {"name": "-x", "argv": ["ls"]})
+    assert_parsed(["list", "--session", "-foo"], {"session": "-foo"})
+    assert_parsed(["--socket", "-s", "list"], {"socket": "-s", "command": "list"})
+
+
+def test_option_value_may_be_a_flag_name() -> None:
+    assert_parsed(
+        ["open", "--name", "--json", "--", "x"], {"name": "--json", "json": False, "argv": ["x"]}
+    )
+    assert_parsed(["open", "--name", "--version", "--", "x"], {"name": "--version"})
+    assert_parsed(["--socket", "list", "show", ID], {"socket": "list", "command": "show"})
+
+
+def test_option_value_may_be_double_dash() -> None:
+    assert_parsed(["open", "--name", "--", "--", "ls"], {"name": "--", "argv": ["ls"]})
+
+
+def test_flag_name_as_option_value_does_not_select_json(steps: list[str]) -> None:
+    run = Run(["open", "--name", "--json", "--", "x"])
+    assert (run.code, run.stdout) == (0, "ok\n")
+
+
 # --- usage errors -------------------------------------------------------------------------------
 
 USAGE_ERRORS: list[list[str]] = [
@@ -366,6 +391,19 @@ USAGE_ERRORS: list[list[str]] = [
     ["--jso", "list"],
     ["list", "--sess", "s"],
     ["--socket"],
+    ["label", "add", ID, "a=b", "--json", "c=d"],
+    ["label", "remove", ID, "a", "--dry-run", "b"],
+    ["--bogus"],
+    ["close", "--", ID, "--grace", "5s"],
+]
+
+# A `--` before the subcommand is a usage error, and the --json pre-scan stops at it.
+SEPARATOR_BEFORE_COMMAND: list[list[str]] = [
+    ["--", "list", "--json"],
+    ["--", "list", "--verbose", "--quiet"],
+    ["--", "close", "abcd", "--grace", "5s"],
+    ["--", "rename", "abcd", "--json", "x"],
+    ["label", "--", "add", ID, "k=v"],
 ]
 
 
@@ -373,7 +411,8 @@ USAGE_ERRORS: list[list[str]] = [
 def test_usage_error_exits_2_with_message_on_stderr(argv: list[str]) -> None:
     run = Run(argv)
     assert run.code == 2
-    assert run.stdout == ""
+    if "--json" not in argv:
+        assert run.stdout == ""
     assert run.stderr.startswith("termctl: ")
     assert run.gateway.calls == []
 
@@ -405,7 +444,53 @@ def test_json_after_double_dash_does_not_select_envelope() -> None:
 
 def test_verbose_with_quiet_message() -> None:
     run = Run(["--verbose", "--quiet", "list"])
-    assert run.stderr == "termctl: --verbose and --quiet cannot be combined\n"
+    assert run.stderr.startswith("termctl: --verbose and --quiet cannot be combined\n")
+
+
+@pytest.mark.parametrize("argv", SEPARATOR_BEFORE_COMMAND)
+def test_double_dash_before_command_is_usage_error(argv: list[str]) -> None:
+    run = Run(argv)
+    assert run.code == 2
+    assert run.stdout == ""
+    assert run.stderr.startswith("termctl: '--' cannot come before the command\n")
+
+
+@pytest.mark.parametrize("argv", [["--bogus"], ["--json", "--bogus"], ["label", "--bogus"]])
+def test_unknown_flag_without_command_is_reported(argv: list[str]) -> None:
+    run = Run(argv)
+    assert run.code == 2
+    assert run.stderr.startswith("termctl: unrecognized arguments: --bogus\n")
+    if "--json" in argv:
+        assert run.json()["error"]["message"] == "unrecognized arguments: --bogus"
+
+
+@pytest.mark.parametrize(
+    ("argv", "usage"),
+    [
+        (["close", "--", "abcd", "--grace", "5s"], "usage: termctl close "),
+        (["close", ID, "--grace", "5s"], "usage: termctl close "),
+        (["open", "cmd"], "usage: termctl open "),
+        (["label", "add", ID, "a=b", "--dry-run", "c=d"], "usage: termctl label add "),
+        (["show"], "usage: termctl show "),
+    ],
+)
+def test_usage_error_in_subcommand_prints_its_usage(argv: list[str], usage: str) -> None:
+    run = Run(argv)
+    assert run.code == 2
+    assert run.stderr.splitlines()[1].startswith(usage)
+
+
+def test_usage_error_escapes_caller_argv() -> None:
+    run = Run(["list", "\x1b]0;x\x07"])
+    assert run.code == 2
+    assert "\x1b" not in run.stderr and "\x07" not in run.stderr
+    assert "unrecognized arguments: \\x1b]0;x\\x07\n" in run.stderr
+
+
+def test_invalid_choice_escapes_caller_argv() -> None:
+    run = Run(["open", "--target", "\x9bx"])
+    assert "\x9b" not in run.stderr
+    assert "\\x9bx" in run.stderr
 
 
 @pytest.mark.parametrize(
@@ -437,8 +522,10 @@ def test_parse_args_raises_usage_error() -> None:
 # --- --version ----------------------------------------------------------------------------------
 
 
-def test_version_matches_package_metadata() -> None:
-    assert __version__ == version("termctl")
+def test_version_matches_pyproject() -> None:
+    pyproject = Path(__file__).parent.parent / "pyproject.toml"
+    expected = tomllib.loads(pyproject.read_text(encoding="utf-8"))["project"]["version"]
+    assert Run(["--version"]).stdout == f"termctl {expected}\n"
 
 
 @pytest.mark.parametrize(
@@ -449,6 +536,12 @@ def test_version_matches_package_metadata() -> None:
         ["show", "--version"],
         ["label", "add", "--version"],
         ["--version", "--verbose", "--quiet"],
+        ["frobnicate", "--version"],
+        ["open", "--target", "tab", "--version"],
+        ["bogus", "--version"],
+        ["list", "extra", "--version"],
+        ["--version", "--help"],
+        ["open", "--name", "x", "--version", "--", "ls"],
     ],
 )
 def test_version_prints_version_and_exits_zero(argv: list[str]) -> None:
@@ -459,9 +552,32 @@ def test_version_prints_version_and_exits_zero(argv: list[str]) -> None:
     assert run.gateway.calls == []
 
 
-def test_help_exits_zero(capsys: pytest.CaptureFixture[str]) -> None:
-    assert Run(["--help"]).code == 0
-    assert "usage: termctl" in capsys.readouterr().out
+def test_version_after_double_dash_is_not_version() -> None:
+    run = Run(["--", "--version"])
+    assert run.code == 2
+
+
+@pytest.mark.parametrize("argv", [["--help"], ["-h"], ["--json", "--help"], ["--verbose", "-h"]])
+def test_help_exits_zero(argv: list[str]) -> None:
+    run = Run(argv)
+    assert run.code == 0
+    assert run.stdout.startswith("usage: termctl ")
+    assert "-h, --help" in run.stdout
+    assert run.stderr == ""
+
+
+@pytest.mark.parametrize(
+    ("argv", "usage"),
+    [
+        (["close", "--help"], "usage: termctl close "),
+        (["--json", "label", "add", "-h"], "usage: termctl label add "),
+        (["label", "--help"], "usage: termctl label "),
+    ],
+)
+def test_subcommand_help(argv: list[str], usage: str) -> None:
+    run = Run(argv)
+    assert run.code == 0
+    assert run.stdout.startswith(usage)
 
 
 # --- check order --------------------------------------------------------------------------------
@@ -544,6 +660,11 @@ def test_human_output_goes_to_stdout(monkeypatch: pytest.MonkeyPatch) -> None:
     assert (run.code, run.stdout, run.stderr) == (0, f"{ID} running\n", "")
 
 
+def test_human_output_is_escaped_line_by_line(monkeypatch: pytest.MonkeyPatch) -> None:
+    monkeypatch.setattr(cli, "run_command", lambda args, ctx: Result({}, "a\x1b\tb\nc\x9b"))
+    assert Run(["placements"]).stdout == "a\\x1b\\x09b\nc\\x9b\n"
+
+
 def test_empty_human_output_prints_nothing(monkeypatch: pytest.MonkeyPatch) -> None:
     monkeypatch.setattr(cli, "run_command", lambda args, ctx: Result({"exists": True}, ""))
     assert Run(["placements"]).stdout == ""
@@ -556,10 +677,32 @@ def test_json_output_is_one_line_of_json(monkeypatch: pytest.MonkeyPatch) -> Non
 
 
 def test_json_output_escapes_control_characters(monkeypatch: pytest.MonkeyPatch) -> None:
-    monkeypatch.setattr(cli, "run_command", lambda args, ctx: Result({"s": "a\x1b\x7fb"}, ""))
+    value = "a\x1b\x7f\x85\u00e9b"
+    monkeypatch.setattr(cli, "run_command", lambda args, ctx: Result({"s": value}, ""))
     run = Run(["placements", "--json"])
-    assert "\x1b" not in run.stdout and "\x7f" not in run.stdout
-    assert run.json() == {"s": "a\x1b\x7fb"}
+    assert run.stdout == '{"s": "a\\u001b\\u007f\\u0085\\u00e9b"}\n'
+    assert run.json() == {"s": value}
+
+
+def test_json_error_envelope_escapes_control_characters(monkeypatch: pytest.MonkeyPatch) -> None:
+    def fail(args: Any, ctx: Context) -> Result:
+        raise TermctlError("not_found", "no pane a\x7fb")
+
+    monkeypatch.setattr(cli, "run_command", fail)
+    run = Run(["placements", "--json"])
+    assert run.stdout == '{"error": {"code": "not_found", "message": "no pane a\\u007fb"}}\n'
+    assert run.stderr == "termctl: no pane a\\x7fb\n"
+
+
+def test_human_messages_escape_control_characters(monkeypatch: pytest.MonkeyPatch) -> None:
+    def fail(args: Any, ctx: Context) -> Result:
+        ctx.out.warn("w\x1b")
+        ctx.out.trace("t\x85")
+        raise TermctlError("not_found", "e\n\x00")
+
+    monkeypatch.setattr(cli, "run_command", fail)
+    run = Run(["placements", "--verbose"])
+    assert run.stderr == "termctl: warning: w\\x1b\ntermctl: t\\x85\ntermctl: e\\x0a\\x00\n"
 
 
 def test_result_exit_code_without_error_object(monkeypatch: pytest.MonkeyPatch) -> None:
@@ -671,3 +814,92 @@ def test_unimplemented_command_golden() -> None:
     expected = json.loads((GOLDEN / "error-not-implemented.json").read_text(encoding="utf-8"))
     validate(expected, "termctl/cli/error.json")
     assert Run(["--json", "show", ID]).json() == expected
+
+
+# --- broken output streams ----------------------------------------------------------------------
+
+
+class Broken(io.StringIO):
+    """A stream whose writes fail, like a closed descriptor or a pipe with no reader."""
+
+    def write(self, s: str) -> int:
+        raise OSError(9, "Bad file descriptor")
+
+    def flush(self) -> None:
+        raise OSError(9, "Bad file descriptor")
+
+
+def run_with(argv: list[str], *, stdout: io.StringIO, stderr: io.StringIO) -> int:
+    return main(
+        argv, gateway=FakeGateway(), clock=FakeClock(), environ={}, stdout=stdout, stderr=stderr
+    )
+
+
+def test_broken_stderr_still_prints_envelope() -> None:
+    stdout = io.StringIO()
+    assert run_with(["--json", "bogus"], stdout=stdout, stderr=Broken()) == 2
+    assert json.loads(stdout.getvalue())["error"]["code"] == "usage"
+
+
+def test_envelope_is_written_before_stderr() -> None:
+    order: list[str] = []
+
+    class Recorder(io.StringIO):
+        def __init__(self, name: str) -> None:
+            super().__init__()
+            self.name = name
+
+        def write(self, s: str) -> int:
+            order.append(self.name)
+            return super().write(s)
+
+    run_with(["--json", "bogus"], stdout=Recorder("stdout"), stderr=Recorder("stderr"))
+    assert order[0] == "stdout"
+
+
+@pytest.mark.parametrize(
+    ("argv", "code"),
+    [
+        (["--json", "bogus"], 2),
+        (["bogus"], 2),
+        (["--json", "show", ID], 1),
+        (["--version"], 0),
+        (["--help"], 0),
+    ],
+)
+def test_broken_stdout_keeps_exit_code(argv: list[str], code: int) -> None:
+    assert run_with(argv, stdout=Broken(), stderr=io.StringIO()) == code
+
+
+def test_broken_stdout_keeps_result_exit_code(monkeypatch: pytest.MonkeyPatch) -> None:
+    monkeypatch.setattr(
+        cli, "run_command", lambda args, ctx: Result({"exists": False}, "", exit_code=10)
+    )
+    assert run_with(["--json", "placements"], stdout=Broken(), stderr=Broken()) == 10
+
+
+def shell(script: str) -> subprocess.CompletedProcess[str]:
+    """Run ``termctl`` (as ``python -m termctl``) under ``sh`` to close descriptors."""
+    return subprocess.run(
+        ["sh", "-c", script, sys.executable],
+        capture_output=True,
+        text=True,
+        timeout=30,
+        check=False,
+    )
+
+
+def test_closed_stderr_subprocess() -> None:
+    proc = shell('"$0" -m termctl --json bogus 2>&-')
+    assert proc.returncode == 2
+    assert json.loads(proc.stdout)["error"]["code"] == "usage"
+
+
+def test_closed_stdout_subprocess() -> None:
+    proc = shell('"$0" -m termctl --version >&-')
+    assert (proc.returncode, proc.stderr) == (0, "")
+
+
+def test_stdout_pipe_without_reader_subprocess() -> None:
+    proc = shell('{ sleep 0.3; "$0" -m termctl --version; echo "rc=$?" >&2; } | true')
+    assert proc.stderr == "rc=0\n"
