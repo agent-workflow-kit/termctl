@@ -1,13 +1,145 @@
 {
   "$schema": "https://json-schema.org/draft/2020-12/schema",
-  "$id": "termctl/config",
+  "$id": "termctl/config.json",
   "title": "termctl config",
   "type": "object",
   "properties": {
+    "backend": {
+      "enum": [
+        "tmux"
+      ],
+      "default": "tmux"
+    },
+    "tmux_bin": {
+      "type": "string",
+      "minLength": 1,
+      "default": "tmux",
+      "description": "Resolved once to an absolute path from the caller's PATH."
+    },
+    "socket": {
+      "$ref": "defs.json#/$defs/socket",
+      "default": null
+    },
+    "server_env_allow": {
+      "type": "array",
+      "items": {
+        "type": "string",
+        "pattern": "^[A-Za-z_][A-Za-z0-9_]*\\*?$"
+      },
+      "default": [
+        "PATH",
+        "HOME",
+        "USER",
+        "LOGNAME",
+        "SHELL",
+        "LANG",
+        "LC_*",
+        "TERM",
+        "COLORTERM",
+        "TZ",
+        "XDG_*",
+        "DISPLAY",
+        "WAYLAND_DISPLAY"
+      ]
+    },
+    "keep_on_exit": {
+      "$ref": "defs.json#/$defs/keep_on_exit",
+      "default": "never"
+    },
+    "close_grace": {
+      "$ref": "defs.json#/$defs/duration",
+      "default": "10s"
+    },
+    "marker_display": {
+      "enum": [
+        "name",
+        "option"
+      ],
+      "default": "name"
+    },
+    "markers": {
+      "type": "object",
+      "propertyNames": {
+        "$ref": "defs.json#/$defs/marker_name"
+      },
+      "additionalProperties": {
+        "type": "object",
+        "properties": {
+          "text": {
+            "$ref": "defs.json#/$defs/marker_text"
+          },
+          "bell": {
+            "type": "boolean",
+            "default": false
+          }
+        },
+        "additionalProperties": false,
+        "required": [
+          "text"
+        ]
+      },
+      "default": {
+        "attention": {
+          "text": "🔔 ",
+          "bell": false
+        }
+      }
+    },
+    "placements": {
+      "type": "object",
+      "propertyNames": {
+        "$ref": "defs.json#/$defs/placement_name"
+      },
+      "additionalProperties": {
+        "$ref": "defs.json#/$defs/placement"
+      },
+      "default": {
+        "default": {
+          "session": "termctl",
+          "target": "window"
+        }
+      }
+    },
+    "rules": {
+      "type": "array",
+      "items": {
+        "$ref": "defs.json#/$defs/rule"
+      },
+      "default": []
+    },
     "hooks": {
       "type": "object",
-      "description": "Hook name to list of hook entries."
+      "properties": {
+        "pre-open": {
+          "type": "array",
+          "items": {
+            "$ref": "defs.json#/$defs/pre_hook_entry"
+          }
+        },
+        "pre-close": {
+          "type": "array",
+          "items": {
+            "$ref": "defs.json#/$defs/pre_hook_entry"
+          }
+        },
+        "post-open": {
+          "type": "array",
+          "items": {
+            "$ref": "defs.json#/$defs/post_hook_entry"
+          }
+        },
+        "post-close": {
+          "type": "array",
+          "items": {
+            "$ref": "defs.json#/$defs/post_hook_entry"
+          }
+        }
+      },
+      "additionalProperties": false,
+      "default": {}
     }
   },
-  "additionalProperties": true
+  "additionalProperties": false,
+  "required": [],
+  "description": "Schema-level shape. Placement fields missing from an entry inherit from default. termctl additionally rejects at load time a rule naming an undefined placement (config_invalid). target: pane, max_panes, layout and group_by are rejected (not_supported) only when open or placements resolves a placement that uses them."
 }

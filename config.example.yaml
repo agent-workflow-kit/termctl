@@ -1,2 +1,79 @@
-# Example config for termctl. Location: ~/.config/termctl/config.yaml (drop-ins: config.d/*.yaml). Keys are defined in docs/interface.md once designed.
+# Example config for termctl, showing every key with its built-in default.
+# Location: ~/.config/termctl/config.yaml (drop-ins: ~/.config/termctl/config.d/*.yaml).
+# Rules: docs/interface.md (sections Config, Placement, Markers, Hooks).
+
+# Terminal backend. tmux is the only one.
+backend: tmux
+
+# tmux executable; resolved once per run to an absolute path on PATH unless absolute.
+# tmux 3.2 or newer is required.
+tmux_bin: tmux
+
+# Default tmux server: a socket name (not . or ..; resolved in ${TMUX_TMPDIR:-/tmp}/tmux-<uid>/)
+# or an absolute socket path (no control characters, not ending in ; or /). termctl always passes
+# the resolved path to tmux with -S and checks the directory's ownership and permissions first.
+# null: the server in $TMUX when running inside tmux, else tmux's default socket.
+socket: null
+
+# Variables kept in the environment termctl runs every tmux command with. This filtered
+# environment becomes the server's global environment when termctl starts the server, decides
+# what a new session imports, and gives a new pane its PATH, so credentials in the caller's
+# environment are never added to tmux. Entries are names or PREFIX* globs. SSH_AUTH_SOCK is not kept by
+# default: sessions termctl creates then have it removed for their panes; add it here to keep it.
+# Drop-ins replace this list rather than extend it.
+server_env_allow:
+  - PATH
+  - HOME
+  - USER
+  - LOGNAME
+  - SHELL
+  - LANG
+  - "LC_*"
+  - TERM
+  - COLORTERM
+  - TZ
+  - "XDG_*"
+  - DISPLAY
+  - WAYLAND_DISPLAY
+
+# What happens to a pane when its command exits: never | failed | always (kept as a dead pane).
+keep_on_exit: never
+
+# close --force: how long to wait after closing the pane before sending SIGTERM (at most 10m).
+close_grace: 10s
+
+# Where markers show: name (window name = marker text + name) | option (pane options only;
+# show @termctl_marker_text in your own tmux status format). The pane options are always set.
+marker_display: name
+
+# Named markers. Callers use: termctl mark <id> attention
+markers:
+  attention:
+    text: "🔔 "
+    bell: false   # true: mark also sets tmux's bell flag on the window (and may ring your terminal)
+
+# Named placements. "default" is built in; an entry here is merged over it field by field,
+# and fields missing from other placements are taken from "default".
+# Only target: window is supported in this version; open and placements reject a placement
+# that uses target: pane (other commands still load such a config).
+placements:
+  default:
+    session: termctl
+    target: window
+
+# Ordered rules matched on the labels given to open; the first match wins, else "default".
+# Every rule must name a defined placement.
+# Example:
+#   rules:
+#     - match: {kind: review}
+#       placement: reviews
+rules: []
+
+# Hooks: pre-open, pre-close (lists of {cmd, timeout}); post-open, post-close (lists of
+# {cmd, timeout, async}). Drop-ins append to these lists.
+# Example:
+#   hooks:
+#     pre-open:
+#       - cmd: "my-policy-check"
+#         timeout: 30
 hooks: {}
