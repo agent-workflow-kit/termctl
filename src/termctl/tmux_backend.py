@@ -8,12 +8,17 @@ Every argument termctl passes to tmux is built here, so the rules cannot be skip
 2. **Leading ``-``.** ``--`` goes immediately before a command's first positional argument.
 3. **Format expansion.** Values of ``-n``, ``-c`` and ``-s`` and the ``rename-window`` name get
    every ``#`` doubled; ``#[`` there is refused (it is rejected as input earlier, exit 2).
+   ``display`` takes only termctl's own ``Format`` as its positional, and ``-F`` and ``-f``
+   only a ``Format``.
 4. **Literal positions.** argv, ``-e`` values and option values need only rule 1.
-5. **Guarded writes.** ``guarded`` wraps commands in ``if-shell -F`` with each inner element
-   single-quoted; ``termctl-nomatch`` on stdout means the guard did not match.
+5. **Guarded writes.** ``guarded`` wraps commands in ``if-shell -F -t %N``; each inner command
+   targets that pane or a window containing it, and its elements are quoted by ``quote``.
+   ``guard_outcome`` reads the result.
 
-Targets are exact ids (``=S:``, ``@N``, ``%N``) built only by ``session``, ``window``, ``pane``
-and ``pane_in_session``. Builder misuse is a programming error and raises ``ValueError``.
+Targets are exact ids (``=S:``, ``@N``, ``%N``, ``=S:@W.%P``); ``Target`` checks that grammar
+however it is built. ``Format`` values come only from this module's factories. Value-taking
+flags (``-t``, ``-e``, ``-F``, ``-f``, ``-n``, ``-c``, ``-s``) are refused as bare flags.
+Builder misuse is a programming error and raises ``ValueError`` or ``TypeError``.
 
 Binary resolution and the version check (#10), socket resolution and safety (#8), the filtered
 environment (#15) and the pane reader (#11) are separate; ``Tmux`` takes their results.
@@ -21,13 +26,14 @@ environment (#15) and the pane reader (#11) are separate; ``Tmux`` takes their r
 
 from __future__ import annotations
 
+import enum
 import os
 import re
 import shlex
 import subprocess
 from collections.abc import Callable, Mapping
 from dataclasses import dataclass, field
-from typing import Self
+from typing import Literal, Self
 
 from .errors import TermctlError
 from .gateway import Gateway
@@ -39,12 +45,28 @@ TMUX_TIMEOUT = 30.0
 
 _COMMAND_NAME = re.compile(r"[a-z]+(-[a-z]+)*")
 _FLAG = re.compile(r"-[A-Za-z]")
+# Doubling also applies to every command's -c and -s, where the value may be a client name or
+# target rather than text; their grammars have no "#", so it changes nothing there.
 _FORMAT_EXPANDED_FLAGS = frozenset({"-n", "-c", "-s"})
 # Flags whose values have their own, typed method.
-_TYPED_FLAGS = frozenset({"-t", "-e", "-F"})
+_TYPED_FLAGS = frozenset({"-t", "-e", "-F", "-f"})
+# Flags that take a value: refused by flag(), where they would take the next element as theirs
+# or (set -F) switch on format expansion of the value.
+_VALUE_FLAGS = _TYPED_FLAGS | _FORMAT_EXPANDED_FLAGS
+_FORMAT_FLAGS = frozenset({"-F", "-f"})
+# Commands whose positional is a format: they take only termctl's own Format.
+_FORMAT_POSITIONAL_COMMANDS = frozenset({"display", "display-message"})
+_SERVER_SCOPE_COMMANDS = frozenset({"set-option", "set", "show-options", "show"})
 _PANE_ID = re.compile(r"%[0-9]+")
 _WINDOW_ID = re.compile(r"@[0-9]+")
 _SESSION_NAME = re.compile(r"[A-Za-z0-9_-]{1,64}")
+_FIELD_NAME = re.compile(r"@?[a-z][a-z0-9_]*")
+_TARGET_GRAMMARS: dict[str, re.Pattern[str]] = {
+    "pane": _PANE_ID,
+    "window": _WINDOW_ID,
+    "session": re.compile(r"=[A-Za-z0-9_-]{1,64}:"),
+    "pane_in_session": re.compile(r"=[A-Za-z0-9_-]{1,64}:@[0-9]+\.%[0-9]+"),
+}
 _TERMCTL_ID = re.compile(r"tc-[a-z2-7]{8}")
 _ENV_NAME = re.compile(r"[A-Za-z_][A-Za-z0-9_]*")
 _CONTROL = re.compile(r"[\x00-\x1f\x7f-\x9f]")
@@ -73,38 +95,82 @@ def double_hashes(value: str) -> str:
 
 
 def quote(element: str) -> str:
-    """Single-quote an element for tmux's command parser, ``'`` written as ``'\\''``."""
-    return "'" + element.replace("'", "'\\''") + "'"
+    """Quote an element for tmux's command parser so it round-trips exactly (spike F5).
+
+    Each newline-free run is single-quoted with ``'`` written as ``'\\''``, and the runs are
+    joined by ``\\n`` outside the quotes (``"a\\nb"`` becomes ``'a'\\n'b'``). tmux's parser
+    drops a backslash-newline pair anywhere, and blanks and ``#`` comments after a newline even
+    inside quotes, so a raw newline must never reach it; ``\\n`` outside quotes is a newline.
+    """
+    return "\\n".join("'" + run.replace("'", "'\\''") + "'" for run in element.split("\n"))
+
+
+# A lone surrogate outside \udc80-\udcff (where os.fsdecode puts undecodable bytes) cannot be
+# encoded for a subprocess argument.
+_LONE_SURROGATE = re.compile(r"[\ud800-\udc7f\udd00-\udfff]")
 
 
 def _check_text(value: str) -> str:
     if "\x00" in value:
         raise ValueError("a tmux argument must not contain NUL")
+    if _LONE_SURROGATE.search(value):
+        raise ValueError("a tmux argument must not contain a lone surrogate")
     return value
 
 
 # --- typed pieces -------------------------------------------------------------------------------
 
 
+_FORMAT_KEY = object()
+
+
 @dataclass(frozen=True)
 class Format:
     """A tmux format string written by termctl itself (never caller or tmux data); passed
-    verbatim. Values interpolated into one must come from a grammar without ``#``, ``,``
-    and ``}``."""
+    verbatim. Only this module's factories (``fields``, the guard conditions) build one.
+    Values interpolated into one must come from a grammar without ``#``, ``,`` and ``}``."""
 
     text: str
+    _key: object = field(default=None, repr=False, compare=False)
 
     def __post_init__(self) -> None:
+        if self._key is not _FORMAT_KEY:
+            raise TypeError("a Format is built only by the tmux_backend factories")
         if _CONTROL.search(self.text) or self.text.endswith(SEPARATOR):
             raise ValueError(f"invalid format: {self.text!r}")
 
 
+def _format(text: str) -> Format:
+    return Format(text, _FORMAT_KEY)
+
+
+def fields(*names: str) -> Format:
+    """``#{a} #{b}``: tmux fields or user options by name, separated by spaces."""
+    if not names:
+        raise ValueError("fields needs at least one name")
+    return _format(" ".join(f"#{{{_fullmatch(_FIELD_NAME, n, 'field name')}}}" for n in names))
+
+
+TargetKind = Literal["pane", "window", "session", "pane_in_session"]
+
+
 @dataclass(frozen=True)
 class Target:
-    """An exact tmux target; build it with ``pane``, ``window``, ``session`` or
-    ``pane_in_session``."""
+    """An exact tmux target: ``%N``, ``@N``, ``=S:`` or ``=S:@W.%P``. Build it with ``pane``,
+    ``window``, ``session`` or ``pane_in_session``; any other text is refused."""
 
     text: str
+
+    def __post_init__(self) -> None:
+        self.kind  # noqa: B018 (checks the grammar)
+
+    @property
+    def kind(self) -> TargetKind:
+        if isinstance(self.text, str):
+            for kind, grammar in _TARGET_GRAMMARS.items():
+                if grammar.fullmatch(self.text):
+                    return kind  # type: ignore[return-value]
+        raise ValueError(f"invalid tmux target: {self.text!r}")
 
 
 def _fullmatch(pattern: re.Pattern[str], value: str, what: str) -> str:
@@ -130,6 +196,9 @@ def session(name: str) -> Target:
 def pane_in_session(name: str, window_id: str, pane_id: str) -> Target:
     """``=S:@W.%P``: fails unless the pane is in that window and the window in that session
     (spike F7)."""
+    # TODO(#24): this refuses session names outside the session grammar, which tmux may report
+    # for a session a user renamed (e.g. "my work"); focus will meet those. "$N:@W.%P" with the
+    # session id works for any name and still enforces containment (verified on tmux 3.5a).
     _fullmatch(_SESSION_NAME, name, "session name")
     _fullmatch(_WINDOW_ID, window_id, "window id")
     _fullmatch(_PANE_ID, pane_id, "pane id")
@@ -152,14 +221,12 @@ class Command:
     elements: tuple[str, ...]
     shown: tuple[str, ...]
     guarded: bool = False
+    # The target given to ``CommandBuilder.target``; ``None`` for a command without one.
+    target: Target | None = None
 
     @property
-    def has_target(self) -> bool:
-        """Whether ``-t`` is among the flags (before any positional)."""
-        flags = (
-            self.elements[: self.elements.index("--")] if "--" in self.elements else self.elements
-        )
-        return "-t" in flags
+    def name(self) -> str:
+        return self.elements[0] if self.elements else ""
 
     @property
     def argv(self) -> tuple[str, ...]:
@@ -180,6 +247,7 @@ class CommandBuilder:
     _elements: list[str] = field(default_factory=list)
     _shown: list[str] = field(default_factory=list)
     _positional: bool = False
+    _target: Target | None = None
 
     def _add(self, element: str, shown: str | None = None) -> None:
         self._elements.append(_check_text(element))
@@ -198,10 +266,24 @@ class CommandBuilder:
 
     # Flags and options.
 
+    @property
+    def _name(self) -> str:
+        return self._elements[0]
+
     def flag(self, flag: str) -> Self:
-        """A flag without a value, such as ``-d``."""
+        """A flag without a value, such as ``-d``. Flags that take a value are refused."""
         self._before_positionals(flag)
+        if flag in _VALUE_FLAGS:
+            raise ValueError(f"{flag} takes a value; use option, target, env or format")
         self._add(flag)
+        return self
+
+    def server_scope(self) -> Self:
+        """``-s`` of ``set-option``/``show-options``: the server option table."""
+        self._before_positionals("-s")
+        if self._name not in _SERVER_SCOPE_COMMANDS:
+            raise ValueError(f"{self._name} has no server scope flag")
+        self._add("-s")
         return self
 
     def option(self, flag: str, value: str) -> Self:
@@ -215,16 +297,22 @@ class CommandBuilder:
         return self
 
     def target(self, target: Target) -> Self:
+        """``-t``; a command takes one target, recorded on the built ``Command``."""
         self._before_positionals("-t")
         if not isinstance(target, Target):
             raise TypeError("a target must be built with pane, window, session or pane_in_session")
+        if self._target is not None:
+            raise ValueError("a command takes one target")
+        self._target = target
         self._add("-t")
         self._add(target.text)
         return self
 
     def format(self, flag: str, fmt: Format) -> Self:
-        """A flag whose value is termctl's own format, such as ``-F``."""
+        """``-F`` or ``-f`` with termctl's own format."""
         self._before_positionals(flag)
+        if flag not in _FORMAT_FLAGS:
+            raise ValueError(f"{flag} does not take a format")
         if not isinstance(fmt, Format):
             raise TypeError("a format must be a Format")
         self._add(flag)
@@ -242,7 +330,13 @@ class CommandBuilder:
     # Positionals.
 
     def arg(self, value: str) -> Self:
-        """A literal positional (rule 4), such as an argv element or an option value."""
+        """A literal positional (rule 4), such as an argv element or an option value. The
+        ``rename-window`` name is format-expanded, so it gets rule 3 as in ``name``; a
+        ``display`` positional is a format and takes only ``format_arg``."""
+        if self._name == "rename-window":
+            return self.name(value)
+        if self._name in _FORMAT_POSITIONAL_COMMANDS:
+            raise ValueError(f"the {self._name} positional is a format; use format_arg")
         self._positional_next()
         self._add(value)
         return self
@@ -269,7 +363,7 @@ class CommandBuilder:
         return self
 
     def build(self) -> Command:
-        return Command(tuple(self._elements), tuple(self._shown))
+        return Command(tuple(self._elements), tuple(self._shown), target=self._target)
 
 
 def command(name: str) -> CommandBuilder:
@@ -344,18 +438,25 @@ def all_of(*conditions: Format) -> Format:
     """``#{&&:a,b}`` nested pairwise (tmux 3.2 takes two operands)."""
     if len(conditions) < 2:
         raise ValueError("all_of needs at least two conditions")
+    if not all(isinstance(c, Format) for c in conditions):
+        raise TypeError("all_of takes Formats")
     text = conditions[-1].text
     for condition in reversed(conditions[:-1]):
         text = f"#{{&&:{condition.text},{text}}}"
-    return Format(text)
+    return _format(text)
+
+
+def in_window(window_id: str) -> Format:
+    """The pane is in ``window_id``."""
+    return _format(_eq("#{window_id}", _fullmatch(_WINDOW_ID, window_id, "window id")))
 
 
 def owned(termctl_id: str) -> Format:
     """The pane's own ``@termctl_pane`` names it and it carries ``termctl_id`` (rule 5)."""
     _fullmatch(_TERMCTL_ID, termctl_id, "termctl id")
     return all_of(
-        Format(_eq("#{@termctl_pane}", "#{pane_id}")),
-        Format(_eq("#{@termctl_id}", termctl_id)),
+        _format(_eq("#{@termctl_pane}", "#{pane_id}")),
+        _format(_eq("#{@termctl_id}", termctl_id)),
     )
 
 
@@ -364,17 +465,17 @@ def owned_single_pane_window(termctl_id: str) -> Format:
     guards; interface.md "Names")."""
     _fullmatch(_TERMCTL_ID, termctl_id, "termctl id")
     return all_of(
-        Format(_eq("#{@termctl_pane}", "#{pane_id}")),
-        Format(_eq("#{@termctl_id}", termctl_id)),
-        Format(_eq("#{window_id}", "#{@termctl_window}")),
-        Format(_eq("#{window_panes}", "1")),
+        _format(_eq("#{@termctl_pane}", "#{pane_id}")),
+        _format(_eq("#{@termctl_id}", termctl_id)),
+        _format(_eq("#{window_id}", "#{@termctl_window}")),
+        _format(_eq("#{window_panes}", "1")),
     )
 
 
 def untagged_in_window(window_id: str) -> Format:
     """Empty ``@termctl_pane`` and in ``window_id`` (the tagging guard, Open order step 6)."""
     _fullmatch(_WINDOW_ID, window_id, "window id")
-    return all_of(Format(_eq("#{@termctl_pane}", "")), Format(_eq("#{window_id}", window_id)))
+    return all_of(_format(_eq("#{@termctl_pane}", "")), in_window(window_id))
 
 
 def cleanup(window_id: str) -> Format:
@@ -382,56 +483,121 @@ def cleanup(window_id: str) -> Format:
     tagging, Open order)."""
     _fullmatch(_WINDOW_ID, window_id, "window id")
     either = f"#{{||:{_eq('#{@termctl_pane}', '')},{_eq('#{@termctl_pane}', '#{pane_id}')}}}"
-    return all_of(Format(_eq("#{window_id}", window_id)), Format(either))
+    return all_of(in_window(window_id), _format(either))
 
 
-_NOMATCH_COMMAND = command("display").flag("-p").arg(NOMATCH).build()
+_NOMATCH_COMMAND = command("display").flag("-p").format_arg(_format(NOMATCH)).build()
+
+
+def _check_guarded_target(guard: Target, inner: Command) -> Target | None:
+    """Refuse an inner command that could act outside the guarded pane; return a window target
+    whose containment the condition must check."""
+    if inner.guarded or inner.name == "if-shell":
+        raise ValueError("guards do not nest")
+    if inner.target is None:
+        raise ValueError("a guarded command must name its target with target()")
+    if inner.target.kind == "window":
+        return inner.target
+    if inner.target != guard:
+        raise ValueError(
+            f"a guarded command must target the guarded pane {guard.text} or its window,"
+            f" not {inner.target.text}"
+        )
+    return None
 
 
 def guarded(target: Target, condition: Format, *commands: Command) -> Command:
-    """``if-shell -F -t <target> -- <condition> '<commands>' 'display -p termctl-nomatch'``.
+    """``if-shell -F -t %N -- <condition> '<commands>' 'display -p termctl-nomatch'``.
 
-    The inner commands run only while ``condition`` holds for ``target``, in the same tmux
-    command; a missing target evaluates the condition as false (spike F5). Each inner command
-    must name its own target with ``-t`` (without one it would act on tmux's default target).
-    Inner elements are single-quoted, where rule 1 does not apply; several inner commands are
-    joined by `` ; ``.
+    The inner commands run only while ``condition`` holds for pane ``target``, in the same tmux
+    command; a missing pane evaluates the condition as false (spike F5). Each inner command
+    targets that same pane or a window (``rename-window -t @W``); for a window target the
+    condition also requires the pane to be in that window, so no inner command can act outside
+    the guarded pane. Inner elements are quoted by ``quote``, where rule 1 does not apply;
+    several inner commands are joined by `` ; ``.
     """
-    if not commands:
-        raise ValueError("a guard needs at least one command")
-    if any(c.guarded for c in commands):
-        raise ValueError("guards do not nest")
-    if not all(c.has_target for c in commands):
-        raise ValueError("a guarded command must name its target with -t")
     if not isinstance(target, Target) or not isinstance(condition, Format):
         raise TypeError("a guard takes a Target and a Format")
-    inner = f" {SEPARATOR} ".join(c.quoted() for c in commands)
+    if target.kind != "pane":
+        raise ValueError(f"a guard target must be a pane id, not {target.text}")
+    if not commands:
+        raise ValueError("a guard needs at least one command")
+    windows: list[Format] = []
+    for inner in commands:
+        window_target = _check_guarded_target(target, inner)
+        if window_target is not None:
+            contained = in_window(window_target.text)
+            if contained not in windows:
+                windows.append(contained)
+    if windows:
+        condition = all_of(condition, *windows)
+    inner_text = f" {SEPARATOR} ".join(c.quoted() for c in commands)
     inner_shown = f" {SEPARATOR} ".join(c.quoted_shown() for c in commands)
-    built = command("if-shell").flag("-F").target(target).format_arg(condition)
-    built.arg(inner).arg(_NOMATCH_COMMAND.quoted())
+    built = command("if-shell")
+    built._before_positionals("-F")
+    built._add("-F")
+    built.target(target).format_arg(condition)
+    built._positional_next()
+    built._add(inner_text)
+    built._add(_NOMATCH_COMMAND.quoted())
     plain = built.build()
     shown = (*plain.shown[:-2], inner_shown, plain.shown[-1])
-    return Command(plain.elements, shown, guarded=True)
+    return Command(plain.elements, shown, guarded=True, target=target)
 
 
-def guard_matched(stdout: str) -> bool:
-    """Whether a guarded invocation's guard matched: no stdout line is ``termctl-nomatch``.
+class GuardOutcome(enum.Enum):
+    """How a guarded invocation ended."""
 
-    Any such line counts as a non-match, so output that merely looks like one fails closed.
+    MATCHED = "matched"
+    NOMATCH = "nomatch"
+    # tmux exited non-zero: no server, a failing inner command, a refused command. Never a
+    # match, since whether the guard ran is unknown.
+    FAILED = "failed"
+
+
+class TmuxCommandFailed(Exception):
+    """A guarded invocation exited non-zero; ``result`` is tmux's result."""
+
+    def __init__(self, result: subprocess.CompletedProcess[str]) -> None:
+        super().__init__(f"tmux exited {result.returncode}: {result.stderr.strip()}")
+        self.result = result
+
+
+def guard_outcome(result: subprocess.CompletedProcess[str]) -> GuardOutcome:
+    """Read a guarded invocation's result: a non-zero exit is ``FAILED``; otherwise any stdout
+    line equal to ``termctl-nomatch`` is ``NOMATCH`` (so output that merely looks like one
+    fails closed), and anything else, empty stdout included, is ``MATCHED``.
+
+    So the inner commands must never print a line that could be ``termctl-nomatch``: only
+    termctl's own formats over tmux ids and numbers, never caller or tmux-controlled text. A
+    false non-match would make ``close`` report an open pane as already closed.
     """
-    return NOMATCH not in stdout.splitlines()
+    if result.returncode != 0:
+        return GuardOutcome.FAILED
+    if NOMATCH in result.stdout.splitlines():
+        return GuardOutcome.NOMATCH
+    return GuardOutcome.MATCHED
 
 
-def check_guard(stdout: str, termctl_id: str) -> None:
-    """Raise ``not_found`` (exit 10) when the guard did not match; ``close`` instead treats
-    that as already closed and calls ``guard_matched`` itself."""
-    if not guard_matched(stdout):
+def check_guard(result: subprocess.CompletedProcess[str], termctl_id: str) -> None:
+    """Raise ``not_found`` (exit 10) on ``NOMATCH`` and ``TmuxCommandFailed`` on ``FAILED``;
+    ``close`` instead treats ``NOMATCH`` as already closed and calls ``guard_outcome``."""
+    outcome = guard_outcome(result)
+    if outcome is GuardOutcome.FAILED:
+        # TODO(#11): map a failed guarded invocation to its exit code (not_found or exit 12).
+        raise TmuxCommandFailed(result)
+    if outcome is GuardOutcome.NOMATCH:
         raise TermctlError(
             "not_found", f"managed pane {termctl_id} is gone or no longer the one resolved"
         )
 
 
 # --- the runner ---------------------------------------------------------------------------------
+
+
+def _escape_controls(text: str) -> str:
+    """C0, DEL and C1 characters as ``\\xNN``, so a trace cannot drive the terminal."""
+    return _CONTROL.sub(lambda m: f"\\x{ord(m.group()):02x}", text)
 
 
 class Tmux:
@@ -464,9 +630,8 @@ class Tmux:
         is the caller's, since it depends on the command."""
         argv = invocation.argv(self.tmux_bin, self.socket_path)
         if self.trace is not None:
-            self.trace(
-                "tmux: " + shlex.join(invocation.shown_argv(self.tmux_bin, self.socket_path))
-            )
+            shown = shlex.join(invocation.shown_argv(self.tmux_bin, self.socket_path))
+            self.trace("tmux: " + _escape_controls(shown))
         try:
             return self.gateway.run(argv, timeout=TMUX_TIMEOUT, env=self.env)
         except subprocess.TimeoutExpired:

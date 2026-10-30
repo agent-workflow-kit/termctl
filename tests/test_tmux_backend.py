@@ -3,14 +3,16 @@
 
 from __future__ import annotations
 
+import dataclasses
 import subprocess
 
 import pytest
 
 from termctl import tmux_backend as tb
 from termctl.errors import TermctlError
-from termctl.tmux_backend import Command, Format, Invocation, Tmux, command
+from termctl.tmux_backend import Command, Format, GuardOutcome, Invocation, Tmux, command
 
+from .conftest import tmux_missing_outcome
 from .fakes import FakeGateway
 
 TMUX = "/usr/bin/tmux"
@@ -53,6 +55,18 @@ HOSTILE = [
     "é中\U0001f514",
     "‮",
     "x" * 5000,
+    # Newlines next to whitespace, "#" and backslashes (review round 1, R1-1).
+    "a\n  b",
+    "if 1:\n    print(1)",
+    "a\\\nb",
+    "a\\\\\\\nb",
+    "\\\n",
+    "a\\\n'b",
+    "x\n set -g @pwned 1",
+    "a\r\nb",
+    "a\n#x",
+    "a\n\tb",
+    "\n\n",
 ]
 
 
@@ -166,6 +180,36 @@ def test_flags_with_their_own_methods_are_refused_as_plain_options(flag: str) ->
         command("new-window").option(flag, "x")
 
 
+@pytest.mark.parametrize("flag", ["-t", "-e", "-F", "-n", "-c", "-s", "-f"])
+def test_value_taking_flags_are_refused_without_a_value(flag: str) -> None:
+    with pytest.raises(ValueError):
+        command("set-option").flag(flag)
+
+
+def test_filter_option_needs_a_format() -> None:
+    with pytest.raises(ValueError):
+        command("list-panes").option("-f", "#{pane_dead}")
+    fmt = tb.fields("pane_id")
+    assert command("list-panes").format("-f", fmt).build().argv == (
+        "list-panes",
+        "-f",
+        "#{pane_id}",
+    )
+
+
+@pytest.mark.parametrize("flag", ["-t", "-e", "-n", "-c", "-s", "-x"])
+def test_formats_go_only_to_format_flags(flag: str) -> None:
+    with pytest.raises(ValueError):
+        command("new-window").format(flag, tb.fields("pane_id"))
+
+
+def test_server_scope_is_set_options_s_flag() -> None:
+    cmd = command("set-option").server_scope().arg("exit-unattached").arg("off").build()
+    assert cmd.argv == ("set-option", "-s", "--", "exit-unattached", "off")
+    with pytest.raises(ValueError):
+        command("new-window").server_scope()
+
+
 @pytest.mark.parametrize("name", ["", "-x", "set;", "Set", "a b", "new-window;", "#{x}"])
 def test_malformed_command_names_are_refused(name: str) -> None:
     with pytest.raises(ValueError):
@@ -201,6 +245,22 @@ def test_status_styles_are_refused_in_format_expanded_values(value: str) -> None
         command("new-window").option("-n", value)
     with pytest.raises(ValueError):
         command("rename-window").name(value)
+    with pytest.raises(ValueError):
+        command("rename-window").arg(value)
+
+
+def test_rename_window_arg_is_format_expanded_like_name() -> None:
+    cmd = command("rename-window").target(tb.window("@2")).arg("a#(b)").build()
+    assert cmd.argv == ("rename-window", "-t", "@2", "--", "a##(b)")
+
+
+@pytest.mark.parametrize("name", ["display", "display-message"])
+def test_display_positional_must_be_a_format(name: str) -> None:
+    with pytest.raises(ValueError):
+        command(name).flag("-p").arg("#(touch x)")
+    assert command(name).flag("-p").format_arg(tb.fields("pane_id")).build().argv[-1] == (
+        "#{pane_id}"
+    )
 
 
 @pytest.mark.parametrize("value", ["#[fg=red]", "#(x)", "#{y}", "a;"])
@@ -218,27 +278,53 @@ def test_literal_positions_are_not_doubled(value: str) -> None:
     assert cmd.argv[-1] == tb.escape_separator(value)
 
 
-def test_other_option_values_are_literal() -> None:
-    assert command("switch-client").flag("-E").option("-c", "/dev/pts/1").build().argv == (
-        "switch-client",
-        "-E",
-        "-c",
-        "/dev/pts/1",
-    )
+def test_values_of_flags_outside_the_doubled_set_are_literal() -> None:
     assert command("x").option("-x", "#{a}").build().argv == ("x", "-x", "#{a}")
+    assert command("new-window").option("-T", "a#(b)#").build().argv == (
+        "new-window",
+        "-T",
+        "a#(b)#",
+    )
 
 
 def test_formats_are_passed_verbatim() -> None:
-    fmt = Format("#{pane_id} #{window_id}")
+    fmt = tb.fields("pane_id", "window_id")
     cmd = command("new-window").flag("-P").format("-F", fmt).build()
     assert cmd.argv == ("new-window", "-P", "-F", "#{pane_id} #{window_id}")
     assert command("display").flag("-p").format_arg(fmt).build().argv[-1] == fmt.text
 
 
-@pytest.mark.parametrize("text", ["a;", "#{x}\n", "\x00", "x\x1b"])
-def test_formats_reject_separators_and_control_characters(text: str) -> None:
-    with pytest.raises(ValueError):
+@pytest.mark.parametrize("text", ["#{pane_id}", "#(touch x)", "a;", "\x00"])
+def test_formats_cannot_be_built_directly(text: str) -> None:
+    with pytest.raises(TypeError):
         Format(text)
+
+
+def test_fields_builds_a_format_of_field_names() -> None:
+    assert tb.fields("pane_id", "@termctl_name").text == "#{pane_id} #{@termctl_name}"
+
+
+@pytest.mark.parametrize(
+    "name", ["", "#(x)", "a}", "a,b", "a b", "pane_id;", "Pane", "@", "1a", "a\n"]
+)
+def test_fields_refuses_anything_but_field_names(name: str) -> None:
+    with pytest.raises(ValueError):
+        tb.fields(name)
+    with pytest.raises(ValueError):
+        tb.fields()
+
+
+@pytest.mark.parametrize("value", ["\ud800", "a\udbff", "\udfff", "\udc7f"])
+def test_lone_surrogates_are_refused(value: str) -> None:
+    with pytest.raises(ValueError):
+        command("x").arg(value)
+    with pytest.raises(ValueError):
+        command("x").env("A", value)
+
+
+def test_surrogate_escaped_bytes_are_accepted() -> None:
+    # os.fsdecode writes an undecodable byte as \udc80-\udcff; it encodes back to the byte.
+    assert command("x").arg("a\udc80\udcff").build().argv[-1] == "a\udc80\udcff"
 
 
 def test_nul_is_refused_everywhere() -> None:
@@ -287,6 +373,36 @@ def test_target_cannot_be_forged_from_a_string() -> None:
         command("kill-pane").target("%1")  # type: ignore[arg-type]
 
 
+@pytest.mark.parametrize(
+    "text", ["main; run-shell x", "main", "=a", "%1;", "=a:@1", "=a:%1", "@1.%2", "", "=a b:"]
+)
+def test_targets_built_directly_are_checked(text: str) -> None:
+    with pytest.raises(ValueError):
+        tb.Target(text)
+
+
+def test_targets_built_directly_with_a_valid_grammar_are_accepted() -> None:
+    assert tb.Target("%3") == tb.pane("%3")
+    assert tb.Target("=w:@1.%2") == tb.pane_in_session("w", "@1", "%2")
+
+
+def test_targets_know_their_kind() -> None:
+    assert tb.pane("%1").kind == "pane"
+    assert tb.window("@1").kind == "window"
+    assert tb.session("s").kind == "session"
+    assert tb.pane_in_session("s", "@1", "%1").kind == "pane_in_session"
+
+
+def test_a_command_takes_one_target() -> None:
+    with pytest.raises(ValueError):
+        command("kill-pane").target(tb.pane("%1")).target(tb.pane("%2"))
+
+
+def test_a_command_records_its_target() -> None:
+    assert command("kill-pane").target(tb.pane("%1")).build().target == tb.pane("%1")
+    assert command("kill-pane").build().target is None
+
+
 # --- -e and redaction ---------------------------------------------------------------------------
 
 
@@ -328,7 +444,7 @@ def test_env_values_are_shown_by_name_only() -> None:
 
 
 def test_chain_joins_commands_with_bare_separators() -> None:
-    a = command("set-option").flag("-s").arg("exit-unattached").arg("off").build()
+    a = command("set-option").server_scope().arg("exit-unattached").arg("off").build()
     b = command("new-session").flag("-d").option("-s", "work").build()
     inv = Invocation.of(a, b)
     assert inv.argv(TMUX, SOCK) == [
@@ -408,7 +524,7 @@ def test_untagged_and_cleanup_conditions() -> None:
 
 def test_all_of_needs_two_conditions() -> None:
     with pytest.raises(ValueError):
-        tb.all_of(Format("1"))
+        tb.all_of(tb.owned(ID))
 
 
 def test_guard_shape() -> None:
@@ -452,7 +568,7 @@ def test_guard_chains_inner_commands() -> None:
         command("display")
         .flag("-p")
         .target(tb.pane("%5"))
-        .format_arg(Format("#{pane_pid}"))
+        .format_arg(tb.fields("pane_pid"))
         .build()
     )
     cmd = tb.guarded(tb.pane("%5"), tb.owned(ID), a, b)
@@ -465,6 +581,49 @@ def test_guard_inner_rename_doubles_hashes_before_quoting() -> None:
     inner = command("rename-window").target(tb.window("@2")).name("a#(b)").build()
     cmd = tb.guarded(tb.pane("%5"), tb.owned_single_pane_window(ID), inner)
     assert cmd.argv[6] == "'rename-window' '-t' '@2' '--' 'a##(b)'"
+
+
+def test_guard_on_a_window_target_requires_the_pane_to_be_in_it() -> None:
+    inner = command("rename-window").target(tb.window("@2")).name("x").build()
+    cmd = tb.guarded(tb.pane("%5"), tb.owned(ID), inner)
+    assert cmd.argv[5] == tb.all_of(tb.owned(ID), tb.in_window("@2")).text
+
+
+def test_guard_target_spoofs_are_refused() -> None:
+    guard, cond = tb.pane("%5"), tb.owned(ID)
+    spoofs = [
+        # An option value "-t" is not a target.
+        command("set-option").flag("-p").option("-T", "-t").arg("@a").arg("1").build(),
+        command("new-window").option("-c", "-t").build(),
+        # Another pane, a session or a pane-in-session target.
+        command("kill-pane").target(tb.pane("%6")).build(),
+        command("kill-session").target(tb.session("s")).build(),
+        command("kill-pane").target(tb.pane_in_session("s", "@1", "%5")).build(),
+        # if-shell inside a guard, however built.
+        command("if-shell").target(guard).arg("1").arg("kill-server").build(),
+        Command(("if-shell", "-t", "%5", "--", "1", "kill-server"), ("if-shell",)),
+    ]
+    for inner in spoofs:
+        with pytest.raises(ValueError):
+            tb.guarded(guard, cond, inner)
+    with pytest.raises(ValueError):
+        command("kill-pane").flag("-t")
+
+
+def test_guard_accepts_an_option_value_double_dash_before_the_target() -> None:
+    inner = command("respawn-pane").option("-c", "--").target(tb.pane("%5")).build()
+    assert tb.guarded(tb.pane("%5"), tb.owned(ID), inner).argv[6] == (
+        "'respawn-pane' '-c' '--' '-t' '%5'"
+    )
+
+
+@pytest.mark.parametrize(
+    "outer", [tb.window("@1"), tb.session("s"), tb.pane_in_session("s", "@1", "%5")]
+)
+def test_guard_target_must_be_a_pane(outer: tb.Target) -> None:
+    inner = command("kill-pane").target(tb.pane("%5")).build()
+    with pytest.raises(ValueError):
+        tb.guarded(outer, tb.owned(ID), inner)
 
 
 def test_guard_shown_redacts_inner_env_values() -> None:
@@ -492,37 +651,67 @@ def test_guard_cannot_nest_guards() -> None:
         tb.guarded(tb.pane("%5"), tb.owned(ID), inner)
 
 
-@pytest.mark.parametrize("value", HOSTILE)
-def test_quote_round_trips_like_a_posix_single_quote(value: str) -> None:
-    # tmux's parser treats single quotes like the shell: nothing is special inside, and a
-    # backslash outside quotes escapes the next character. The real-tmux round trip is in
-    # test_tmux_integration.py; here, Python's shell lexer stands in.
-    import shlex
+@pytest.mark.parametrize(
+    ("value", "expected"),
+    [
+        ("", "''"),
+        ("a b", "'a b'"),
+        ("it's", "'it'\\''s'"),
+        ("a\nb", "'a'\\n'b'"),
+        ("\n", "''\\n''"),
+        ("a\n  b", "'a'\\n'  b'"),
+        ("a\\\nb", "'a\\'\\n'b'"),
+        ("a\n#x", "'a'\\n'#x'"),
+    ],
+)
+def test_quote_writes_newlines_as_escapes_outside_the_quotes(value: str, expected: str) -> None:
+    # tmux's parser drops "\" + newline anywhere, and blanks and "#..." comments after a
+    # newline even inside quotes; "\n" outside quotes is a newline (spike F5). The real-tmux
+    # round trips are in test_tmux_integration.py.
+    assert tb.quote(value) == expected
 
-    assert shlex.split(tb.quote(value)) == [value]
+
+@pytest.mark.parametrize("value", HOSTILE)
+def test_quote_leaves_no_raw_newline(value: str) -> None:
+    assert "\n" not in tb.quote(value)
+
+
+def _result(rc: int, stdout: str) -> subprocess.CompletedProcess[str]:
+    return subprocess.CompletedProcess(["tmux"], rc, stdout, "")
 
 
 @pytest.mark.parametrize(
-    ("stdout", "matched"),
+    ("rc", "stdout", "outcome"),
     [
-        ("", True),
-        ("123 0 456\n", True),
-        ("termctl-nomatch\n", False),
-        ("termctl-nomatch", False),
-        ("x\ntermctl-nomatch\n", False),
-        ("termctl-nomatch-not\n", True),
-        (" termctl-nomatch\n", True),
+        (0, "", GuardOutcome.MATCHED),
+        (0, "123 0 456\n", GuardOutcome.MATCHED),
+        (0, "termctl-nomatch\n", GuardOutcome.NOMATCH),
+        (0, "termctl-nomatch", GuardOutcome.NOMATCH),
+        (0, "x\ntermctl-nomatch\n", GuardOutcome.NOMATCH),
+        (0, "termctl-nomatch-not\n", GuardOutcome.MATCHED),
+        (0, " termctl-nomatch\n", GuardOutcome.MATCHED),
+        (1, "", GuardOutcome.FAILED),
+        (1, "123\n", GuardOutcome.FAILED),
+        (1, "termctl-nomatch\n", GuardOutcome.FAILED),
+        (-9, "", GuardOutcome.FAILED),
     ],
 )
-def test_guard_matched(stdout: str, matched: bool) -> None:
-    assert tb.guard_matched(stdout) is matched
+def test_guard_outcome(rc: int, stdout: str, outcome: GuardOutcome) -> None:
+    assert tb.guard_outcome(_result(rc, stdout)) is outcome
 
 
-def test_check_guard_raises_not_found() -> None:
+def test_check_guard_raises_not_found_on_a_nomatch() -> None:
     with pytest.raises(TermctlError) as info:
-        tb.check_guard("termctl-nomatch\n", "tc-abcdefgh")
+        tb.check_guard(_result(0, "termctl-nomatch\n"), "tc-abcdefgh")
     assert info.value.code == "not_found" and info.value.exit_code == 10
-    tb.check_guard("", "tc-abcdefgh")
+    tb.check_guard(_result(0, ""), "tc-abcdefgh")
+
+
+def test_check_guard_never_treats_a_failure_as_a_match() -> None:
+    failed = _result(1, "")
+    with pytest.raises(tb.TmuxCommandFailed) as info:
+        tb.check_guard(failed, "tc-abcdefgh")
+    assert info.value.result is failed
 
 
 # --- the runner ---------------------------------------------------------------------------------
@@ -570,6 +759,20 @@ def test_runner_trace_quotes_hostile_elements() -> None:
     assert traced == [f"tmux: {TMUX} -S {SOCK} rename-window -t @1 -- 'a b\\;'"]
 
 
+def test_runner_trace_escapes_control_characters() -> None:
+    value = "a\x1b[2Jb\x07\x7f\x9b\nc"
+    inv = Invocation.of(
+        command("set-option").flag("-p").target(tb.pane("%1")).arg("@a").arg(value).build()
+    )
+    argv = inv.argv(TMUX, SOCK)
+    gateway = RecordingGateway({tuple(argv): _done(argv)})
+    traced: list[str] = []
+    Tmux(gateway, TMUX, SOCK, env={}, trace=traced.append).run(inv)
+    assert traced == [
+        f"tmux: {TMUX} -S {SOCK} set-option -p -t %1 -- @a 'a\\x1b[2Jb\\x07\\x7f\\x9b\\x0ac'"
+    ]
+
+
 def test_runner_returns_failures_to_the_caller() -> None:
     inv = Invocation.of(command("kill-pane").target(tb.pane("%9")).build())
     argv = inv.argv(TMUX, SOCK)
@@ -611,5 +814,18 @@ def test_runner_refuses_a_relative_binary() -> None:
 def test_command_is_immutable() -> None:
     cmd = command("kill-pane").target(tb.pane("%1")).build()
     assert isinstance(cmd, Command)
-    with pytest.raises(AttributeError):
-        cmd.argv = ()  # type: ignore[misc]
+    with pytest.raises(dataclasses.FrozenInstanceError):
+        cmd.elements = ()  # type: ignore[misc]
+
+
+# --- the tmux_server fixture --------------------------------------------------------------------
+
+
+@pytest.mark.parametrize(
+    ("environ", "outcome"),
+    [({}, "skip"), ({"CI": "true"}, "fail"), ({"CI": "1"}, "fail"), ({"CI": ""}, "skip")],
+)
+def test_missing_tmux_fails_under_ci_and_skips_elsewhere(
+    environ: dict[str, str], outcome: str
+) -> None:
+    assert tmux_missing_outcome(environ) == outcome

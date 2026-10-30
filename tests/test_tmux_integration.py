@@ -13,7 +13,7 @@ from pathlib import Path
 import pytest
 
 from termctl import tmux_backend as tb
-from termctl.tmux_backend import Command, Format, Invocation, command
+from termctl.tmux_backend import Command, GuardOutcome, Invocation, command
 
 from .conftest import TmuxServer, wait_for
 
@@ -55,11 +55,28 @@ LITERALS = [
     "\x1b[31m",
     "é中\U0001f514",
     "x" * 4000,
+    # Newlines next to whitespace, "#" and backslashes, which tmux's parser alters inside a
+    # quoted guard command unless quote() writes them outside the quotes (review round 1).
+    "a\n  b",
+    "if 1:\n    print(1)",
+    "a\\\nb",
+    "a\\\\\\\nb",
+    "\\\n",
+    "a\\\n'b",
+    "x\n set -g @pwned 1",
+    "a\r\nb",
+    "a\n#x",
+    "a\n#{pane_id}",
+    "a\n\tb",
+    "\n\n",
+    "\n",
+    "a\n}",
+    "#(echo pwned)\n#(echo pwned)",
 ]
 
-# Option values as tmux prints them back: it escapes ESC and other C0 characters on output
+# Option values as tmux prints them back: it escapes ESC, CR and other C0 characters on output
 # (tab and newline are kept), so those are left to the argv and -e tests, which read them raw.
-OPTION_VALUES = [v for v in LITERALS if "\x1b" not in v]
+OPTION_VALUES = [v for v in LITERALS if "\x1b" not in v and "\r" not in v]
 
 # Values for format-expanded positions: valid names (no control characters, no "#[").
 NAMES = [
@@ -94,11 +111,15 @@ def _run(server: TmuxServer, *commands: Command) -> tuple[int, str, str]:
     return result.returncode, result.stdout, result.stderr
 
 
+def _guard(server: TmuxServer, cmd: Command) -> GuardOutcome:
+    return tb.guard_outcome(server.tmux().run(Invocation.of(cmd)))
+
+
 def _show_pane_option(server: TmuxServer, pane_id: str, name: str) -> str:
-    result = server.raw("show-options", "-p", "-q", "-v", "-t", pane_id, name)
+    result = server.raw_bytes("show-options", "-p", "-q", "-v", "-t", pane_id, name)
     assert result.returncode == 0, result.stderr
     # An unset option prints nothing; a set one its value and a newline.
-    return result.stdout.removesuffix("\n")
+    return result.stdout.decode().removesuffix("\n")
 
 
 def _display(server: TmuxServer, target: str, fmt: str) -> str:
@@ -127,7 +148,7 @@ def _new_window(server: TmuxServer, builder_tail: Command | None = None) -> tupl
         command("new-window")
         .flag("-d")
         .flag("-P")
-        .format("-F", Format("#{pane_id} #{window_id}"))
+        .format("-F", tb.fields("pane_id", "window_id"))
         .target(tb.session("base"))
         .arg("/usr/bin/env")
         .arg("--")
@@ -264,7 +285,7 @@ def test_e4_names_round_trip_in_new_window_and_rename_window(
         command("new-window")
         .flag("-d")
         .flag("-P")
-        .format("-F", Format("#{pane_id} #{window_id}"))
+        .format("-F", tb.fields("pane_id", "window_id"))
         .target(tb.session("base"))
         .option("-n", name)
         .arg("/usr/bin/env")
@@ -292,7 +313,7 @@ def test_e4_cwd_round_trips(tmux_server: TmuxServer, dirname: str) -> None:
         command("new-window")
         .flag("-d")
         .flag("-P")
-        .format("-F", Format("#{pane_id} #{window_id}"))
+        .format("-F", tb.fields("pane_id", "window_id"))
         .target(tb.session("base"))
         .option("-c", str(cwd))
         .arg("/usr/bin/env")
@@ -353,9 +374,8 @@ def test_e4_command_formats_never_run(tmux_server: TmuxServer) -> None:
         command("rename-window").target(tb.window(window_id)).name(payload + "g").build(),
     )
     for cmd in (new_window, new_session, rename, guarded_rename):
-        rc, out, err = _run(tmux_server, cmd)
-        assert rc == 0, err
-        assert tb.guard_matched(out)
+        result = tmux_server.tmux().run(Invocation.of(cmd))
+        assert tb.guard_outcome(result) is GuardOutcome.MATCHED, result.stderr
     assert _no_canary(canary)
     assert _display(tmux_server, pane_id, "#{window_name}") == payload + "g"
     sessions = tmux_server.raw("list-sessions", "-F", "#{session_name}").stdout.splitlines()
@@ -382,9 +402,8 @@ def test_f5_guarded_option_values_round_trip(tmux_server: TmuxServer, value: str
     pane_id = tmux_server.start()
     _tag(tmux_server, pane_id)
     cmd = tb.guarded(tb.pane(pane_id), tb.owned(ID), _set_pane(pane_id, "@termctl_name", value))
-    rc, out, err = _run(tmux_server, cmd)
-    assert rc == 0, err
-    assert tb.guard_matched(out)
+    assert _guard(tmux_server, cmd) is GuardOutcome.MATCHED
+    assert tmux_server.raw("show-options", "-g", "-q", "-v", "@pwned").stdout == ""
     assert _show_pane_option(tmux_server, pane_id, "@termctl_name") == value
     assert tmux_server.raw("show-options", "-g", "-q", "-v", "@termctl_name").stdout == ""
 
@@ -395,18 +414,17 @@ def test_f5_guarded_rename_round_trips(tmux_server: TmuxServer, name: str) -> No
     window_id = _display(tmux_server, pane_id, "#{window_id}")
     _tag(tmux_server, pane_id)
     rename = command("rename-window").target(tb.window(window_id)).name(name).build()
-    rc, out, err = _run(
-        tmux_server, tb.guarded(tb.pane(pane_id), tb.owned_single_pane_window(ID), rename)
-    )
-    assert (rc, tb.guard_matched(out)) == (0, True), err
+    guarded = tb.guarded(tb.pane(pane_id), tb.owned_single_pane_window(ID), rename)
+    assert _guard(tmux_server, guarded) is GuardOutcome.MATCHED
     assert _display(tmux_server, pane_id, "#{window_name}") == _as_window_name(name)
 
 
-def test_f5_guarded_env_value_round_trips(tmux_server: TmuxServer) -> None:
+@pytest.mark.parametrize("value", LITERALS)
+def test_f5_guarded_argv_and_env_values_round_trip(tmux_server: TmuxServer, value: str) -> None:
     pane_id, _ = _new_window_in_started(tmux_server)
     _tag(tmux_server, pane_id)
     out = tmux_server.root / "out"
-    value = "it's; #(x) $HOME ~ \\ \n;"
+    script = 'printf "%s\\0" "$V" "$@" > "$0.tmp" && mv "$0.tmp" "$0"; exec sleep 600'
     respawn = (
         command("respawn-pane")
         .flag("-k")
@@ -416,14 +434,17 @@ def test_f5_guarded_env_value_round_trips(tmux_server: TmuxServer) -> None:
         .arg("--")
         .arg("/bin/sh")
         .arg("-c")
-        .arg('printf "%s" "$V" > "$0.tmp" && mv "$0.tmp" "$0"; exec sleep 600')
+        .arg(script)
         .arg(str(out))
+        .arg(value)
+        .arg(value + ";")
         .build()
     )
-    rc, stdout, err = _run(tmux_server, tb.guarded(tb.pane(pane_id), tb.owned(ID), respawn))
-    assert (rc, tb.guard_matched(stdout)) == (0, True), err
+    guarded = tb.guarded(tb.pane(pane_id), tb.owned(ID), respawn)
+    assert _guard(tmux_server, guarded) is GuardOutcome.MATCHED
     assert wait_for(out.exists)
-    assert out.read_text() == value
+    assert out.read_bytes().decode().split("\0")[:-1] == [value, value, value + ";"]
+    assert tmux_server.raw("show-options", "-g", "-q", "-v", "@pwned").stdout == ""
 
 
 def _new_window_in_started(server: TmuxServer) -> tuple[str, str]:
@@ -438,7 +459,7 @@ def test_f5_guard_chains_inner_commands_and_reports_their_output(tmux_server: Tm
         command("display-message")
         .flag("-p")
         .target(tb.pane(pane_id))
-        .format_arg(Format("#{pane_id} #{@termctl_name}"))
+        .format_arg(tb.fields("pane_id", "@termctl_name"))
         .build()
     )
     cmd = tb.guarded(
@@ -456,15 +477,14 @@ def test_f5_wrong_id_is_a_nomatch_and_changes_nothing(tmux_server: TmuxServer) -
     )
     rc, out, err = _run(tmux_server, cmd)
     assert (rc, out) == (0, "termctl-nomatch\n"), err
-    assert not tb.guard_matched(out)
+    assert _guard(tmux_server, cmd) is GuardOutcome.NOMATCH
     assert tmux_server.alive()
 
 
 def test_f5_untagged_pane_is_a_nomatch(tmux_server: TmuxServer) -> None:
     pane_id = tmux_server.start()
     cmd = tb.guarded(tb.pane(pane_id), tb.owned(ID), _set_pane(pane_id, "@x", "1"))
-    rc, out, _ = _run(tmux_server, cmd)
-    assert (rc, tb.guard_matched(out)) == (0, False)
+    assert _guard(tmux_server, cmd) is GuardOutcome.NOMATCH
     assert _show_pane_option(tmux_server, pane_id, "@x") == ""
 
 
@@ -479,8 +499,7 @@ def test_f5_inherited_window_option_is_a_nomatch(tmux_server: TmuxServer) -> Non
     cmd = tb.guarded(
         tb.pane(other_pane), tb.owned(ID), command("kill-pane").target(tb.pane(other_pane)).build()
     )
-    rc, out, _ = _run(tmux_server, cmd)
-    assert (rc, tb.guard_matched(out)) == (0, False)
+    assert _guard(tmux_server, cmd) is GuardOutcome.NOMATCH
     assert tmux_server.raw("list-panes", "-t", other_pane).returncode == 0
 
 
@@ -489,8 +508,7 @@ def test_f5_missing_pane_is_a_nomatch(tmux_server: TmuxServer) -> None:
     cmd = tb.guarded(
         tb.pane("%999"), tb.owned(ID), command("kill-pane").target(tb.pane("%999")).build()
     )
-    rc, out, err = _run(tmux_server, cmd)
-    assert (rc, tb.guard_matched(out)) == (0, False), err
+    assert _guard(tmux_server, cmd) is GuardOutcome.NOMATCH
 
 
 def test_f5_restarted_server_reusing_the_pane_id_is_a_nomatch(tmux_server: TmuxServer) -> None:
@@ -503,8 +521,7 @@ def test_f5_restarted_server_reusing_the_pane_id_is_a_nomatch(tmux_server: TmuxS
     cmd = tb.guarded(
         tb.pane(pane_id), tb.owned(ID), command("kill-pane").target(tb.pane(pane_id)).build()
     )
-    rc, out, err = _run(tmux_server, cmd)
-    assert (rc, tb.guard_matched(out)) == (0, False), err
+    assert _guard(tmux_server, cmd) is GuardOutcome.NOMATCH
     assert tmux_server.raw("list-panes", "-t", new_pane).returncode == 0
 
 
@@ -515,10 +532,8 @@ def test_f5_rename_guard_refuses_a_split_window(tmux_server: TmuxServer) -> None
     tmux_server.raw("rename-window", "-t", window_id, "before")
     tmux_server.raw("split-window", "-d", "-t", pane_id, "--", "/usr/bin/env", "--", "sleep", "600")
     rename = command("rename-window").target(tb.window(window_id)).name("after").build()
-    rc, out, _ = _run(
-        tmux_server, tb.guarded(tb.pane(pane_id), tb.owned_single_pane_window(ID), rename)
-    )
-    assert (rc, tb.guard_matched(out)) == (0, False)
+    guarded = tb.guarded(tb.pane(pane_id), tb.owned_single_pane_window(ID), rename)
+    assert _guard(tmux_server, guarded) is GuardOutcome.NOMATCH
     assert _display(tmux_server, pane_id, "#{window_name}") == "before"
 
 
@@ -533,45 +548,55 @@ def test_f5_rename_guard_refuses_a_moved_pane(tmux_server: TmuxServer) -> None:
         .name("x")
         .build()
     )
-    rc, out, _ = _run(
-        tmux_server, tb.guarded(tb.pane(pane_id), tb.owned_single_pane_window(ID), rename)
-    )
-    assert (rc, tb.guard_matched(out)) == (0, False)
+    guarded = tb.guarded(tb.pane(pane_id), tb.owned_single_pane_window(ID), rename)
+    assert _guard(tmux_server, guarded) is GuardOutcome.NOMATCH
 
 
-def test_f5_failing_inner_command_exits_1(tmux_server: TmuxServer) -> None:
+def test_f5_window_target_outside_the_guarded_pane_is_a_nomatch(tmux_server: TmuxServer) -> None:
     pane_id = tmux_server.start()
     _tag(tmux_server, pane_id)
-    cmd = tb.guarded(
-        tb.pane(pane_id), tb.owned(ID), command("kill-pane").target(tb.pane("%999")).build()
+    other_pane, other_window = _new_window(tmux_server)
+    tmux_server.raw("rename-window", "-t", other_window, "before")
+    rename = command("rename-window").target(tb.window(other_window)).name("after").build()
+    assert _guard(tmux_server, tb.guarded(tb.pane(pane_id), tb.owned(ID), rename)) is (
+        GuardOutcome.NOMATCH
     )
+    assert _display(tmux_server, other_pane, "#{window_name}") == "before"
+
+
+def test_f5_failing_inner_command_is_a_failure_not_a_match(tmux_server: TmuxServer) -> None:
+    pane_id = tmux_server.start()
+    _tag(tmux_server, pane_id)
+    # An unknown (non-@) option: the guard matches and the inner command fails.
+    cmd = tb.guarded(tb.pane(pane_id), tb.owned(ID), _set_pane(pane_id, "no-such-option", "1"))
     rc, out, err = _run(tmux_server, cmd)
-    assert rc == 1 and tb.guard_matched(out) and err
+    assert (rc, out) == (1, "") and err
+    assert _guard(tmux_server, cmd) is GuardOutcome.FAILED
+
+
+def test_f5_no_server_is_a_failure_not_a_match(tmux_server: TmuxServer) -> None:
+    cmd = tb.guarded(
+        tb.pane("%0"), tb.owned(ID), command("kill-pane").target(tb.pane("%0")).build()
+    )
+    rc, out, _ = _run(tmux_server, cmd)
+    assert (rc, out) == (1, "")
+    assert _guard(tmux_server, cmd) is GuardOutcome.FAILED
 
 
 def test_untagged_and_cleanup_guards(tmux_server: TmuxServer) -> None:
     pane_id = tmux_server.start()
     window_id = _display(tmux_server, pane_id, "#{window_id}")
     mark = _set_pane(pane_id, "@seen", "1")
-    rc, out, _ = _run(
-        tmux_server, tb.guarded(tb.pane(pane_id), tb.untagged_in_window("@999"), mark)
-    )
-    assert (rc, tb.guard_matched(out)) == (0, False)
-    rc, out, _ = _run(
-        tmux_server, tb.guarded(tb.pane(pane_id), tb.untagged_in_window(window_id), mark)
-    )
-    assert (rc, tb.guard_matched(out)) == (0, True)
+    pane = tb.pane(pane_id)
+    nomatch, matched = GuardOutcome.NOMATCH, GuardOutcome.MATCHED
+    assert _guard(tmux_server, tb.guarded(pane, tb.untagged_in_window("@999"), mark)) is nomatch
+    assert _guard(tmux_server, tb.guarded(pane, tb.untagged_in_window(window_id), mark)) is matched
     _tag(tmux_server, pane_id)
-    rc, out, _ = _run(
-        tmux_server, tb.guarded(tb.pane(pane_id), tb.untagged_in_window(window_id), mark)
-    )
-    assert (rc, tb.guard_matched(out)) == (0, False)
-    rc, out, _ = _run(tmux_server, tb.guarded(tb.pane(pane_id), tb.cleanup(window_id), mark))
-    assert (rc, tb.guard_matched(out)) == (0, True)
+    assert _guard(tmux_server, tb.guarded(pane, tb.untagged_in_window(window_id), mark)) is nomatch
+    assert _guard(tmux_server, tb.guarded(pane, tb.cleanup(window_id), mark)) is matched
     # Tagged by someone else (another pane id): the cleanup kill refuses.
     tmux_server.raw("set-option", "-p", "-t", pane_id, "@termctl_pane", "%999")
-    rc, out, _ = _run(tmux_server, tb.guarded(tb.pane(pane_id), tb.cleanup(window_id), mark))
-    assert (rc, tb.guard_matched(out)) == (0, False)
+    assert _guard(tmux_server, tb.guarded(pane, tb.cleanup(window_id), mark)) is nomatch
 
 
 # --- chains and exact targets -------------------------------------------------------------------
