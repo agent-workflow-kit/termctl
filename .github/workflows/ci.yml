@@ -1,6 +1,8 @@
 name: ci
 
-# Thin caller for agent-workflow-kit/awkit-ci. Required status check: `ci / ci-ok`.
+# Thin caller for agent-workflow-kit/awkit-ci, plus a `tmux` job that runs the real-tmux tests.
+# Status checks: `ci / ci-ok` (required) and `tmux`. `tmux` is not part of `ci / ci-ok`; it
+# gates merges only once it is added as a required check in branch protection (maintainer).
 # Source: https://github.com/agent-workflow-kit/awkit-ci/tree/main/templates
 
 on:

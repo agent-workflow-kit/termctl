@@ -1180,15 +1180,101 @@ def test_flags_smuggled_as_option_values_never_reach_a_guard() -> None:
 
 
 @pytest.mark.parametrize("value", ["-", "--", "-t", "-a", "-g", "--json"])
-@pytest.mark.parametrize("name", ["new-window", "new-session", "respawn-pane", "switch-client"])
+@pytest.mark.parametrize("name", ["new-window", "new-session", "respawn-pane"])
 def test_option_refuses_flag_like_values(name: str, value: str) -> None:
     with pytest.raises(ValueError):
         command(name).option("-c", value)
 
 
-@pytest.mark.parametrize("name", ["new-window", "new-session", "respawn-pane", "switch-client"])
+@pytest.mark.parametrize("name", ["new-window", "new-session", "respawn-pane"])
 def test_option_takes_c_on_the_commands_that_have_it(name: str) -> None:
     assert command(name).option("-c", "/d#x").build().argv == (name, "-c", "/d##x")
+
+
+# --- switch-client -c: client() (review round 5, R5-2) ----------------------------------------
+
+
+@pytest.mark.parametrize("value", ["/dev/pts/3", "-foo", "-", "--", "-t", "a.b_c-d", "x" * 100])
+def test_client_takes_every_name_of_the_client_grammar(value: str) -> None:
+    # tmux takes the element after -c as the client name whatever it starts with (verified on
+    # 3.2a and 3.5a: "can't find client: -foo").
+    cmd = command("switch-client").flag("-E").client(value).target(tb.pane("%5")).build()
+    assert cmd.argv == ("switch-client", "-E", "-c", value, "-t", "%5")
+
+
+@pytest.mark.parametrize("value", ["", "a b", "a;", "a#b", "a:b", "x" * 101, "a\n", "\u00e9"])
+def test_client_refuses_names_outside_the_client_grammar(value: str) -> None:
+    with pytest.raises(ValueError):
+        command("switch-client").client(value)
+
+
+@pytest.mark.parametrize("name", ["new-window", "attach", "display", "set"])
+def test_client_is_only_for_switch_client(name: str) -> None:
+    with pytest.raises(ValueError):
+        command(name).client("/dev/pts/3")
+
+
+def test_client_comes_before_positionals() -> None:
+    with pytest.raises(ValueError):
+        command("switch-client").arg("x").client("/dev/pts/3")
+
+
+@pytest.mark.parametrize("value", ["/dev/pts/3", "-foo"])
+def test_option_refuses_c_on_switch_client(value: str) -> None:
+    with pytest.raises(ValueError):
+        command("switch-client").option("-c", value)
+
+
+# --- flag(): value-taking flags of every command termctl builds (review round 5, R5-3) -------
+
+
+@pytest.mark.parametrize(
+    ("name", "flag"),
+    [
+        ("display", "-d"),
+        ("display-message", "-d"),
+        ("display", "-c"),
+        ("select-pane", "-T"),
+        ("switch-client", "-T"),
+        ("switch-client", "-c"),
+        ("new-session", "-x"),
+        ("new-session", "-y"),
+        ("join-pane", "-l"),
+        ("join-pane", "-s"),
+        ("capture-pane", "-b"),
+        ("capture-pane", "-E"),
+        ("capture-pane", "-S"),
+        ("attach", "-f"),
+        ("attach-session", "-c"),
+        ("list-clients", "-f"),
+        ("set-environment", "-t"),
+    ],
+)
+def test_flag_refuses_the_value_taking_flags_of_each_command(name: str, flag: str) -> None:
+    with pytest.raises(ValueError):
+        command(name).flag(flag)
+
+
+@pytest.mark.parametrize(
+    ("name", "flag"),
+    [
+        # The same letters take no value on these commands.
+        ("switch-client", "-E"),
+        ("attach", "-E"),
+        ("attach", "-x"),
+        ("new-session", "-E"),
+        ("new-session", "-d"),
+        ("new-window", "-d"),
+        ("new-window", "-b"),
+        ("new-window", "-S"),
+        ("select-window", "-T"),
+        ("select-window", "-l"),
+        ("display", "-p"),
+        ("respawn-pane", "-k"),
+    ],
+)
+def test_flag_takes_the_same_letters_where_they_take_no_value(name: str, flag: str) -> None:
+    assert command(name).flag(flag).build().argv == (name, flag)
 
 
 @pytest.mark.parametrize("value", ["-x", "--", "-t", "a#b", "n;"])

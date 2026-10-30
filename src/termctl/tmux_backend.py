@@ -7,7 +7,8 @@ Every argument termctl passes to tmux is built here, so the rules cannot be skip
    ``;``); only termctl's own separators between chained commands are a bare ``;``.
 2. **Leading ``-``.** ``--`` goes immediately before a command's first positional argument.
    ``option`` takes only a flag that takes a value for that command, never a value starting
-   with ``-``; ``window_name`` (``-n``) and ``session_name`` (``-s``) take names that may.
+   with ``-``; ``window_name`` (``-n``), ``session_name`` (``-s``) and ``client``
+   (``switch-client -c``) take names that may.
 3. **Format expansion.** Values of ``-n``, ``-c`` and ``-s`` and the ``rename-window`` name get
    every ``#`` doubled; ``#[`` there is refused (it is rejected as input earlier, exit 2).
    ``display`` takes only termctl's own ``Format`` as its positional, and ``-F`` and ``-f``
@@ -21,7 +22,9 @@ Every argument termctl passes to tmux is built here, so the rules cannot be skip
 
 Targets are exact ids (``=S:``, ``@N``, ``%N``, ``=S:@W.%P``); ``Target`` checks that grammar
 however it is built. ``Format`` values come only from this module's factories. Value-taking
-flags (``-t``, ``-e``, ``-F``, ``-f``, ``-n``, ``-c``, ``-s``) are refused as bare flags.
+flags (``-t``, ``-e``, ``-F``, ``-f``, ``-n``, ``-c``, ``-s`` everywhere, and per command
+those such as ``display -d``, ``select-pane -T`` and ``new-session -x``) are refused as bare
+flags.
 Builder misuse is a programming error and raises ``ValueError`` or ``TypeError``.
 
 Binary resolution and the version check (#10), socket resolution and safety (#8), the filtered
@@ -41,6 +44,7 @@ from typing import Literal, Self
 
 from .errors import TermctlError
 from .gateway import Gateway
+from .validate import is_client
 
 SEPARATOR = ";"
 NOMATCH = "termctl-nomatch"
@@ -49,23 +53,34 @@ TMUX_TIMEOUT = 30.0
 
 _COMMAND_NAME = re.compile(r"[a-z]+(-[a-z]+)*")
 _FLAG = re.compile(r"-[A-Za-z]")
-# Doubling also applies to switch-client's -c, a client name rather than text; client names
-# are tty paths without "#", so it changes nothing there.
 _FORMAT_EXPANDED_FLAGS = frozenset({"-n", "-c", "-s"})
 # Flags whose values have their own, typed method.
 _TYPED_FLAGS = frozenset({"-t", "-e", "-F", "-f", "-n", "-s"})
 # Flags that take a value: refused by flag(), where they would take the next element as theirs
-# or (set -F) switch on format expansion of the value.
+# or (set -F) switch on format expansion of the value. These letters take a value, or are
+# refused as bare flags for other reasons (-s, see server_scope), on every command.
 _VALUE_FLAGS = _TYPED_FLAGS | _FORMAT_EXPANDED_FLAGS
+# Letters that take a value only on some commands (tmux 3.2a to 3.5a list-commands, for every
+# command of interface.md and design.md; review round 5, R5-3); elsewhere they are plain flags
+# (switch-client -E, select-window -T, attach -x, new-window -b and -S).
+_COMMAND_VALUE_FLAGS: dict[str, frozenset[str]] = {
+    "display": frozenset({"-d"}),
+    "display-message": frozenset({"-d"}),
+    "select-pane": frozenset({"-T"}),
+    "switch-client": frozenset({"-T"}),
+    "new-session": frozenset({"-x", "-y"}),
+    "join-pane": frozenset({"-l"}),
+    "capture-pane": frozenset({"-b", "-E", "-S"}),
+}
 # The flags option() takes, per command: each takes a value in tmux, so the next element is
 # always that value (review round 4, R4-1). A flag that takes none would leave its "value" to be
-# parsed as further flags (set -w -g). Values starting with "-" are refused besides; -c is a
-# directory (absolute) or a client name (a tty path), neither of which starts with "-".
+# parsed as further flags (set -w -g). Values starting with "-" are refused besides; -c here is
+# a directory, which is absolute. switch-client's -c is a client name, which may start with
+# "-", and has its own method, client() (review round 5, R5-2).
 _OPTION_FLAGS: dict[str, frozenset[str]] = {
     "new-window": frozenset({"-c"}),
     "new-session": frozenset({"-c"}),
     "respawn-pane": frozenset({"-c"}),
-    "switch-client": frozenset({"-c"}),
 }
 # window_name() and session_name(): -n and -s on the commands where they take a value. These
 # values may start with "-" (a name "-x"); tmux takes the element after them as the value
@@ -362,10 +377,11 @@ class CommandBuilder:
         return self._elements[0]
 
     def flag(self, flag: str) -> Self:
-        """A flag without a value, such as ``-d``. Flags that take a value are refused."""
+        """A flag without a value, such as ``-d``. Flags that take a value on this command
+        (``_VALUE_FLAGS``, ``_COMMAND_VALUE_FLAGS``) are refused."""
         self._before_positionals(flag)
-        if flag in _VALUE_FLAGS:
-            raise ValueError(f"{flag} takes a value; use option, target, env or format")
+        if flag in _VALUE_FLAGS or flag in _COMMAND_VALUE_FLAGS.get(self._name, frozenset()):
+            raise ValueError(f"{self._name} {flag} takes a value; use a method that gives one")
         self._add_flag(flag)
         return self
 
@@ -390,6 +406,20 @@ class CommandBuilder:
             raise ValueError(f"an option value must not look like a flag: {value!r}")
         self._add_flag(flag)
         self._add(double_hashes(value) if flag in _FORMAT_EXPANDED_FLAGS else value)
+        return self
+
+    def client(self, name: str) -> Self:
+        """``-c CLIENT`` of ``switch-client``: a name from the ``--client`` grammar
+        (interface.md ``focus``), which may start with ``-``; tmux takes the element after
+        ``-c`` as the client name whatever it starts with. The grammar has no ``#`` or ``;``,
+        so rules 1 and 3 change nothing."""
+        self._before_positionals("-c")
+        if self._name != "switch-client":
+            raise ValueError(f"{self._name} takes no client")
+        if not isinstance(name, str) or not is_client(name):
+            raise ValueError(f"invalid client name: {name!r}")
+        self._add_flag("-c")
+        self._add(name)
         return self
 
     def window_name(self, value: str) -> Self:
