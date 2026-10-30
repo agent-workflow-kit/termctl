@@ -12,12 +12,21 @@ import copy
 import os
 import pwd
 import re
-from collections.abc import Callable, Mapping
+from collections.abc import Mapping
 from pathlib import Path
 from typing import Annotated, Any, Literal
 
 import yaml
-from pydantic import AfterValidator, BaseModel, ConfigDict, Field, ValidationError, field_validator
+from pydantic import (
+    AfterValidator,
+    BaseModel,
+    BeforeValidator,
+    ConfigDict,
+    Field,
+    TypeAdapter,
+    ValidationError,
+    field_validator,
+)
 
 from .errors import TermctlError
 
@@ -122,7 +131,15 @@ def _check_marker_text(value: str) -> str:
     return value
 
 
+def _integral(value: Any) -> Any:
+    """Accept an integral float (``1.0``) as an integer, as JSON Schema does."""
+    if isinstance(value, float) and value.is_integer():
+        return int(value)
+    return value
+
+
 NonEmpty = Annotated[str, Field(min_length=1)]
+PositiveInt = Annotated[int, BeforeValidator(_integral), Field(ge=1)]
 Socket = Annotated[str, AfterValidator(check_socket)]
 Duration = Annotated[str, _grammar(_DURATION, "duration (e.g. 10s, 500ms, 2m; at most 10m)")]
 MarkerName = Annotated[str, _grammar(_MARKER_NAME, "marker name")]
@@ -156,7 +173,7 @@ class Placement(_Model):
 
     session: SessionName | None = None
     target: Literal["window", "pane"] | None = None
-    max_panes: Annotated[int, Field(ge=1)] | None = None
+    max_panes: PositiveInt | None = None
     layout: str | None = None
     group_by: str | None = None
 
@@ -175,7 +192,7 @@ class Rule(_Model):
 
 class PreHook(_Model):
     cmd: NonEmpty
-    timeout: Annotated[int, Field(ge=1)] = 30
+    timeout: PositiveInt = 30
 
 
 class PostHook(PreHook):
@@ -213,17 +230,24 @@ def defaults() -> Config:
 
 # --- loading ------------------------------------------------------------------------------------
 
+_HOME_UNKNOWN = "cannot determine the home directory; set HOME or XDG_CONFIG_HOME, or use --config"
+
 
 def config_path(environ: Mapping[str, str], explicit: str | None) -> Path:
     """``--config PATH``, else ``$XDG_CONFIG_HOME/termctl/config.yaml`` (when set and
-    absolute), else ``~/.config/termctl/config.yaml``."""
+    absolute), else ``~/.config/termctl/config.yaml`` (``HOME``, else the passwd entry)."""
     if explicit is not None:
         return Path(explicit)
     xdg = environ.get("XDG_CONFIG_HOME", "")
     if xdg and os.path.isabs(xdg):
         base = Path(xdg)
     else:
-        home = environ.get("HOME") or pwd.getpwuid(os.getuid()).pw_dir
+        home = environ.get("HOME")
+        if not home:
+            try:
+                home = pwd.getpwuid(os.getuid()).pw_dir
+            except KeyError:
+                raise ConfigError(_HOME_UNKNOWN) from None
         base = Path(home) / ".config"
     return base / "termctl" / "config.yaml"
 
@@ -243,31 +267,115 @@ def merge(base: Mapping[Any, Any], over: Mapping[Any, Any], path: tuple[Any, ...
     return result
 
 
-def _read(path: Path) -> dict[Any, Any]:
+class _Rejected(yaml.YAMLError):
+    """A YAML construct config files do not allow; ``key`` is the dotted path, if any."""
+
+    def __init__(self, message: str, mark: yaml.Mark, key: str | None = None) -> None:
+        super().__init__(f"{message} (line {mark.line + 1})")
+        self.key = key
+
+
+_STR_TAG = "tag:yaml.org,2002:str"
+_MERGE_TAG = "tag:yaml.org,2002:merge"
+
+
+def _check_keys(root: yaml.Node) -> None:
+    """Every mapping key is a string, appears once, and is not a merge key (``<<``); the first
+    violation in document order is reported."""
+    stack: list[tuple[yaml.Node, str]] = [(root, "")]
+    while stack:
+        node, path = stack.pop()
+        if isinstance(node, yaml.SequenceNode):
+            items: list[yaml.Node] = node.value
+            children = [(item, f"{path}[{index}]") for index, item in enumerate(items)]
+            stack.extend(reversed(children))
+        elif isinstance(node, yaml.MappingNode):
+            pairs: list[tuple[yaml.Node, yaml.Node]] = node.value
+            seen: set[str] = set()
+            values: list[tuple[yaml.Node, str]] = []
+            for key_node, value_node in pairs:
+                if key_node.tag == _MERGE_TAG:
+                    raise _Rejected("merge keys (<<) are not allowed", key_node.start_mark)
+                text = key_node.value if isinstance(key_node, yaml.ScalarNode) else "?"
+                key = f"{path}.{text}" if path else text
+                if not isinstance(key_node, yaml.ScalarNode) or key_node.tag != _STR_TAG:
+                    kind = key_node.tag.rsplit(":", 1)[-1]
+                    raise _Rejected(
+                        f'{key}: the key is read as a {kind}, not a string; quote it ("{text}")',
+                        key_node.start_mark,
+                        key,
+                    )
+                if text in seen:
+                    raise _Rejected(f"{key}: duplicate key", key_node.start_mark, key)
+                seen.add(text)
+                values.append((value_node, key))
+            stack.extend(reversed(values))
+
+
+class _Loader(yaml.SafeLoader):
+    """``SafeLoader`` without anchors, aliases or merge keys (they enable exponential blow-up and
+    config files need none), with string keys only and no duplicate keys."""
+
+    def compose_node(self, parent: yaml.Node | None, index: Any) -> yaml.Node | None:
+        event = self.peek_event()
+        if isinstance(event, yaml.AliasEvent) or getattr(event, "anchor", None) is not None:
+            raise _Rejected("anchors and aliases are not allowed", event.start_mark)
+        return super().compose_node(parent, index)  # pyright: ignore[reportUnknownMemberType]
+
+    def construct_document(self, node: yaml.Node) -> Any:
+        _check_keys(node)
+        return super().construct_document(node)  # pyright: ignore[reportUnknownMemberType]
+
+
+def _read(path: Path, *, optional: bool = False) -> dict[str, Any]:
+    """Read one config file. With ``optional``, a missing file (not a dangling symlink) means
+    no settings; every other failure is a ``ConfigError`` naming the file."""
     try:
         text = path.read_text(encoding="utf-8")
     except (OSError, UnicodeDecodeError) as exc:
-        reason = exc.strerror if isinstance(exc, OSError) else "not UTF-8"
+        if isinstance(exc, FileNotFoundError) and path.is_symlink():
+            reason = "dangling symlink"
+        elif isinstance(exc, FileNotFoundError) and optional:
+            return {}
+        elif isinstance(exc, OSError):
+            reason = exc.strerror or str(exc)
+        else:
+            reason = "not UTF-8"
         raise ConfigError(f"cannot read config {path}: {reason}", file=str(path)) from None
+    details = {"file": str(path)}
     try:
-        data = yaml.safe_load(text)
+        data = yaml.load(text, Loader=_Loader)  # _Loader is a SafeLoader
+    except _Rejected as exc:
+        if exc.key is not None:
+            details["key"] = exc.key
+        raise ConfigError(f"invalid config {path}: {exc}", **details) from None
     except yaml.YAMLError as exc:
-        raise ConfigError(f"invalid config {path}: {exc}", file=str(path)) from None
+        raise ConfigError(f"invalid config {path}: {exc}", **details) from None
+    except RecursionError:
+        raise ConfigError(f"invalid config {path}: nested too deeply", **details) from None
     if data is None:
         return {}
     if not isinstance(data, dict):
-        raise ConfigError(f"invalid config {path}: the top level must be a mapping", file=str(path))
+        raise ConfigError(f"invalid config {path}: the top level must be a mapping", **details)
     return data  # pyright: ignore[reportUnknownVariableType]
 
 
 def _dropins(main: Path) -> list[Path]:
-    """``config.d/*.yaml`` next to the main file, in lexical order; hidden files are skipped,
-    as a shell glob would."""
+    """``config.d/*.yaml`` next to the main file, sorted by code point; hidden files are
+    skipped, as a shell glob would. No ``config.d`` means no drop-ins; one that cannot be
+    listed is a ``ConfigError``."""
     directory = main.parent / "config.d"
-    if not directory.is_dir():
+    try:
+        with os.scandir(directory) as entries:
+            names = [e.name for e in entries if e.name.endswith(".yaml")]
+    except FileNotFoundError:
         return []
-    paths = [p for p in directory.glob("*.yaml") if not p.name.startswith(".")]
-    return sorted(paths, key=lambda p: p.name)
+    except OSError as exc:
+        reason = exc.strerror or str(exc)
+        raise ConfigError(
+            f"cannot read config {directory}: {reason}", file=str(directory)
+        ) from None
+    return [directory / name for name in sorted(names) if not name.startswith(".")]
 
 
 def _key(loc: tuple[int | str, ...]) -> str:
@@ -286,15 +394,35 @@ def _first_error(exc: ValidationError) -> tuple[str, str]:
     return _key(error["loc"]), message
 
 
-def _validate(data: Mapping[Any, Any], on_error: Callable[[str, str], ConfigError]) -> Config:
-    try:
-        return Config.model_validate(data)
-    except ValidationError as exc:
-        raise on_error(*_first_error(exc)) from None
-
-
 def _key_error(key: str, message: str) -> ConfigError:
     return ConfigError(f"invalid config: {key}: {message}", key=key)
+
+
+def _env_adapter(key: str) -> TypeAdapter[Any]:
+    field = Config.model_fields[key]
+    return TypeAdapter(
+        Annotated[field.annotation, field],  # pyright: ignore[reportInvalidTypeForm, reportArgumentType]
+        config=ConfigDict(strict=True),
+    )
+
+
+# One validator per TERMCTL_<KEY>, built from the Config field so the two cannot drift.
+_ENV_ADAPTERS = {key: _env_adapter(key) for key in ENV_KEYS}
+
+
+def _from_environment(environ: Mapping[str, str]) -> dict[str, Any]:
+    """The valid ``TERMCTL_<KEY>`` values that are set, by key."""
+    values: dict[str, Any] = {}
+    for key in ENV_KEYS:
+        variable = f"TERMCTL_{key.upper()}"
+        if variable not in environ:
+            continue
+        try:
+            values[key] = _ENV_ADAPTERS[key].validate_python(environ[variable])
+        except ValidationError as exc:
+            message = _first_error(exc)[1]
+            raise ConfigError(f"invalid {variable}: {message}", variable=variable) from None
+    return values
 
 
 def _check_pre_hooks(data: Mapping[Any, Any]) -> None:
@@ -321,30 +449,19 @@ def _check_rules(cfg: Config) -> None:
 
 
 def load(environ: Mapping[str, str], explicit: str | None = None) -> Config:
-    """Load the effective config: built-in defaults, the main file, the drop-ins in lexical
+    """Load the effective config: built-in defaults, the main file, the drop-ins in code point
     order, then ``TERMCTL_<KEY>`` scalars. Raises ``ConfigError`` naming the key, variable or
     file. A missing main file is an error only when given with ``--config``."""
     main = config_path(environ, explicit)
-    data: dict[Any, Any] = copy.deepcopy(DEFAULTS)
-    if explicit is not None or main.exists():
-        data = merge(data, _read(main))
+    data = merge(copy.deepcopy(DEFAULTS), _read(main, optional=explicit is None))
     for path in _dropins(main):
         data = merge(data, _read(path))
 
     _check_pre_hooks(data)
-    _validate(data, _key_error)
-
-    for key in ENV_KEYS:
-        variable = f"TERMCTL_{key.upper()}"
-        if variable in environ:
-            data[key] = environ[variable]
-            _validate(
-                data,
-                lambda _key, message, var=variable: ConfigError(
-                    f"invalid {var}: {message}", variable=var
-                ),
-            )
-
-    cfg = _validate(data, _key_error)
+    try:
+        cfg = Config.model_validate(data)
+    except ValidationError as exc:
+        raise _key_error(*_first_error(exc)) from None
+    cfg = cfg.model_copy(update=_from_environment(environ))
     _check_rules(cfg)
     return cfg

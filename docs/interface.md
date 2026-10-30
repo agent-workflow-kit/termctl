@@ -405,7 +405,15 @@ Every payload has the top-level fields `tool` (`termctl`), `hook`, `object_type`
 
 ## Config
 
-`~/.config/termctl/config.yaml` (respecting `XDG_CONFIG_HOME`) plus `config.d/*.yaml` in lexical order, merged after it: maps are merged key by key at every depth, `hooks` lists are appended, and other lists (`server_env_allow`, `rules`) are replaced. Schema: `schemas/config.json`; every key with its default is in `config.example.yaml`. Invalid config exits 2 (`config_invalid`) naming the key; besides the schema, termctl checks at load that every rule names a defined placement, that `socket` is a socket name or an absolute path ([Server selection](#server-selection)), and that no pre-hook sets `async`. Unsupported placement fields are not a load error ([Placement](#placement)).
+`~/.config/termctl/config.yaml` (respecting `XDG_CONFIG_HOME`) plus `config.d/*.yaml` in code point order, merged after it: maps are merged key by key at every depth, `hooks` lists are appended, and other lists (`server_env_allow`, `rules`) are replaced. Schema: `schemas/config.json`; every key with its default is in `config.example.yaml`. Invalid config exits 2 (`config_invalid`) naming the key; besides the schema, termctl checks at load that every rule names a defined placement, that `socket` is a socket name or an absolute path ([Server selection](#server-selection)), and that no pre-hook sets `async`. Unsupported placement fields are not a load error ([Placement](#placement)).
+
+Config files are YAML with these restrictions; a violation exits 2 (`config_invalid`) naming the file, and the key where there is one:
+
+- Every mapping key is a string and appears once in its mapping. Quote keys YAML 1.1 reads as other types (`"no"`, `"on"`, `"yes"`, `"off"`, numbers).
+- Anchors, aliases and merge keys (`<<`) are not allowed; config files need none, and aliases allow exponential growth.
+- An integral float (`1.0`) is accepted where an integer is expected, as in the schema; other floats are not.
+
+The main file may be missing (no settings), unless it was given with `--config` or is a dangling symlink; any other failure to read it is an error. A missing `config.d/` means no drop-ins; one that cannot be listed (unreadable, not a directory) is an error. Drop-ins are the entries whose names end in `.yaml` and do not start with `.`, read in code point order of their names. When neither an absolute `XDG_CONFIG_HOME` nor `HOME` is set, the home directory comes from the user's passwd entry; without one, termctl exits 2 (`config_invalid`).
 
 | Key | Default | Meaning |
 |---|---|---|

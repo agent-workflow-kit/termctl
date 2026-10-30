@@ -2,6 +2,9 @@ from __future__ import annotations
 
 import io
 import json
+import os
+import time
+from collections.abc import Iterator
 from pathlib import Path
 from typing import Any
 
@@ -45,6 +48,22 @@ def dropins(home: Path) -> Path:
 
 def load_home(home: Path, **env: str) -> Config:
     return load({"HOME": str(home), **env})
+
+
+@pytest.fixture
+def no_access() -> Iterator[list[Path]]:
+    """Paths a test makes mode 0; their modes are restored so tmp cleanup works."""
+    if os.geteuid() == 0:
+        pytest.skip("root ignores file modes")
+    paths: list[Path] = []
+    yield paths
+    for path in paths:
+        path.chmod(0o700)
+
+
+def lock(no_access: list[Path], path: Path) -> None:
+    path.chmod(0)
+    no_access.append(path)
 
 
 def load_error(environ: dict[str, str], explicit: str | None = None) -> ConfigError:
@@ -137,6 +156,64 @@ def test_missing_config_flag_file_is_an_error(tmp_path: Path) -> None:
     assert "absent.yaml" in err.message
 
 
+def test_missing_config_flag_file_names_the_file_in_details(tmp_path: Path) -> None:
+    absent = tmp_path / "absent.yaml"
+    assert load_error({}, str(absent)).details == {"file": str(absent)}
+
+
+def test_dangling_symlink_as_the_default_file_is_an_error(home: Path, main_file: Path) -> None:
+    main_file.symlink_to(home / "nowhere.yaml")
+    err = load_error({"HOME": str(home)})
+    assert err.details == {"file": str(main_file)}
+
+
+def test_unreadable_config_directory_is_an_error(
+    home: Path, main_file: Path, no_access: list[Path]
+) -> None:
+    lock(no_access, main_file.parent)
+    err = load_error({"HOME": str(home)})
+    assert err.details == {"file": str(main_file)}
+
+
+def test_unreadable_drop_in_directory_is_an_error(
+    home: Path, dropins: Path, no_access: list[Path]
+) -> None:
+    dropins.mkdir()
+    lock(no_access, dropins)
+    err = load_error({"HOME": str(home)})
+    assert err.details == {"file": str(dropins)}
+    assert str(dropins) in err.message
+
+
+def test_drop_in_directory_that_is_a_file_is_an_error(home: Path, dropins: Path) -> None:
+    write(dropins, "tmux_bin: x\n")
+    err = load_error({"HOME": str(home)})
+    assert err.details == {"file": str(dropins)}
+
+
+def test_home_falls_back_to_the_passwd_entry(
+    monkeypatch: pytest.MonkeyPatch, home: Path, main_file: Path
+) -> None:
+    write(main_file, {"tmux_bin": "from-passwd"})
+
+    class Entry:
+        pw_dir = str(home)
+
+    monkeypatch.setattr(config.pwd, "getpwuid", lambda uid: Entry())
+    assert load({}).tmux_bin == "from-passwd"
+
+
+def test_no_home_and_no_passwd_entry_is_an_error(monkeypatch: pytest.MonkeyPatch) -> None:
+    def missing(uid: int) -> Any:
+        raise KeyError(uid)
+
+    monkeypatch.setattr(config.pwd, "getpwuid", missing)
+    err = load_error({})
+    assert err.message == (
+        "cannot determine the home directory; set HOME or XDG_CONFIG_HOME, or use --config"
+    )
+
+
 def test_empty_file_means_no_settings(home: Path, main_file: Path) -> None:
     write(main_file, "# only a comment\n")
     assert load_home(home) == config.defaults()
@@ -156,15 +233,90 @@ def test_unparsable_drop_in_names_the_drop_in(home: Path, dropins: Path) -> None
     assert err.details == {"file": str(bad)}
 
 
+# --- YAML hazards -------------------------------------------------------------------------------
+
+
+@pytest.mark.parametrize(
+    ("text", "key"),
+    [
+        ("tmux_bin: a\ntmux_bin: b\n", "tmux_bin"),
+        ("placements:\n  a: {session: x, session: y}\n", "placements.a.session"),
+    ],
+)
+def test_duplicate_keys_are_invalid(home: Path, main_file: Path, text: str, key: str) -> None:
+    write(main_file, text)
+    err = load_error({"HOME": str(home)})
+    assert err.details == {"file": str(main_file), "key": key}
+    assert str(main_file) in err.message and key in err.message
+
+
+def test_duplicate_keys_in_a_drop_in_name_the_drop_in(home: Path, dropins: Path) -> None:
+    bad = write(dropins / "a.yaml", "hooks:\n  pre-open: []\n  pre-open: []\n")
+    err = load_error({"HOME": str(home)})
+    assert err.details == {"file": str(bad), "key": "hooks.pre-open"}
+
+
+@pytest.mark.parametrize(
+    "text",
+    [
+        "markers:\n  a: &m {text: x}\n  b: *m\n",
+        "placements:\n  a: &p {session: x}\n",
+        "placements:\n  a: {<<: {session: x}}\n",
+    ],
+)
+def test_anchors_aliases_and_merge_keys_are_invalid(home: Path, main_file: Path, text: str) -> None:
+    write(main_file, text)
+    err = load_error({"HOME": str(home)})
+    assert err.details == {"file": str(main_file)}
+    assert str(main_file) in err.message
+
+
+def test_alias_bomb_fails_fast(home: Path, main_file: Path) -> None:
+    lines = ["a0: &a0 {x: 1, y: 1}"]
+    lines += [f"a{i}: &a{i} {{x: *a{i - 1}, y: *a{i - 1}}}" for i in range(1, 40)]
+    lines += ["placements: {p: {layout: *a39}}"]
+    write(main_file, "\n".join(lines) + "\n")
+    start = time.monotonic()
+    err = load_error({"HOME": str(home)})
+    assert time.monotonic() - start < 0.5
+    assert err.details == {"file": str(main_file)}
+
+
+@pytest.mark.parametrize(
+    ("text", "key", "shown"),
+    [
+        ("placements: {no: {}}\n", "placements.no", "no"),
+        ("markers: {1: {text: x}}\n", "markers.1", "1"),
+        ("on: 1\n", "on", "on"),
+    ],
+)
+def test_non_string_keys_are_invalid(
+    home: Path, main_file: Path, text: str, key: str, shown: str
+) -> None:
+    write(main_file, text)
+    err = load_error({"HOME": str(home)})
+    assert err.details == {"file": str(main_file), "key": key}
+    assert shown in err.message and "quote" in err.message
+
+
+def test_deep_nesting_is_invalid(home: Path, main_file: Path) -> None:
+    write(main_file, "a: " + "[" * 100_000 + "]" * 100_000 + "\n")
+    err = load_error({"HOME": str(home)})
+    assert err.details == {"file": str(main_file)}
+
+
 # --- drop-ins and merging -----------------------------------------------------------------------
 
 
-def test_drop_ins_apply_in_lexical_order(home: Path, main_file: Path, dropins: Path) -> None:
+def test_drop_ins_apply_in_code_point_order(home: Path, main_file: Path, dropins: Path) -> None:
     write(main_file, {"tmux_bin": "main"})
     write(dropins / "2.yaml", {"tmux_bin": "two"})
     write(dropins / "10.yaml", {"tmux_bin": "ten", "keep_on_exit": "always"})
+    write(dropins / "b.yaml", {"marker_display": "name"})
+    write(dropins / "B.yaml", {"marker_display": "option", "close_grace": "5s"})
     cfg = load_home(home)
     assert (cfg.tmux_bin, cfg.keep_on_exit) == ("two", "always")
+    assert (cfg.marker_display, cfg.close_grace) == ("name", "5s")
 
 
 def test_only_visible_yaml_drop_ins_are_read(home: Path, dropins: Path) -> None:
@@ -449,6 +601,8 @@ VALID: list[dict[str, Any]] = [
     {"placements": {"a": {"session": "S_1-x"}}},
     {"rules": [{"match": {"kind.sub-x": "A-z0.9:/#@+=,-", "e": ""}, "placement": "default"}]},
     {"hooks": {"pre-open": [{"cmd": "x", "timeout": 1}]}},
+    {"hooks": {"post-open": [{"cmd": "x", "timeout": 1.0}]}},
+    {"placements": {"a": {"max_panes": 2.0}}},
 ]
 
 INVALID: list[tuple[dict[str, Any], str]] = [
@@ -482,6 +636,7 @@ INVALID: list[tuple[dict[str, Any], str]] = [
     ({"placements": {"a": {"target": None}}}, "placements.a.target"),
     ({"placements": {"a": {"max_panes": 0}}}, "placements.a.max_panes"),
     ({"placements": {"a": {"max_panes": True}}}, "placements.a.max_panes"),
+    ({"placements": {"a": {"max_panes": 2.5}}}, "placements.a.max_panes"),
     ({"placements": {"a": {"layout": 3}}}, "placements.a.layout"),
     ({"placements": {"a": {"extra": 1}}}, "placements.a.extra"),
     ({"placements": None}, "placements"),
@@ -494,6 +649,7 @@ INVALID: list[tuple[dict[str, Any], str]] = [
     ({"hooks": {"pre-open": [{}]}}, "hooks.pre-open[0].cmd"),
     ({"hooks": {"pre-open": [{"cmd": ""}]}}, "hooks.pre-open[0].cmd"),
     ({"hooks": {"post-open": [{"cmd": "x", "timeout": 0}]}}, "hooks.post-open[0].timeout"),
+    ({"hooks": {"pre-open": [{"cmd": "x", "timeout": 1.5}]}}, "hooks.pre-open[0].timeout"),
     ({"hooks": {"post-open": [{"cmd": "x", "async": "true"}]}}, "hooks.post-open[0].async"),
     ({"hooks": {"post-close": [{"cmd": "x", "env": {}}]}}, "hooks.post-close[0].env"),
 ]
@@ -504,6 +660,19 @@ def test_valid_configs_agree_with_schema(home: Path, main_file: Path, data: dict
     validate(data, "termctl/config.json")
     write(main_file, data)
     load_home(home)
+
+
+def test_integral_floats_load_as_integers(home: Path, main_file: Path) -> None:
+    write(
+        main_file,
+        {
+            "hooks": {"pre-open": [{"cmd": "x", "timeout": 5.0}]},
+            "placements": {"a": {"max_panes": 2.0}},
+        },
+    )
+    cfg = load_home(home)
+    assert cfg.hooks.pre_open[0].timeout == 5 and type(cfg.hooks.pre_open[0].timeout) is int
+    assert cfg.placements["a"].max_panes == 2 and type(cfg.placements["a"].max_panes) is int
 
 
 @pytest.mark.parametrize(("data", "key"), INVALID)
@@ -521,11 +690,13 @@ def test_invalid_configs_agree_with_schema(
 # --- the CLI ------------------------------------------------------------------------------------
 
 
-def run(argv: list[str], environ: dict[str, str]) -> tuple[int, str, str]:
+def run(
+    argv: list[str], environ: dict[str, str], gateway: FakeGateway | None = None
+) -> tuple[int, str, str]:
     stdout, stderr = io.StringIO(), io.StringIO()
     code = main(
         argv,
-        gateway=FakeGateway(),
+        gateway=gateway or FakeGateway(),
         clock=FakeClock(),
         environ=environ,
         stdout=stdout,
@@ -557,8 +728,10 @@ def test_context_defaults_to_the_built_in_config() -> None:
 @pytest.mark.parametrize("command", [["placements"], ["show", "tc-abcdefgh"], ["open"]])
 def test_cli_invalid_config_exits_2_before_tmux(tmp_path: Path, command: list[str]) -> None:
     explicit = write(tmp_path / "c.yaml", {"rules": [{"match": {}, "placement": "nope"}]})
-    code, stdout, stderr = run(["--json", "--config", str(explicit), *command], {})
+    gateway = FakeGateway()
+    code, stdout, stderr = run(["--json", "--config", str(explicit), *command], {}, gateway)
     assert code == 2
+    assert gateway.calls == []
     envelope = json.loads(stdout)
     validate(envelope, "termctl/cli/error.json")
     assert envelope["error"]["code"] == "config_invalid"
