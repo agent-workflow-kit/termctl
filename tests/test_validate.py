@@ -2,16 +2,19 @@
 
 from __future__ import annotations
 
-from collections.abc import Callable
+import json
+from collections.abc import Callable, Iterator
 from typing import Any
 
 import pytest
 from jsonschema import ValidationError
+from referencing import Registry, Resource
 
 from termctl import validate
 from termctl.errors import TermctlError, UsageError
 
 from .fakes import FakeGateway
+from .schemas import SCHEMA_DIR, EcmaValidator
 from .schemas import validate as validate_instance
 
 # Control characters: C0 (tab and newline included), DEL and C1.
@@ -629,6 +632,90 @@ def test_socket_path_bad_agrees_with_schema(value: str) -> None:
     if len(value.encode("utf-8", "surrogatepass")) > 100 and len(value) <= 100:
         return
     assert not schema_matches("socket_path", value)
+
+
+# --- config.json ----------------------------------------------------------------------------------
+
+# config.json must stay usable on its own (interface.md points users to it alone), so it
+# carries inline copies of the shared definitions; they must not drift from defs.json.
+CONFIG_SHARED_DEFS = {
+    "duration",
+    "keep_on_exit",
+    "marker_name",
+    "marker_text",
+    "placement",
+    "placement_name",
+    "post_hook_entry",
+    "pre_hook_entry",
+    "rule",
+    "session_name",
+    "socket",
+    "target",
+}
+CONFIG_PATH = SCHEMA_DIR / "config.json"
+
+
+def config_matches(definition: str, value: object) -> bool:
+    """A check of ``value`` against config.json's ``definition``, with no other schema loaded."""
+    contents = json.loads(CONFIG_PATH.read_text(encoding="utf-8"))
+    registry: Registry[Any] = Registry().with_resource(
+        contents["$id"], Resource.from_contents(contents)
+    )
+    validator = EcmaValidator({"$ref": f"{contents['$id']}#/$defs/{definition}"}, registry=registry)
+    try:
+        validator.validate(value)
+    except ValidationError:
+        return False
+    return True
+
+
+def test_config_schema_has_every_shared_definition() -> None:
+    config_defs = json.loads(CONFIG_PATH.read_text(encoding="utf-8"))["$defs"]
+    assert CONFIG_SHARED_DEFS <= set(config_defs)
+
+
+def test_config_schema_shared_definitions_equal_defs() -> None:
+    config_defs = json.loads(CONFIG_PATH.read_text(encoding="utf-8"))["$defs"]
+    defs = json.loads((SCHEMA_DIR / "defs.json").read_text(encoding="utf-8"))["$defs"]
+    shared = set(config_defs) & set(defs)
+    assert shared >= CONFIG_SHARED_DEFS
+    for name in sorted(shared):
+        assert config_defs[name] == defs[name], name
+
+
+def iter_refs(node: object) -> Iterator[object]:
+    """Every ``$ref`` value found anywhere inside ``node``."""
+    if isinstance(node, dict):
+        for key, value in node.items():
+            if key == "$ref":
+                yield value
+            else:
+                yield from iter_refs(value)
+    elif isinstance(node, list):
+        for item in node:
+            yield from iter_refs(item)
+
+
+def test_config_schema_is_standalone() -> None:
+    text = CONFIG_PATH.read_text(encoding="utf-8")
+    assert "defs.json" not in text
+    contents = json.loads(text)
+    local_prefix = "#/$defs/"
+    for ref in iter_refs(contents):
+        assert isinstance(ref, str) and ref.startswith(local_prefix), ref
+        assert ref[len(local_prefix) :] in contents["$defs"], ref
+
+
+@pytest.mark.parametrize(
+    "value", ["/.", "/..", "/a/.", "/a/..", "/a,b", "/a ;", "/a /", "/a\udcff"]
+)
+def test_config_socket_rejects_review_findings(value: str) -> None:
+    assert not config_matches("socket", value)
+
+
+@pytest.mark.parametrize("value", ["a #[", "a #", "\ud800", "a\udc00", "\udc80x"])
+def test_config_marker_text_rejects_review_findings(value: str) -> None:
+    assert not config_matches("marker_text", value)
 
 
 # --- cwd ----------------------------------------------------------------------------------------

@@ -350,7 +350,7 @@ def check_args(args: argparse.Namespace, ctx: Context) -> None:
     """
     # TODO: remaining step-1 usage checks, owned by later issues: an argv[0] containing '='
     # and --env PATH=... without argv (#15); the --override-escalation gate (TTY or a human:
-    # actor) and --hook name validity (#6, #17).
+    # actor) and --hook name validity (#6, #17); the `close --force` gate (#23).
     if args.socket is not None:
         validate.check_socket_flag(args.socket)
     command = args.command

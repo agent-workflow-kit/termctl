@@ -579,15 +579,6 @@ def test_termctl_socket_uses_the_config_socket_grammar(home: Path, socket: str) 
     assert err.message.startswith("invalid TERMCTL_SOCKET: ")
 
 
-def test_config_schema_shares_the_grammars_in_defs() -> None:
-    """config.json refers to defs.json for every definition the two would otherwise both hold,
-    so the config grammars cannot drift from the command-line ones."""
-    schema = json.loads((ROOT / "schemas" / "config.json").read_text(encoding="utf-8"))
-    defs = json.loads((ROOT / "schemas" / "defs.json").read_text(encoding="utf-8"))["$defs"]
-    assert set(schema.get("$defs", {})) & set(defs) == set()
-    assert schema["properties"]["socket"]["$ref"] == "defs.json#/$defs/socket"
-
-
 def test_unsupported_placement_fields_load(home: Path, main_file: Path) -> None:
     write(
         main_file,
