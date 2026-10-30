@@ -222,7 +222,7 @@ Every command checks in this order and stops at the first failure:
 
 **Dry runs.** `open`, `close`, `focus`, `rename`, `mark`, `unmark`, `label add` and `label remove` accept `--dry-run`: the command makes its checks (read-only tmux queries included) and exits as a real run would, but runs no hooks, changes nothing, writes no log or audit record, and prints what would change. For `rename`, `mark`, `unmark` and the label commands that is the pane object as it would be afterwards, with `dry_run: true` and `display_name` as in [Names](#names).
 
-**Human output.** Each command's human-mode output is stated below; messages and warnings go to stderr. All human output, on stdout and stderr alike, is printed with each C0, DEL and C1 control character escaped as `\xNN` (its code point in two lowercase hex digits; line breaks between lines of output are kept), so no string from tmux (for example a window, session or client name), a hook (including `hook_stderr`), a pane option or the caller's own arguments echoed in a message (for example an unrecognized argument) can drive the user's terminal. This applies to every message, warning, usage line and help text, in `--json` mode too for what goes to stderr. `--json` output is not escaped this way; JSON string encoding already escapes C0 and DEL, and a consumer that displays a string escapes it itself.
+**Human output.** Each command's human-mode output is stated below; messages and warnings go to stderr. All human output, on stdout and stderr alike, is printed with each C0, DEL and C1 control character escaped as `\xNN` (its code point in two lowercase hex digits; line breaks between lines of output are kept), so no string from tmux (for example a window, session or client name), a hook (including `hook_stderr`), a pane option or the caller's own arguments echoed in a message (for example an unrecognized argument) can drive the user's terminal. This applies to every message, warning, usage line and help text, in `--json` mode too for what goes to stderr. `--json` output is not escaped this way; JSON string encoding already escapes C0 and DEL, and a consumer that displays a string escapes it itself. An argument that is not valid UTF-8 reaches termctl with each undecodable byte held as a lone surrogate (U+DC80 to U+DCFF, Python's surrogateescape); wherever termctl prints such a string, human output and `--json` alike, each of those is printed as the text `\xNN` (the byte in two lowercase hex digits) and any other lone surrogate as the text `\uXXXX` (four lowercase hex digits), so `--json` output never holds a lone surrogate and is valid for a strict JSON parser. Characters the output encoding cannot represent are written as backslash escapes (Python's `backslashreplace`).
 
 ### `open`
 
@@ -318,9 +318,9 @@ Exit 0, 1, 2, 10, 11, 12, 13, 20, 21.
 
 ## Global flags
 
-Global flags may come before or after the subcommand, never after `--`. A `--` may also precede positional arguments, for example `rename <id> -- -name`; a `--` before the subcommand (`termctl -- list`) exits 2, in human mode.
+Global flags may come before or after the subcommand, never after `--`. A `--` may also precede positional arguments, for example `rename <id> -- -name`; a `--` before the subcommand (`termctl -- list`) exits 2, and a `--json` after that `--` is not a flag.
 
-An option that takes a value always consumes the next token as its value, even one that begins with `-` (getopt semantics): `open --name -x -- ls` names the pane `-x`, and in `open --name --json -- ls` the name is `--json` and JSON output is not selected. `--opt=value` is equivalent. Only tokens before the first `--` that are not such values count as flags, for `--json` and `--version` as for the rest.
+An option that takes a value always consumes the next token as its value, even one that begins with `-` (getopt semantics): `open --name -x -- ls` names the pane `-x`, and in `open --name --json -- ls` the name is `--json` and JSON output is not selected. `--opt=value` is equivalent. Only tokens before the first `--` that are not such values count as flags, for `--json` and `--version` as for the rest. A flag that takes no value rejects `=VALUE` (`--json=x`, `--version=x`, `-h=1`) as a usage error, exit 2.
 
 | Flag | Meaning |
 |---|---|
@@ -329,8 +329,8 @@ An option that takes a value always consumes the next token as its value, even o
 | `--config PATH` | config file instead of `~/.config/termctl/config.yaml` (drop-ins are read from the `config.d/` next to it) |
 | `--verbose` | also writes each tmux command termctl runs to stderr, with `--env` values replaced by their names |
 | `--quiet` | suppresses all stderr output except errors; with `--verbose`, exit 2 |
-| `--version` | prints `termctl <version>` and exits 0. `--version` anywhere before `--` does so before any other check: other flags, `--help` and usage errors are ignored |
-| `-h`, `--help` | prints the help of the command it is given to (termctl's own before a subcommand) on stdout and exits 0; human-readable only, `--json` is ignored |
+| `--version` | prints `termctl <version>` and exits 0. `--version` (without `=VALUE`) anywhere before `--` does so before any other check: other flags, `--help` and usage errors are ignored |
+| `-h`, `--help` | prints the help of the command it is given to (termctl's own before a subcommand) on stdout and exits 0; human-readable only, `--json` is ignored. `-h` or `--help` (without `=VALUE`) anywhere before `--` does so before any check but `--version`, which wins over it: usage errors are ignored, and `label --bogus -h` prints the help of `label`. Short options do not combine: `-hx` is an unrecognized argument |
 
 ## Exit codes
 

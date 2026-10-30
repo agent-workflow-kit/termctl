@@ -19,10 +19,26 @@ from .errors import TermctlError, UsageError
 PROG = "termctl"
 
 _CONTROL = re.compile("[\x00-\x1f\x7f-\x9f]")
+_SURROGATE = re.compile("[\ud800-\udfff]")
+
+
+def _surrogate_text(match: re.Match[str]) -> str:
+    """An undecodable argument byte (``\\udc80``-``\\udcff``, from surrogateescape) as
+    ``\\xNN``; any other lone surrogate as ``\\uXXXX``."""
+    point = ord(match.group())
+    if 0xDC80 <= point <= 0xDCFF:
+        return f"\\x{point - 0xDC00:02x}"
+    return f"\\u{point:04x}"
+
+
+def _map_surrogates(text: str) -> str:
+    return _SURROGATE.sub(_surrogate_text, text)
 
 
 def escape(text: str) -> str:
-    """Escape each C0, DEL and C1 control character as ``\\xNN`` (interface.md "Human output")."""
+    """Escape each C0, DEL and C1 control character as ``\\xNN`` and map lone surrogates
+    (interface.md "Human output")."""
+    text = _map_surrogates(text)
     return _CONTROL.sub(lambda match: f"\\x{ord(match.group()):02x}", text)
 
 
@@ -31,17 +47,37 @@ def _escape_lines(text: str) -> str:
     return "\n".join(escape(line) for line in text.split("\n"))
 
 
+def _without_surrogates(value: Any) -> Any:
+    """``value`` with every string's lone surrogates mapped as ``escape`` maps them."""
+    if isinstance(value, str):
+        return _map_surrogates(value)
+    if isinstance(value, dict):
+        return {_without_surrogates(k): _without_surrogates(v) for k, v in value.items()}
+    if isinstance(value, list | tuple):
+        return [_without_surrogates(item) for item in value]
+    return value
+
+
 def _to_json(data: dict[str, Any]) -> str:
     # interface.md "Human output": JSON string encoding escapes the control characters, so
     # --json output is never escaped as human output is. ensure_ascii also escapes C1 and
     # every other non-ASCII character; it is the default, but stated so it is not lost.
-    return json.dumps(data, ensure_ascii=True) + "\n"
+    # Lone surrogates are mapped first, so a strict parser accepts the output.
+    return json.dumps(_without_surrogates(data), ensure_ascii=True) + "\n"
 
 
 def _write(stream: TextIO, text: str) -> None:
+    # ValueError covers an encoding error (UnicodeEncodeError) and a closed stream.
     try:
         stream.write(text)
-    except OSError:
+    except (OSError, ValueError):
+        pass
+
+
+def _flush(stream: TextIO) -> None:
+    try:
+        stream.flush()
+    except (OSError, ValueError):
         pass
 
 
@@ -82,6 +118,8 @@ class Output:
         """Errors always reach stderr (even with ``--quiet``); with ``--json`` stdout first."""
         if self.json:
             _write(self.stdout, _to_json(err.envelope()))
+            # Flushed now so that it precedes the message when both go to one pipe or file.
+            _flush(self.stdout)
         self._stderr(err.message)
         if isinstance(err, UsageError) and err.usage and not self.json:
             _write(self.stderr, _escape_lines(err.usage))
