@@ -74,8 +74,18 @@ def test_system_gateway_stdin_isatty_asks_about_fd_0(monkeypatch: pytest.MonkeyP
     assert asked == [0]
 
 
-def test_system_gateway_user_name_is_the_real_uid_user() -> None:
-    assert SystemGateway().user_name() == pwd.getpwuid(os.getuid()).pw_name
+def test_system_gateway_user_name_is_the_real_uid_user(monkeypatch: pytest.MonkeyPatch) -> None:
+    looked_up: list[int] = []
+    real = pwd.getpwuid(os.getuid())
+
+    def getpwuid(uid: int) -> pwd.struct_passwd:
+        looked_up.append(uid)
+        return pwd.struct_passwd(("alice", *real[1:]))
+
+    monkeypatch.setattr(os, "getuid", lambda: 4242)
+    monkeypatch.setattr(pwd, "getpwuid", getpwuid)
+    assert SystemGateway().user_name() == "alice"
+    assert looked_up == [4242]
 
 
 def test_system_gateway_user_name_none_without_passwd_entry(

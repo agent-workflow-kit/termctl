@@ -19,10 +19,18 @@ GOLDEN = Path(__file__).parent / "golden"
 ID = "tc-abcdefgh"
 
 
-def run(argv: list[str]) -> tuple[int, str, str]:
+DIRS = {"/", "/a b/#(x)", "/srv", "/home/u/src"}
+
+
+def run(argv: list[str], gateway: FakeGateway | None = None) -> tuple[int, str, str]:
     stdout, stderr = io.StringIO(), io.StringIO()
     code = main(
-        argv, gateway=FakeGateway(), clock=FakeClock(), environ={}, stdout=stdout, stderr=stderr
+        argv,
+        gateway=gateway or FakeGateway(dirs=DIRS),
+        clock=FakeClock(),
+        environ={},
+        stdout=stdout,
+        stderr=stderr,
     )
     return code, stdout.getvalue(), stderr.getvalue()
 
@@ -53,6 +61,10 @@ BAD: list[list[str]] = [
     ["--socket", ".", "list"],
     ["--socket", "..", "list"],
     ["--socket", "/", "list"],
+    ["--socket", "/a/..", "list"],
+    ["--socket", "rel/.", "list"],
+    ["--socket", "/a,b/s", "list"],
+    ["--socket", "/" + "x" * 100, "list"],
     ["list", "--socket", "/tmp/x/"],
     ["list", "--socket", "/tmp/x;"],
     ["list", "--socket", "/tmp/a\nb"],
@@ -76,6 +88,8 @@ BAD: list[list[str]] = [
     ["open", "--cwd", "/a\tb"],
     ["open", "--cwd", "/a#[b"],
     ["open", "--cwd", ""],
+    ["open", "--cwd", "/missing"],
+    ["open", "--cwd", "missing"],
     ["open", "--env", "A"],
     ["open", "--env", "1A=x"],
     ["open", "--env", "A=1", "--env", "A=2"],
@@ -140,6 +154,8 @@ GOOD: list[list[str]] = [
     ["mark", ID, "attention"],
     ["focus", ID, "--client", "/dev/pts/3"],
     ["label", "add", ID, "k=a=b", "x="],
+    # The 32-label limit of label add is checked after id resolution, not in step 1.
+    ["label", "add", ID, *[f"k{i}=v" for i in range(33)]],
     ["placements", "--label", "team=a#b"],
 ]
 
@@ -169,3 +185,31 @@ def test_env_value_never_appears_in_the_error() -> None:
     code, stdout, stderr = run(["--json", "open", "--env", "TOKEN=s3cret", "--env", "TOKEN=x"])
     assert code == 2
     assert "s3cret" not in stdout + stderr
+
+
+def test_open_checks_the_cwd_in_step_1(later_steps: list[str]) -> None:
+    gateway = FakeGateway(cwd="/home/u", dirs={"/home/u"})
+    code, stdout, _ = run(["--json", "open", "--cwd", "src"], gateway)
+    assert code == 2
+    assert json.loads(stdout)["error"]["code"] == "usage"
+    assert gateway.dir_checks == ["/home/u/src"]
+    assert later_steps == []
+
+
+def test_open_resolves_a_relative_cwd(later_steps: list[str]) -> None:
+    gateway = FakeGateway(cwd="/home/u", dirs=DIRS)
+    assert run(["open", "--cwd", "src"], gateway)[0] == 0
+    assert gateway.dir_checks == ["/home/u/src"]
+
+
+def test_open_absolute_cwd_works_without_a_readable_current_dir(later_steps: list[str]) -> None:
+    gateway = FakeGateway(cwd=None, dirs=DIRS)
+    assert run(["open", "--cwd", "/srv"], gateway) == (0, "", "")
+    assert "run_command" in later_steps
+
+
+def test_open_without_cwd_needs_a_readable_current_dir(later_steps: list[str]) -> None:
+    code, _, stderr = run(["open"], FakeGateway(cwd=None, dirs=DIRS))
+    assert code == 2
+    assert "current directory" in stderr
+    assert later_steps == []

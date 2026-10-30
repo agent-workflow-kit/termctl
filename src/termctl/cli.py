@@ -14,7 +14,7 @@ from collections.abc import Mapping, Sequence
 from dataclasses import dataclass, field
 from typing import Any, NoReturn, TextIO
 
-from . import __version__, validate
+from . import __version__, ids, validate
 from .argv import Scan, scan
 from .errors import TermctlError, UsageError
 from .gateway import Clock, Gateway, SystemClock, SystemGateway
@@ -319,6 +319,55 @@ COMMANDS: dict[str, CommandSpec] = {
 }
 
 
+def check_args(args: argparse.Namespace, ctx: Context) -> None:
+    """Step 1: the grammars and limits of the arguments, and ``open``'s cwd (exit 2).
+
+    Replaces ``open``'s ``args.cwd`` with the resolved working directory. Checks that need
+    config (a marker or placement being defined) or the pane list (the label limit of
+    ``label add``) belong to later steps.
+    """
+    if args.socket is not None:
+        validate.check_socket_flag(args.socket)
+    command = args.command
+    if hasattr(args, "id"):
+        if command == "close" and args.force:
+            ids.require_full(args.id)
+        else:
+            ids.parse(args.id)
+    if getattr(args, "actor", None) is not None:
+        validate.check_actor(args.actor)
+    if hasattr(args, "decision_ids"):
+        validate.check_decision_ids(args.decision_ids)
+    if hasattr(args, "labels"):
+        labels = validate.parse_labels(args.labels)
+        if command == "open":
+            validate.check_label_count(labels)
+
+    if command == "open":
+        if args.name is not None:
+            validate.check_name(args.name)
+        if args.cwd is not None:
+            validate.check_cwd_flag(args.cwd)
+        validate.parse_env(args.env)
+        if args.placement is not None:
+            validate.check_placement_name(args.placement)
+        if args.session is not None:
+            validate.check_session_name(args.session)
+        args.cwd = validate.resolve_cwd(args.cwd, ctx.gateway)
+    elif command == "list" and args.session is not None:
+        validate.check_session_filter(args.session)
+    elif command == "rename":
+        validate.check_name(args.name)
+    elif command == "mark":
+        validate.check_marker_name(args.marker)
+    elif command == "focus" and args.client is not None:
+        validate.check_client(args.client)
+    elif command == "close" and args.grace is not None:
+        validate.parse_duration(args.grace)
+    elif command in ("label add", "label remove"):
+        validate.parse_labels(args.pairs)
+
+
 def load_config(args: argparse.Namespace, ctx: Context) -> None:
     """Step 1 (rest): the config file, drop-ins and ``TERMCTL_*`` variables (exit 2)."""
     # TODO: config loading - issue #3 (config.py)
@@ -348,7 +397,7 @@ def run_command(args: argparse.Namespace, ctx: Context) -> Result:
 def dispatch(args: argparse.Namespace, ctx: Context) -> Result:
     """Run the check order after the flag-level usage checks; stop at the first failure."""
     spec = COMMANDS[args.command]
-    validate.check_args(args)
+    check_args(args, ctx)
     load_config(args, ctx)
     if spec.uses_tmux:
         resolve_server(args, ctx)

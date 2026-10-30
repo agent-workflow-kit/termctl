@@ -134,8 +134,9 @@ def test_full_id_property() -> None:
 
 def test_require_full_accepts_only_full_ids() -> None:
     assert ids.require_full("TC-ABCDEFGH") == "tc-abcdefgh"
-    with pytest.raises(UsageError):
+    with pytest.raises(UsageError) as info:
         ids.require_full("tc-abcd")
+    assert info.value.message == "close --force needs a full id; 'tc-abcd' is a prefix"
     with pytest.raises(UsageError):
         ids.require_full("bad!")
 
@@ -170,6 +171,40 @@ def test_resolve_no_match_exits_10() -> None:
     assert info.value.exit_code == 10
     with pytest.raises(TermctlError):
         ids.resolve(ids.parse("qqqq"), [])
+
+
+def test_resolve_full_id_matches_by_equality_not_prefix() -> None:
+    # A forged @termctl_id longer than a full id must not match that full id.
+    forged = [Pane("tc-abcdefghij", "%4", "x"), Pane("tc-abcdefgh", "%1", "termctl")]
+    assert ids.resolve(ids.parse("tc-abcdefgh"), forged) is forged[1]
+    with pytest.raises(TermctlError) as info:
+        ids.resolve(ids.parse("abcdefgh"), forged[:1])
+    assert info.value.code == "not_found"
+
+
+def test_resolve_ambiguous_candidates_are_sorted_by_id_then_pane_id() -> None:
+    panes = [
+        Pane("tc-abcdzzzz", "%9", "b"),
+        Pane("tc-abcdaaaa", "%5", "c"),
+        Pane("tc-abcdaaaa", "%3", "a"),
+    ]
+    with pytest.raises(TermctlError) as info:
+        ids.resolve(ids.parse("abcd"), panes)
+    assert [(c["id"], c["pane_id"]) for c in info.value.candidates or []] == [
+        ("tc-abcdaaaa", "%3"),
+        ("tc-abcdaaaa", "%5"),
+        ("tc-abcdzzzz", "%9"),
+    ]
+
+
+def test_resolve_ambiguous_message_lists_ids_but_never_sessions() -> None:
+    panes = [Pane("tc-abcdzzzz", "%2", "\x1b]0;evil"), Pane("tc-abcdaaaa", "%1", "s")]
+    with pytest.raises(TermctlError) as info:
+        ids.resolve(ids.parse("abcd"), panes)
+    message = info.value.message
+    assert "tc-abcdaaaa" in message and "tc-abcdzzzz" in message
+    assert message.index("tc-abcdaaaa") < message.index("tc-abcdzzzz")
+    assert "evil" not in message
 
 
 def test_resolve_ambiguous_prefix_exits_21_with_candidates() -> None:

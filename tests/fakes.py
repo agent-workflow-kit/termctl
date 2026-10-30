@@ -25,7 +25,10 @@ class FakeGateway:
         self.responses = dict(responses or {})
         self.calls: list[list[str]] = []
         self.cwd = cwd
-        self.dirs = set(dirs or ())
+        # By default only the caller's current directory exists.
+        if dirs is None:
+            dirs = {cwd} if cwd is not None else set()
+        self.dirs = set(dirs)
         self.tty = tty
         self.user = user
         self.dir_checks: list[str] = []

@@ -1,20 +1,20 @@
 """Input grammars (interface.md "Names", "Labels", "Markers", "Placement", "Server selection",
 "Hooks", "Audit and log", `open`, `focus` and `close`).
 
-Every grammar has a predicate (``is_*``, or ``*_problem`` returning a message) for callers that
-report their own error code, such as config loading (``config_invalid``) or the pane reader, and
-a ``check_*``/``parse_*`` function that raises ``UsageError`` (exit 2) for command-line input.
-termctl rejects invalid input and never cleans it.
+Grammars that config loading (``config_invalid``) or the pane reader also need have a predicate
+(``is_*``, or ``*_problem`` returning a message); command-line input goes through a
+``check_*``/``parse_*`` function that raises ``UsageError`` (exit 2). termctl rejects invalid
+input and never cleans it.
 """
 
 from __future__ import annotations
 
-import argparse
 import os
 import re
 
 from .errors import UsageError
 from .gateway import Gateway
+from .output import escape
 
 # C0 (tab and newline included), DEL and C1.
 _CONTROL = re.compile(r"[\x00-\x1f\x7f-\x9f]")
@@ -36,6 +36,7 @@ _SOCKET_NAME = re.compile(r"[A-Za-z0-9._-]{1,64}")
 
 NAME_MAX = 64
 MARKER_TEXT_MAX = 16
+SOCKET_PATH_MAX_BYTES = 100
 MAX_LABELS = 32
 MAX_ENV = 32
 MAX_DECISION_IDS = 32
@@ -46,8 +47,8 @@ _UNIT_MS = {"ms": 1, "s": 1000, "m": 60_000, None: 1000}
 def show(value: str, limit: int = 64) -> str:
     """``value`` quoted for a message: control characters escaped, overlong input cut."""
     if len(value) > limit:
-        return repr(value[:limit]) + f"... ({len(value)} characters)"
-    return repr(value)
+        return f"'{escape(value[:limit])}'... ({len(value)} characters)"
+    return f"'{escape(value)}'"
 
 
 def _fullmatch(pattern: re.Pattern[str], value: str) -> bool:
@@ -61,7 +62,7 @@ def _text_problem(value: str, max_len: int) -> str | None:
     if _CONTROL.search(value):
         return "must not contain control characters"
     if _SURROGATE.search(value):
-        return "must be valid UTF-8 text"
+        return "must be valid Unicode text"
     if "#[" in value:
         return "must not contain '#['"
     return None
@@ -72,10 +73,6 @@ def _text_problem(value: str, max_len: int) -> str | None:
 
 def name_problem(value: str) -> str | None:
     return _text_problem(value, NAME_MAX)
-
-
-def is_name(value: str) -> bool:
-    return name_problem(value) is None
 
 
 def check_name(value: str) -> str:
@@ -102,17 +99,6 @@ def marker_text_problem(value: str) -> str | None:
     if problem is None and value.endswith("#"):
         problem = "must not end in '#'"
     return problem
-
-
-def is_marker_text(value: str) -> bool:
-    return marker_text_problem(value) is None
-
-
-def check_marker_text(value: str) -> str:
-    problem = marker_text_problem(value)
-    if problem:
-        raise UsageError(f"invalid marker text {show(value)}: {problem}")
-    return value
 
 
 # --- labels -------------------------------------------------------------------------------------
@@ -183,12 +169,8 @@ def check_placement_name(value: str) -> str:
     return value
 
 
-def is_client(value: str) -> bool:
-    return _fullmatch(_CLIENT, value)
-
-
 def check_client(value: str) -> str:
-    if not is_client(value):
+    if not _fullmatch(_CLIENT, value):
         raise UsageError(f"invalid client {show(value)}: must match /?[A-Za-z0-9_./-]{{1,100}}")
     return value
 
@@ -243,12 +225,8 @@ def parse_duration(value: str) -> int:
 # --- actor and decision ids ---------------------------------------------------------------------
 
 
-def is_actor(value: str) -> bool:
-    return _fullmatch(_ACTOR, value)
-
-
 def check_actor(value: str) -> str:
-    if not is_actor(value):
+    if not _fullmatch(_ACTOR, value):
         raise UsageError(
             f"invalid actor {show(value)}: must match (human|auto):[A-Za-z0-9._@-]{{1,64}}"
         )
@@ -259,7 +237,9 @@ def default_actor(*, stdin_is_tty: bool, user: str | None) -> tuple[str, str | N
     """The actor when ``--actor`` is not given, and a warning to print, if any."""
     if not stdin_is_tty:
         return "auto:unknown", None
-    if user is not None and _fullmatch(_ACTOR_USER, user):
+    if user is None:
+        return "human:unknown", "the OS user has no name; using actor human:unknown"
+    if _fullmatch(_ACTOR_USER, user):
         return f"human:{user}", None
     return "human:unknown", (
         "the OS user name does not fit the actor grammar; using actor human:unknown"
@@ -299,7 +279,8 @@ def is_socket_path(value: str) -> bool:
 def socket_problem(value: str, *, allow_relative: bool) -> str | None:
     """Why ``value`` is not a valid ``--socket`` (``allow_relative``) or config/env socket.
 
-    Only the grammar: resolution, canonicalization and the 100-byte limit come later.
+    Only the grammar: resolution and canonicalization come later, and the canonical path is
+    checked again then.
     """
     if not is_socket_path(value):
         if value in (".", "..") or not _fullmatch(_SOCKET_NAME, value):
@@ -310,11 +291,15 @@ def socket_problem(value: str, *, allow_relative: bool) -> str | None:
     if _CONTROL.search(value):
         return "a socket path must not contain control characters"
     if _SURROGATE.search(value):
-        return "a socket path must be valid UTF-8 text"
+        return "a socket path must be valid Unicode text"
+    if "," in value:
+        return "a socket path must not contain ','"
     if value.endswith(";"):
         return "a socket path must not end in ';'"
-    if value.endswith("/"):
-        return "a socket path must have a basename"
+    if value.rpartition("/")[2] in ("", ".", ".."):
+        return "a socket path must have a basename other than '.' and '..'"
+    if len(value.encode()) > SOCKET_PATH_MAX_BYTES:
+        return f"a socket path must be at most {SOCKET_PATH_MAX_BYTES} bytes"
     return None
 
 
@@ -332,84 +317,38 @@ def cwd_problem(path: str) -> str | None:
     if _CONTROL.search(path):
         return "must not contain control characters"
     if _SURROGATE.search(path):
-        return "must be valid UTF-8 text"
+        return "must be valid Unicode text"
     if "#[" in path:
         return "must not contain '#['"
     return None
 
 
+def check_cwd_flag(value: str) -> str:
+    """The text of ``--cwd`` as given; ``resolve_cwd`` checks the resolved path."""
+    if value == "":
+        raise UsageError("--cwd must not be empty")
+    if problem := cwd_problem(value):
+        raise UsageError(f"invalid --cwd {show(value)}: {problem}")
+    return value
+
+
 def resolve_cwd(value: str | None, gateway: Gateway) -> str:
     """``open``'s working directory: ``--cwd`` against the caller's directory, else that one.
 
-    The result is joined, not normalized, so tmux gets the path the caller gave.
+    ``value`` has passed ``check_cwd_flag``. The caller's directory is read only when ``value``
+    is absent or relative. The result is joined, not normalized, so tmux gets the path the
+    caller gave.
     """
-    if value == "":
-        raise UsageError("--cwd must not be empty")
-    if value is not None and (problem := cwd_problem(value)):
-        raise UsageError(f"invalid --cwd {show(value)}: {problem}")
-    try:
-        base = gateway.current_dir()
-    except OSError as exc:
-        raise UsageError(f"cannot read the current directory: {exc.strerror or exc}") from None
-    path = base if value is None else os.path.join(base, value)
+    if value is not None and os.path.isabs(value):
+        path = value
+    else:
+        try:
+            base = gateway.current_dir()
+        except OSError as exc:
+            raise UsageError(f"cannot read the current directory: {exc.strerror or exc}") from None
+        path = base if value is None else os.path.join(base, value)
     if problem := cwd_problem(path):
         raise UsageError(f"invalid working directory {show(path)}: {problem}")
     if not gateway.is_dir(path):
         raise UsageError(f"working directory {show(path)} is not an existing directory")
     return path
-
-
-# --- the command line ---------------------------------------------------------------------------
-
-
-def check_args(args: argparse.Namespace) -> None:
-    """Check order step 1: the grammars and limits of the parsed arguments (exit 2).
-
-    Checks that need config (marker or placement defined), the filesystem (``--cwd``) or
-    the pane list (label limit after ``label add``) belong to the commands.
-    """
-    # Imported here: ids imports this module for ``show``.
-    from . import ids
-
-    if args.socket is not None:
-        check_socket_flag(args.socket)
-    command = args.command
-    if hasattr(args, "id"):
-        if command == "close" and args.force:
-            ids.require_full(args.id)
-        else:
-            ids.parse(args.id)
-    if getattr(args, "actor", None) is not None:
-        check_actor(args.actor)
-    if hasattr(args, "decision_ids"):
-        check_decision_ids(args.decision_ids)
-    if hasattr(args, "labels"):
-        labels = parse_labels(args.labels)
-        if command == "open":
-            check_label_count(labels)
-
-    if command == "open":
-        if args.name is not None:
-            check_name(args.name)
-        if args.cwd is not None:
-            if args.cwd == "":
-                raise UsageError("--cwd must not be empty")
-            if problem := cwd_problem(args.cwd):
-                raise UsageError(f"invalid --cwd {show(args.cwd)}: {problem}")
-        parse_env(args.env)
-        if args.placement is not None:
-            check_placement_name(args.placement)
-        if args.session is not None:
-            check_session_name(args.session)
-    elif command == "list" and args.session is not None:
-        check_session_filter(args.session)
-    elif command == "rename":
-        check_name(args.name)
-    elif command == "mark":
-        check_marker_name(args.marker)
-    elif command == "focus" and args.client is not None:
-        check_client(args.client)
-    elif command == "close" and args.grace is not None:
-        parse_duration(args.grace)
-    elif command in ("label add", "label remove"):
-        parse_labels(args.pairs)

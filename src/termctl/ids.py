@@ -51,8 +51,11 @@ class IdInput:
         """The full id, or None for a prefix."""
         return PREFIX + self.body if self.full else None
 
-    def matches(self, full_id: str) -> bool:
-        return full_id.startswith(PREFIX + self.body)
+    def matches(self, pane_id: str) -> bool:
+        """A full id matches only an equal id; a prefix matches the ids starting with it."""
+        if self.full:
+            return pane_id == PREFIX + self.body
+        return pane_id.startswith(PREFIX + self.body)
 
 
 def parse(raw: str) -> IdInput:
@@ -72,10 +75,10 @@ def parse(raw: str) -> IdInput:
 
 
 def require_full(raw: str) -> str:
-    """A full id; a prefix is a usage error (``close --force``)."""
+    """The full id ``close --force`` needs; a prefix is a usage error."""
     parsed = parse(raw)
     if parsed.id is None:
-        raise UsageError(f"{show(raw)} is a prefix; a full id is required here")
+        raise UsageError(f"close --force needs a full id; {show(raw)} is a prefix")
     return parsed.id
 
 
@@ -96,16 +99,22 @@ def resolve[P: Candidate](id_input: IdInput, panes: Sequence[P]) -> P:
     """The one managed pane ``id_input`` names.
 
     No match exits 10 (``not_found``); several matches, including two panes carrying the same
-    full id, exit 21 (``ambiguous``) with the candidates, and termctl acts on none of them.
+    full id, exit 21 (``ambiguous``) with the candidates sorted by id, then pane id, and termctl
+    acts on none of them. The message lists the candidates' ids, which the pane reader has
+    checked against the id grammar; sessions (untrusted) appear only in ``candidates``.
     ``panes`` holds one entry per pane id (linked-window rows already merged).
     """
-    matches = [pane for pane in panes if id_input.matches(pane.id)]
+    matches = sorted(
+        (pane for pane in panes if id_input.matches(pane.id)),
+        key=lambda pane: (pane.id, pane.pane_id),
+    )
     if not matches:
         raise TermctlError("not_found", f"no managed pane matches {show(id_input.raw)}")
     if len(matches) > 1:
+        listed = ", ".join(pane.id for pane in matches)
         raise TermctlError(
             "ambiguous",
-            f"{show(id_input.raw)} matches {len(matches)} managed panes",
+            f"{show(id_input.raw)} matches {len(matches)} managed panes: {listed}",
             candidates=[
                 {"id": pane.id, "pane_id": pane.pane_id, "session": pane.session}
                 for pane in matches
