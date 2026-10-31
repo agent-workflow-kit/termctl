@@ -130,8 +130,9 @@ class GroupCall:
     spawned: bool
 
 
-# A scripted group run: a fixed result, an exception to raise, or a function of the call.
-GroupResponse = GroupRun | Exception | Callable[[GroupCall], GroupRun]
+# A scripted group run: a fixed result, an exception to raise (``KeyboardInterrupt`` and
+# ``Terminated`` included), or a function of the call.
+GroupResponse = GroupRun | BaseException | Callable[[GroupCall], GroupRun]
 
 
 def group_run(
@@ -278,7 +279,7 @@ class FakeGateway:
         call = GroupCall(list(argv), stdin, dict(env), timeout, stdout_limit, stderr_limit, False)
         self.group_calls.append(call)
         response = self._group_response(argv)
-        if isinstance(response, Exception):
+        if isinstance(response, BaseException):
             raise response
         if isinstance(response, GroupRun):
             return response
@@ -289,7 +290,7 @@ class FakeGateway:
     ) -> int:
         self.group_calls.append(GroupCall(list(argv), stdin, dict(env), timeout, None, None, True))
         response = self._group_response(argv)
-        if isinstance(response, Exception):
+        if isinstance(response, BaseException):
             raise response
         return 4343
 

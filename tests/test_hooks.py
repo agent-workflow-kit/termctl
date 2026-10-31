@@ -834,3 +834,21 @@ def test_real_hook_does_not_inherit_unrelated_descriptors(tmp_path: Path) -> Non
     finally:
         os.close(read_fd)
         os.close(write_fd)
+
+
+# --- the log entry of a hook process ------------------------------------------------------------
+
+
+@pytest.mark.parametrize(
+    ("process", "entry"),
+    [
+        (HookProcess("pre-open", "gate", 77), {"hook": "pre-open", "cmd": "gate", "pgid": 77,
+                                               "async": False}),
+        (HookProcess("post-open", "bg", 4343, watchdog=True),
+         {"hook": "post-open", "cmd": "bg", "pgid": 4343, "async": True}),
+    ],
+)  # fmt: skip
+def test_a_hook_process_log_entry_names_its_group(
+    process: HookProcess, entry: dict[str, Any]
+) -> None:
+    assert process.log_entry() == entry

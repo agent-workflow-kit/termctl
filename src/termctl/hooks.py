@@ -22,12 +22,11 @@ No hook runs while this process holds a server lock (``lock.held()``): hooks may
 the lock must never wait on them.
 """
 
-# TODO(#17): open builds its pre-open/post-open payloads here, runs the hooks at steps 4 and 9
-# of the open order, prints and logs the warnings (``HookWarning.log_record``) and audits
-# override runs. TODO(#23): the same for close (pre-close at step 2, post-close).
-# TODO(#17): the open step's log record must include the hook process groups
-# (``PreHookOutcome.processes`` and ``PostHookOutcome.processes``; design guide section 8 says
-# the group is "created and recorded"). TODO(#23): the same for the close step's record.
+# open (cli.open_pane) builds its payloads here, runs the hooks at steps 4 and 9 of the open
+# order, prints and logs the warnings (``HookWarning.log_record``), lists the hook process
+# groups in its log record (``HookProcess.log_entry``; design guide section 8: the group is
+# "created and recorded") and audits override runs.
+# TODO(#23): the same for close (pre-close at step 2, post-close).
 
 from __future__ import annotations
 
@@ -268,6 +267,10 @@ class HookProcess:
     cmd: str
     pgid: int
     watchdog: bool = False
+
+    def log_entry(self) -> dict[str, Any]:
+        """Its entry in the ``hooks`` list of the step's log record (``schemas/log.json``)."""
+        return {"hook": self.hook, "cmd": self.cmd, "pgid": self.pgid, "async": self.watchdog}
 
 
 # --- untrusted output ---------------------------------------------------------------------------

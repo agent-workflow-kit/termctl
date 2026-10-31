@@ -85,6 +85,43 @@
       ],
       "description": "focus only; attach is logged before the exec."
     },
+    "hooks": {
+      "type": "array",
+      "items": {
+        "type": "object",
+        "properties": {
+          "hook": {
+            "enum": [
+              "pre-open",
+              "post-open",
+              "pre-close",
+              "post-close"
+            ]
+          },
+          "cmd": {
+            "type": "string",
+            "minLength": 1
+          },
+          "pgid": {
+            "type": "integer",
+            "minimum": 1,
+            "description": "The process group termctl created for the hook; for an async hook, its watchdog's (also its session)."
+          },
+          "async": {
+            "type": "boolean",
+            "description": "true for an async post-hook: pgid is then its watchdog's group."
+          }
+        },
+        "additionalProperties": false,
+        "required": [
+          "hook",
+          "cmd",
+          "pgid",
+          "async"
+        ]
+      },
+      "description": "open and close only (required there): every hook the step started, in the order it started them, with its process group. A hook that could not be started is not listed."
+    },
     "message": {
       "type": "string"
     },
@@ -156,7 +193,8 @@
         "required": [
           "actor",
           "decision_ids",
-          "escalation_override"
+          "escalation_override",
+          "hooks"
         ]
       },
       "else": {
@@ -170,6 +208,11 @@
             {
               "required": [
                 "escalation_override"
+              ]
+            },
+            {
+              "required": [
+                "hooks"
               ]
             }
           ]

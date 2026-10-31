@@ -11,7 +11,6 @@ implements it:
   (``open_cmd.create_window`` runs them in the order of interface.md "Open order" step 5).
 - ``tag_pane`` and ``cleanup_pane``: ``open``'s pane (Open order step 6, ``open_cmd.tag``).
 - ``record_process``: ``open``'s PID recording (Open order step 7, ``open_cmd.record``).
-- TODO(#17): the rest of ``open`` (hooks).
 - TODO(#19): ``rename``; TODO(#20): ``mark`` and ``unmark``; TODO(#21): label changes.
 - TODO(#23): ``close``; TODO(#24): ``focus``.
 """

@@ -11,6 +11,7 @@ from pathlib import Path
 from typing import Any
 
 import pytest
+from jsonschema import ValidationError
 
 from termctl import jsonlog
 from termctl.errors import TermctlError
@@ -93,6 +94,7 @@ def open_record(**overrides: Any) -> dict[str, Any]:
         "actor": "auto:unknown",
         "decision_ids": [],
         "escalation_override": False,
+        "hooks": [],
     }
     fields.update(overrides)
     return jsonlog.log_record(TS, **fields)
@@ -119,6 +121,56 @@ def test_record_without_resolved_id_or_socket_validates() -> None:
     record = open_record(id=None, socket_path=None, result="error", exit_code=12)
     validate(record, "termctl/log.json")
     assert record["id"] is None and record["socket_path"] is None
+
+
+HOOK_ENTRY = {"hook": "pre-open", "cmd": "gate", "pgid": 4242, "async": False}
+
+
+def test_open_record_lists_the_hook_process_groups() -> None:
+    entries = [HOOK_ENTRY, {"hook": "post-open", "cmd": "notify", "pgid": 7, "async": True}]
+    record = open_record(hooks=entries)
+    validate(record, "termctl/log.json")
+    assert record["hooks"] == entries
+
+
+def test_open_and_close_records_need_hooks() -> None:
+    with pytest.raises(ValueError, match="hooks"):
+        open_record(hooks=None)
+    with pytest.raises(ValueError, match="hooks"):
+        open_record(event="close", force=True, hooks=None)
+
+
+def test_other_records_never_carry_hooks() -> None:
+    with pytest.raises(ValueError, match="hooks"):
+        jsonlog.log_record(
+            TS, event="focus", result="ok", id=ID, socket_path=SOCKET, action="attach", hooks=[]
+        )
+
+
+@pytest.mark.parametrize(
+    "entry",
+    [
+        {**HOOK_ENTRY, "pgid": 0},
+        {**HOOK_ENTRY, "hook": "pre-rename"},
+        {**HOOK_ENTRY, "cmd": ""},
+        {key: value for key, value in HOOK_ENTRY.items() if key != "async"},
+        {**HOOK_ENTRY, "stderr": "x"},
+    ],
+    ids=["pgid-0", "unknown-hook", "empty-cmd", "no-async", "extra-field"],
+)
+def test_schema_rejects_bad_hook_entries(entry: dict[str, Any]) -> None:
+    with pytest.raises(ValidationError):
+        validate(open_record(hooks=[entry]), "termctl/log.json")
+
+
+def test_schema_requires_hooks_on_open_records_only() -> None:
+    record = open_record()
+    del record["hooks"]
+    with pytest.raises(ValidationError):
+        validate(record, "termctl/log.json")
+    warning = jsonlog.log_record(TS, event="warning", result="warning", id=ID, socket_path=SOCKET)
+    with pytest.raises(ValidationError):
+        validate({**warning, "hooks": []}, "termctl/log.json")
 
 
 def test_close_record_needs_force() -> None:

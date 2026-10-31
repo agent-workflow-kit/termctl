@@ -434,8 +434,12 @@ def test_a_forged_global_ownership_marker_fails_the_tagging(tmux_server: TmuxSer
     assert "warning:" in result.stderr and "unmanaged" in result.stderr
     # Logged with result error (interface.md "Audit and log"), under the private HOME.
     log = tmux_server.root / ".local" / "state" / "termctl" / "log.jsonl"
-    [record] = [json.loads(line) for line in log.read_text().splitlines()]
+    warning, record = [json.loads(line) for line in log.read_text().splitlines()]
+    validate(warning, "termctl/log.json")
     validate(record, "termctl/log.json")
+    # The cleanup warning is logged too, before the open record.
+    assert (warning["event"], warning["result"]) == ("warning", "warning")
+    assert "unmanaged" in warning["message"]
     assert (record["event"], record["result"], record["exit_code"]) == ("open", "error", 12)
     assert record["socket_path"] == tmux_server.socket_path
 
@@ -479,3 +483,55 @@ def test_usage_errors_start_nothing(tmux_server: TmuxServer) -> None:
         assert result.code == 2, argv
     assert not tmux_server.alive()
     assert not os.path.exists(tmux_server.socket_path)
+
+
+# --- hooks (interface.md "Hooks"): real hook scripts ------------------------------------------
+
+
+def hook_script(tmp_path: Path, name: str, body: str) -> str:
+    """A private executable hook script; its path is the hook's cmd."""
+    path = tmp_path / name
+    path.write_text(f"#!/bin/sh\n{body}\n", encoding="utf-8")
+    path.chmod(0o700)
+    return str(path)
+
+
+def test_a_vetoing_pre_open_hook_starts_no_server(tmux_server: TmuxServer, tmp_path: Path) -> None:
+    seen = tmp_path / "payload.json"
+    gate = hook_script(tmp_path, "gate", f"cat > '{seen}'; echo 'not today' >&2; exit 1")
+    result = termctl(tmux_server, "--json", "open", "--hook", f"pre-open={gate}", "--", "true")
+    assert result.code == 11, result.stderr
+    err = result.json()["error"]
+    assert (err["code"], err["hook"], err["hook_stderr"]) == ("vetoed", gate, "not today\n")
+    validate(json.loads(seen.read_text(encoding="utf-8")), "termctl/hooks/pre-open.json")
+    assert not tmux_server.alive()
+    assert not Path(tmux_server.socket_path).exists()
+
+
+def test_an_escalation_creates_nothing_and_an_override_run_opens(
+    tmux_server: TmuxServer, tmp_path: Path
+) -> None:
+    tmux_server.start()
+    gate = hook_script(tmp_path, "gate", 'printf \'{"decision_id": "gate-1"}\'; exit 13')
+    before = tmux_server.raw("list-windows", "-a").stdout
+    escalated = termctl(tmux_server, "--json", "open", "--hook", f"pre-open={gate}", "--", "true")
+    assert escalated.code == 13, escalated.stderr
+    assert escalated.json()["error"]["decision_ids"] == ["gate-1"]
+    assert tmux_server.raw("list-windows", "-a").stdout == before
+    out = opened(
+        tmux_server, "--actor", "human:tester", "--override-escalation", "--hook",
+        f"pre-open={gate}", "--keep-on-exit", "always", "--", "true",
+    )  # fmt: skip
+    assert out["decision_ids"] == ["gate-1"]
+    assert pane_exists(tmux_server, out["pane_id"])
+
+
+def test_a_post_open_hook_gets_the_open_output(tmux_server: TmuxServer, tmp_path: Path) -> None:
+    seen = tmp_path / "payload.json"
+    notify = hook_script(tmp_path, "notify", f"cat > '{seen}'; echo \"$TERMCTL_ID\" >> '{seen}.id'")
+    out = opened(tmux_server, "--hook", f"post-open={notify}", "--keep-on-exit", "always", "--",
+                 "true")  # fmt: skip
+    data = json.loads(seen.read_text(encoding="utf-8"))
+    validate(data, "termctl/hooks/post-open.json")
+    assert data["pane"] == out
+    assert Path(f"{seen}.id").read_text(encoding="utf-8") == f"{out['id']}\n"
