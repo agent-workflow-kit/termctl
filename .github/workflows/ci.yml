@@ -1,6 +1,8 @@
 name: ci
 
-# Thin caller for agent-workflow-kit/awkit-ci. Required status check: `ci / ci-ok`.
+# Thin caller for agent-workflow-kit/awkit-ci, plus a `tmux` job that runs the real-tmux tests.
+# Status checks: `ci / ci-ok` (required) and `tmux`. `tmux` is not part of `ci / ci-ok`; it
+# gates merges only once it is added as a required check in branch protection (maintainer).
 # Source: https://github.com/agent-workflow-kit/awkit-ci/tree/main/templates
 
 on:
@@ -19,8 +21,35 @@ jobs:
   ci:
     uses: agent-workflow-kit/awkit-ci/.github/workflows/python-ci.yml@v0.1.0
 
+  # The shared verify job cannot install packages, so it runs the real-tmux tests only when the
+  # runner image ships tmux; this job installs tmux and runs make verify with
+  # TERMCTL_REQUIRE_TMUX set, so a missing tmux fails.
+  tmux:
+    name: tmux
+    runs-on: ubuntu-latest
+    timeout-minutes: 20
+    permissions:
+      contents: read
+    env:
+      TERMCTL_REQUIRE_TMUX: "1"
+      UV_PYTHON: "3.12"
+    steps:
+      - uses: actions/checkout@3d3c42e5aac5ba805825da76410c181273ba90b1 # v7.0.1
+        with:
+          persist-credentials: false
+      - uses: astral-sh/setup-uv@1c37ad07a6a961277cf70c0d37d6f313000f5884 # v10.3.0
+      - name: Install tmux
+        run: |
+          sudo apt-get update
+          sudo apt-get install -y --no-install-recommends tmux
+          tmux -V
+      - name: uv sync
+        run: uv sync --python "$UV_PYTHON"
+      - name: make verify
+        run: make verify
+
   release:
-    needs: ci
+    needs: [ci, tmux]
     if: github.event_name == 'push' && github.ref == 'refs/heads/main'
     # The release pushes with the release GitHub App token, so GITHUB_TOKEN stays read-only.
     permissions:
