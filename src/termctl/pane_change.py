@@ -1,7 +1,7 @@
-"""The read-modify-write of a managed pane's options and window name: ``rename``, ``mark`` and
-``unmark``, and TODO(#21) ``label add`` and ``label remove``, run ``change_pane`` with their own
-plan (interface.md "Names", "Markers", "Labels", "Audit and log"
-Locking; design.md D20, D28, D29).
+"""The read-modify-write of a managed pane's options and window name: ``rename``, ``mark``,
+``unmark``, ``label add`` and ``label remove`` (the label commands leave the window name alone)
+run ``change_pane`` with their own plan (interface.md "Names", "Markers", "Labels", "Audit and
+log" Locking; design.md D20, D28, D29).
 
 ``change_pane`` holds the per-server lock (``lock.server_lock``) while it reads the pane again
 by its full termctl id (the id resolved in step 4 may be stale after the lock wait), decides,
@@ -23,6 +23,10 @@ too, and the same probe proves it holds no tab or newline. The probe also checks
 answering is still the one read (``Backend.byte_lengths``). Otherwise the change is written
 again, which replaces a forged value.
 
+**Dry runs.** ``preview_change`` decides as ``change_pane`` does, on the pane step 4 read, and
+returns the pane as it would be afterwards (interface.md "Dry runs", "Names"): it takes no lock
+and writes nothing; its only tmux query is the read-only length probe of a would-be no-op.
+
 **Warnings.** The reads under the lock report their warnings through ``warn``, each once and
 none that step 4 already reported (``seen``).
 """
@@ -30,7 +34,7 @@ none that step 4 already reported (``seen``).
 from __future__ import annotations
 
 from collections.abc import Callable, Iterable, Mapping, Sequence
-from dataclasses import dataclass
+from dataclasses import dataclass, replace
 from typing import Protocol
 
 from . import ids
@@ -113,16 +117,59 @@ def change_pane(
 
     with server_lock(backend.socket_path, environ=environ, clock=clock):
         pane = _resolve(read(), termctl_id)
-        change = plan(pane)
-        unknown = set(change.options) - set(_CURRENT)
-        if unknown:
-            raise ValueError(f"a pane change cannot write {sorted(unknown)!r}")
+        change = _checked(plan(pane))
         if _is_no_op(backend, pane, change, version):
             return Outcome(pane=pane, changed=False, display_updated=False)
         rename = change.display_name is not None and may_rename_window(pane)
         window_name = change.display_name if rename else None
         updated = backend.write_pane(pane, change.options, window_name)
         return Outcome(pane=_resolve(read(), termctl_id), changed=True, display_updated=updated)
+
+
+def preview_change(
+    backend: PaneWriter,
+    pane: ManagedPane,
+    plan: Callable[[ManagedPane], Change],
+    *,
+    version: TmuxVersion | None,
+) -> Outcome:
+    """What ``change_pane`` would do to ``pane`` (as read in step 4), without the lock and
+    without writing: ``pane`` as it would be afterwards, its ``display_name`` the computed one
+    when the window would be renamed and the current one otherwise. The computed name can
+    differ from the form tmux reports after the real run, which stores some characters
+    escaped (interface.md "Names"). Errors of ``plan`` propagate as in a real run."""
+    change = _checked(plan(pane))
+    if _is_no_op(backend, pane, change, version):
+        return Outcome(pane=pane, changed=False, display_updated=False)
+    rename = change.display_name is not None and may_rename_window(pane)
+    after = replace(pane, **_fields(change.options))
+    if rename:
+        assert change.display_name is not None
+        after = replace(after, display_name=change.display_name)
+    return Outcome(pane=after, changed=True, display_updated=rename)
+
+
+def _checked(change: Change) -> Change:
+    unknown = set(change.options) - set(_CURRENT)
+    if unknown:
+        raise ValueError(f"a pane change cannot write {sorted(unknown)!r}")
+    return change
+
+
+def _fields(options: Mapping[str, str]) -> dict[str, object]:
+    """The ``ManagedPane`` fields that ``options`` would set, read as the pane reader reads
+    them (an empty marker option is no marker; empty labels are none)."""
+    fields: dict[str, object] = {}
+    for option, value in options.items():
+        if option == "@termctl_name":
+            fields["name"] = value
+        elif option == "@termctl_marker":
+            fields["marker"] = value or None
+        elif option == "@termctl_marker_text":
+            fields["marker_text"] = value or None
+        elif option == "@termctl_labels":
+            fields["labels"] = tuple(value.split(" ")) if value else ()
+    return fields
 
 
 def _resolve(read: PaneRead, termctl_id: str) -> ManagedPane:

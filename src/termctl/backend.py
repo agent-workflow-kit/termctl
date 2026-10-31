@@ -12,8 +12,8 @@ implements it:
 - ``tag_pane`` and ``cleanup_pane``: ``open``'s pane (Open order step 6, ``open_cmd.tag``).
 - ``record_process``: ``open``'s PID recording (Open order step 7, ``open_cmd.record``).
 - ``write_pane`` and ``byte_lengths``: the guarded read-modify-write of a managed pane's
-  options and window name (``pane_change.py``); ``rename``, ``mark`` and ``unmark`` use them,
-  and TODO(#21) label changes reuse them.
+  options and window name (``pane_change.py``); ``rename``, ``mark``, ``unmark`` and the label
+  commands use them.
 - ``pane_tty``: the terminal a ``bell`` marker writes BEL to (``display.ring_bell``).
 - TODO(#23): ``close``; TODO(#24): ``focus``.
 """

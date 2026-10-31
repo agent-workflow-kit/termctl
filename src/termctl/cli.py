@@ -43,7 +43,7 @@ from .gateway import (
     stop_signals,
 )
 from .output import PROG, Output, Result, flush_standard_streams
-from .pane_change import Change, Outcome, change_pane
+from .pane_change import Change, Outcome, change_pane, preview_change
 from .panes import ManagedPane, PaneRead
 from .statedir import StateDirError
 from .tmux_backend import Tmux, WindowSpec
@@ -96,8 +96,9 @@ class Context:
     audited: bool = False
     # A logged ``open``: its stop-signal handling (``gateway.stop_signals``).
     signals: RunSignals | None = None
-    # A pane change (``rename``) that changed nothing: no log record (interface.md "Audit and
-    # log").
+    # A pane change (``rename``, ``mark``, ``unmark``, ``label add``, ``label remove``) that
+    # changed nothing: no log record
+    # (interface.md "Audit and log").
     no_op: bool = False
 
     def socket_path(self) -> str | None:
@@ -984,27 +985,31 @@ def _change_backend(ctx: Context) -> Backend:
 
 
 def _apply_change(
-    ctx: Context, plan: Callable[[ManagedPane], Change]
+    ctx: Context, plan: Callable[[ManagedPane], Change], *, dry_run: bool
 ) -> tuple[dict[str, Any], Outcome]:
     """Apply ``plan`` to the resolved pane under the lock; a change that changes nothing is a
-    no-op. Returns the pane-change ``--json`` object and the outcome."""
+    no-op. A dry run decides the same on the pane step 4 read, without the lock or a write
+    (interface.md "Dry runs"). Returns the pane-change ``--json`` object and the outcome."""
     assert ctx.pane is not None and ctx.tmux is not None
-    outcome = change_pane(
-        _change_backend(ctx),
-        ctx.pane.id,
-        plan,
-        version=ctx.tmux.version,
-        environ=ctx.environ,
-        clock=ctx.clock,
-        warn=ctx.warn,
-        seen=() if ctx.pane_read is None else ctx.pane_read.warnings,
-    )
+    if dry_run:
+        outcome = preview_change(_change_backend(ctx), ctx.pane, plan, version=ctx.tmux.version)
+    else:
+        outcome = change_pane(
+            _change_backend(ctx),
+            ctx.pane.id,
+            plan,
+            version=ctx.tmux.version,
+            environ=ctx.environ,
+            clock=ctx.clock,
+            warn=ctx.warn,
+            seen=() if ctx.pane_read is None else ctx.pane_read.warnings,
+        )
     ctx.no_op = not outcome.changed
     data = {
         **outcome.pane.pane_object(_socket_path(ctx)),
         "changed": outcome.changed,
         "display_updated": outcome.display_updated,
-        "dry_run": False,
+        "dry_run": dry_run,
     }
     return data, outcome
 
@@ -1012,15 +1017,12 @@ def _apply_change(
 def rename(args: argparse.Namespace, ctx: Context) -> Result:
     """Set ``@termctl_name`` and recompute the displayed name, keeping a set marker; the
     window is renamed only while termctl may (interface.md `rename`, "Names")."""
-    if args.dry_run:
-        # TODO(#22): rename --dry-run prints the pane as it would be (interface.md "Dry runs").
-        raise TermctlError("internal", f"{PROG} rename --dry-run is not implemented yet")
 
     def plan(pane: ManagedPane) -> Change:
         shown = display.displayed_name(args.name, pane.marker_text, ctx.config.marker_display)
         return Change(options={"@termctl_name": args.name}, display_name=shown)
 
-    data, outcome = _apply_change(ctx, plan)
+    data, outcome = _apply_change(ctx, plan, dry_run=args.dry_run)
     return Result(data, outcome.pane.display_name)
 
 
@@ -1028,9 +1030,6 @@ def mark(args: argparse.Namespace, ctx: Context) -> Result:
     """Set the marker, with its text from the current config, in one write with the
     recomputed displayed name; a ``bell`` marker rings when something changed on a running
     pane (interface.md "Markers", `mark`). ``load_config`` checked that it is defined."""
-    if args.dry_run:
-        # TODO(#22): mark --dry-run prints the pane as it would be (interface.md "Dry runs").
-        raise TermctlError("internal", f"{PROG} mark --dry-run is not implemented yet")
     marker = ctx.config.markers[args.marker]
 
     def plan(pane: ManagedPane) -> Change:
@@ -1038,8 +1037,8 @@ def mark(args: argparse.Namespace, ctx: Context) -> Result:
         options = {"@termctl_marker": args.marker, "@termctl_marker_text": marker.text}
         return Change(options=options, display_name=shown)
 
-    data, outcome = _apply_change(ctx, plan)
-    if outcome.changed and marker.bell:
+    data, outcome = _apply_change(ctx, plan, dry_run=args.dry_run)
+    if outcome.changed and marker.bell and not args.dry_run:
         _ring_bell(ctx, outcome.pane)
     return Result(data, outcome.pane.display_name)
 
@@ -1065,17 +1064,38 @@ def _ring_bell(ctx: Context, pane: ManagedPane) -> None:
 def unmark(args: argparse.Namespace, ctx: Context) -> Result:
     """Clear the marker, whether or not config still defines it; the displayed name becomes
     the name (interface.md `unmark`)."""
-    if args.dry_run:
-        # TODO(#22): unmark --dry-run prints the pane as it would be (interface.md "Dry runs").
-        raise TermctlError("internal", f"{PROG} unmark --dry-run is not implemented yet")
 
     def plan(pane: ManagedPane) -> Change:
         shown = display.displayed_name(pane.name, None, ctx.config.marker_display)
         options = {"@termctl_marker": "", "@termctl_marker_text": ""}
         return Change(options=options, display_name=shown)
 
-    data, outcome = _apply_change(ctx, plan)
+    data, outcome = _apply_change(ctx, plan, dry_run=args.dry_run)
     return Result(data, outcome.pane.display_name)
+
+
+def label_change(args: argparse.Namespace, ctx: Context) -> Result:
+    """``label add`` and ``label remove``: the pane's labels are a set of pairs, so adding a
+    present pair or removing an absent one changes nothing; they are written in canonical
+    form (sorted by code point, unique, single spaces) and the window is never renamed
+    (interface.md `label add` / `label remove`, "Labels")."""
+    pairs = set(validate.parse_labels(args.pairs))
+    adding = args.command == "label add"
+
+    def plan(pane: ManagedPane) -> Change:
+        current = set(pane.labels)
+        labels = sorted(current | pairs if adding else current - pairs)
+        # The limit applies to the labels read under the lock, after id resolution, so the
+        # failure is logged; a removal never grows the set.
+        if len(labels) > validate.MAX_LABELS:
+            raise UsageError(
+                f"managed pane {pane.id} would carry {len(labels)} labels "
+                f"(at most {validate.MAX_LABELS})"
+            )
+        return Change(options={"@termctl_labels": " ".join(labels)}, display_name=None)
+
+    data, outcome = _apply_change(ctx, plan, dry_run=args.dry_run)
+    return Result(data, " ".join(outcome.pane.labels))
 
 
 COMMAND_STEPS = {
@@ -1086,6 +1106,8 @@ COMMAND_STEPS = {
     "rename": rename,
     "mark": mark,
     "unmark": unmark,
+    "label add": label_change,
+    "label remove": label_change,
 }
 
 
@@ -1097,7 +1119,7 @@ def run_command(args: argparse.Namespace, ctx: Context) -> Result:
     if args.command == "placements":
         labels = validate.parse_labels(args.labels) if args.labels else None
         return placement.report(ctx.config, labels)
-    # TODO(#21): label add, label remove. TODO(#23): close.
+    # TODO(#23): close.
     # TODO(#24): focus.
     raise TermctlError("internal", f"{PROG} {args.command} is not implemented yet")
 
@@ -1159,8 +1181,13 @@ def _logged_open(args: argparse.Namespace, ctx: Context) -> Result:
 
 
 # The pane-change commands, by their log.jsonl event (interface.md "Audit and log").
-# TODO(#21): label_add, label_remove.
-CHANGE_EVENTS = {"rename": "rename", "mark": "mark", "unmark": "unmark"}
+CHANGE_EVENTS = {
+    "rename": "rename",
+    "mark": "mark",
+    "unmark": "unmark",
+    "label add": "label_add",
+    "label remove": "label_remove",
+}
 
 
 def _logged_change(args: argparse.Namespace, ctx: Context) -> Result:

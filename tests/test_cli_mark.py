@@ -678,17 +678,6 @@ def test_an_unknown_id_is_logged(state: Path) -> None:
     assert (record["event"], record["id"]) == ("mark", None)
 
 
-@pytest.mark.parametrize(
-    "argv", [["mark", ID, "attention", "--dry-run"], ["unmark", ID, "--dry-run"]]
-)
-def test_dry_run_is_not_implemented_yet_and_not_logged(state: Path, argv: list[str]) -> None:
-    gateway = marking()
-    result = run(["--json", *argv], gateway, state)
-    assert (result.code, result.json()["error"]["code"]) == (1, "internal")
-    assert writes(gateway) == []
-    assert result.log() == []
-
-
 def test_an_unusable_state_directory_exits_12_locked_before_any_write(state: Path) -> None:
     state.parent.mkdir(exist_ok=True)
     state.write_text("a file, not a directory")
