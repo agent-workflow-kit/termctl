@@ -1,0 +1,1 @@
+{"error": {"code": "config_invalid", "message": "invalid config: rules[0].placement: undefined placement 'reviews'", "details": {"key": "rules[0].placement"}}}

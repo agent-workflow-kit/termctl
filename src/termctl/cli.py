@@ -14,8 +14,10 @@ from collections.abc import Mapping, Sequence
 from dataclasses import dataclass, field
 from typing import Any, NoReturn, TextIO
 
-from . import __version__, ids, validate
+from . import __version__, ids, tmux_socket, validate
+from . import config as config_module
 from .argv import Scan, scan
+from .config import Config
 from .errors import TermctlError, UsageError
 from .gateway import Clock, Gateway, SystemClock, SystemGateway
 from .output import PROG, Output, Result, flush_standard_streams
@@ -31,6 +33,10 @@ class Context:
     clock: Clock
     environ: Mapping[str, str]
     out: Output = field(repr=False)
+    config: Config = field(default_factory=config_module.defaults)
+    # Set by step 2 (the resolved server) and step 3 (False when there is no server).
+    server: tmux_socket.Server | None = None
+    socket_present: bool | None = None
 
 
 # --- argument parsing ---------------------------------------------------------------------------
@@ -294,6 +300,8 @@ def _parse(parser: _Parser, scanned: Scan) -> argparse.Namespace:
     args, extra = parser.parse_known_args(scanned.args)
     if extra:
         raise UsageError(f"unrecognized arguments: {' '.join(extra)}", usage=usage)
+    if args.config == "":
+        raise UsageError("--config must not be empty", usage=usage)
     if args.verbose and args.quiet:
         raise UsageError("--verbose and --quiet cannot be combined", usage=usage)
     if args.command == "open":
@@ -392,21 +400,38 @@ def check_args(args: argparse.Namespace, ctx: Context) -> None:
 
 def load_config(args: argparse.Namespace, ctx: Context) -> None:
     """Step 1 (rest): the config file, drop-ins and ``TERMCTL_*`` variables (exit 2)."""
-    # TODO: config loading - issue #3 (config.py)
+    ctx.config = config_module.load(ctx.environ, args.config)
 
 
 def resolve_server(args: argparse.Namespace, ctx: Context) -> None:
     """Step 2: resolve the server, without side effects."""
-    # TODO: socket resolution - issue #8
+    ctx.server = tmux_socket.resolve(args.socket, ctx.config.socket, ctx.environ, ctx.gateway)
 
 
 def check_tmux(args: argparse.Namespace, ctx: Context) -> None:
     """Step 3: tmux binary, version and socket safety checks (exit 12)."""
-    # TODO: tmux binary and version - issue #10; socket safety - issue #8
+    # TODO(#10): the tmux binary and version checks, before the socket checks.
+    assert ctx.server is not None
+    ctx.socket_present = tmux_socket.check(ctx.server, ctx.gateway)
+    # TODO(#14): open re-checks the socket right before connecting, creates the default
+    # directory (default form only, mode 0700), and exits 12 for an explicit path whose parent
+    # is missing.
+    # TODO(#12): list prints an empty list and exists answers without a server.
+    # TODO(#12): a refused connection on an existing socket means no server; re-run the checks
+    # before connecting.
 
 
 def resolve_id(args: argparse.Namespace, ctx: Context) -> None:
     """Step 4: resolve the id to one managed pane (exit 10 or 21)."""
+    # A missing socket or parent directory is no server; `exists` then prints its normal
+    # output with exit 10 (TODO(#12)), and a refused connection is no server too (TODO(#12)).
+    if ctx.socket_present is False and args.command != "exists":
+        assert ctx.server is not None
+        raise TermctlError(
+            "no_server",
+            f"no tmux server is running on {validate.show(ctx.server.socket_path, 200)}",
+            details={"socket_path": ctx.server.socket_path},
+        )
     # TODO(#12): read the managed panes with backend.TmuxBackend.read_panes (no server: exit 10,
     # no_server) and pick one with ids.resolve.
 
