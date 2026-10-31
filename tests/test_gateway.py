@@ -1017,3 +1017,72 @@ def test_watchdog_kills_the_hook_on_a_stop_signal_while_it_starts(tmp_path: Path
     )
     assert proc.returncode == 1, proc.stderr
     assert wait_gone(int(read_when_ready(marker)))
+
+
+def test_system_gateway_stderr_isatty_asks_about_fd_2(monkeypatch: pytest.MonkeyPatch) -> None:
+    asked: list[int] = []
+
+    def isatty(fd: int) -> bool:
+        asked.append(fd)
+        return False
+
+    monkeypatch.setattr(os, "isatty", isatty)
+    assert SystemGateway().stderr_isatty() is False
+    assert asked == [2]
+
+
+# --- exec_replace: focus's attach (interface.md `focus` step 2) ---------------------------------
+
+
+def test_exec_replace_execs_exactly_argv_and_env_with_sigpipe_restored(
+    monkeypatch: pytest.MonkeyPatch,
+) -> None:
+    seen: list[tuple[str, list[str], dict[str, str], Any]] = []
+
+    class Execed(Exception):
+        pass
+
+    def execve(path: str, argv: list[str], env: dict[str, str]) -> None:
+        seen.append((path, list(argv), dict(env), signal.getsignal(signal.SIGPIPE)))
+        raise Execed
+
+    monkeypatch.setattr(os, "execve", execve)
+    previous = signal.signal(signal.SIGPIPE, signal.SIG_IGN)
+    try:
+        with pytest.raises(Execed):
+            SystemGateway().exec_replace(["/usr/bin/tmux", "attach"], {"A": "1"})
+        # The failed exec put termctl's own handler back.
+        assert signal.getsignal(signal.SIGPIPE) == signal.SIG_IGN
+    finally:
+        signal.signal(signal.SIGPIPE, previous)
+    assert seen == [("/usr/bin/tmux", ["/usr/bin/tmux", "attach"], {"A": "1"}, signal.SIG_DFL)]
+
+
+@pytest.mark.parametrize("argv", [[], ["tmux", "attach"], ["./tmux"]])
+def test_exec_replace_refuses_a_relative_program(argv: list[str]) -> None:
+    with pytest.raises(ValueError):
+        SystemGateway().exec_replace(argv, {})
+
+
+def test_exec_replace_raises_oserror_for_a_missing_program(tmp_path: Path) -> None:
+    with pytest.raises(OSError):
+        SystemGateway().exec_replace([str(tmp_path / "missing")], {})
+
+
+@pytest.mark.skipif(not Path("/proc/self/status").exists(), reason="reads /proc/self/status")
+def test_exec_replace_really_replaces_the_process_without_ignored_sigpipe() -> None:
+    """Run in a child Python, which ignores SIGPIPE as every Python does; the program it execs
+    must not inherit that (SigIgn bit 13 clear)."""
+    code = (
+        "from termctl.gateway import SystemGateway\n"
+        "SystemGateway().exec_replace(['/bin/sh', '-c', "
+        "'echo $$ $MARK; grep SigIgn /proc/self/status'], {'MARK': 'm'})\n"
+    )
+    result = subprocess.run(
+        [sys.executable, "-c", code], capture_output=True, text=True, timeout=30, check=False
+    )
+    assert result.returncode == 0, result.stderr
+    first, second = result.stdout.splitlines()
+    assert first.split()[1] == "m"
+    ignored = int(second.split()[1], 16)
+    assert not ignored & (1 << (signal.SIGPIPE - 1))

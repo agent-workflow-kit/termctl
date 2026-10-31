@@ -353,6 +353,80 @@ def test_human_output_is_the_id() -> None:
     assert (result.code, result.stdout) == (0, f"{ID}\n")
 
 
+# --- step 8: --focus (interface.md "Open order" step 8, `focus`) --------------------------------
+
+
+def focus_flow(client_lines: str, **responses: Any) -> Flow:
+    gateway = existing_session_flow(make_plan())
+    gateway.responses[key(tb.list_clients())] = completed(client_lines)
+    gateway.responses.update(responses.get("extra", {}))
+    return gateway
+
+
+@pytest.mark.usefixtures("fixed_id")
+def test_focus_switches_a_client_and_reports_focused() -> None:
+    gateway = focus_flow("/dev/pts/2 10 $1 @0\n/dev/pts/4 99 $8 @0\n")
+    gateway.responses[key(tb.switch_client("/dev/pts/2", "%5"))] = completed()
+    result = run(["--focus", "--", "true"], gateway)
+    out = result.json()
+    validate(out, "termctl/cli/open.json")
+    assert out["focused"] is True
+    assert calls(gateway)[-2:] == ["list-clients -F", "switch-client -E"]
+    # Step 8 comes after the read for the output; nothing is attached.
+    assert gateway.execs == []
+
+
+@pytest.mark.usefixtures("fixed_id")
+def test_focus_never_attaches_even_from_a_terminal() -> None:
+    flow = focus_flow("")
+    flow.tty = flow.stderr_tty = True
+    result = run(["--focus", "--", "true"], flow)
+    assert result.code == 0, result.stderr
+    out = result.json()
+    assert out["focused"] is False
+    assert flow.execs == []
+    assert "no tmux client" in result.stderr
+
+
+@pytest.mark.usefixtures("fixed_id")
+def test_focus_inside_tmux_uses_step_1() -> None:
+    caller = key(tb.caller_session("%9"))
+    flow = focus_flow(
+        "/dev/pts/2 10 $1 @0\n/dev/pts/7 1 $4 @6\n", extra={caller: completed("%9 $4\n")}
+    )
+    flow.responses[key(tb.switch_client("/dev/pts/7", "%5"))] = completed()
+    result = run(["--focus", "--", "true"], flow, {"TMUX": f"{SOCK},1,0", "TMUX_PANE": "%9"})
+    assert result.json()["focused"] is True
+
+
+@pytest.mark.usefixtures("fixed_id")
+def test_a_failed_focus_is_a_warning_and_the_open_succeeds() -> None:
+    flow = focus_flow("/dev/pts/2 10 $1 @0\n")
+    flow.responses[key(tb.switch_client("/dev/pts/2", "%5"))] = completed(
+        stderr="boom\n", returncode=1
+    )
+    result = run(["--focus", "--", "true"], flow)
+    assert result.code == 0
+    assert result.json()["focused"] is False
+    assert "could not focus" in result.stderr and "boom" in result.stderr
+
+
+@pytest.mark.usefixtures("fixed_id")
+def test_without_focus_no_client_is_touched() -> None:
+    flow = focus_flow("/dev/pts/2 10 $1 @0\n")
+    out = run(["--", "true"], flow).json()
+    assert out["focused"] is False
+    assert "list-clients -F" not in calls(flow)
+
+
+@pytest.mark.usefixtures("fixed_id")
+def test_focus_of_a_pane_gone_before_the_read_is_not_attempted() -> None:
+    gateway = existing_session_flow(make_plan(), after=[])
+    out = run(["--focus", "--", "true"], gateway).json()
+    assert (out["state"], out["focused"]) == ("gone", False)
+    assert "list-clients -F" not in calls(gateway)
+
+
 @pytest.mark.usefixtures("fixed_id")
 def test_a_pane_gone_before_the_read_reports_state_gone() -> None:
     # Spike C1/E5: `true` exits at once and keep never closes its window.

@@ -9,6 +9,7 @@ from __future__ import annotations
 import argparse
 import io
 import os
+import shlex
 import signal
 import sys
 from collections.abc import Mapping, Sequence
@@ -17,6 +18,7 @@ from typing import Any, NoReturn, TextIO
 
 from . import (
     __version__,
+    focus_cmd,
     hooks,
     ids,
     jsonlog,
@@ -90,6 +92,8 @@ class Context:
     audited: bool = False
     # A logged ``open``: its stop-signal handling (``gateway.stop_signals``).
     signals: RunSignals | None = None
+    # ``focus``: the action decided, for its log record (``switched`` until one is decided).
+    focus_action: focus_cmd.Action = "switched"
 
     def socket_path(self) -> str | None:
         """The resolved server's socket path; None before step 2 resolved it."""
@@ -105,11 +109,17 @@ class Context:
                     self.clock.now(),
                     event="warning",
                     result="warning",
-                    id=self.open_id,
+                    id=self.logged_id(),
                     socket_path=self.socket_path(),
                     message=message,
                 )
             )
+
+    def logged_id(self) -> str | None:
+        """The id a log record names: ``open``'s generated id, else the resolved pane's."""
+        if self.open_id is not None:
+            return self.open_id
+        return None if self.pane is None else self.pane.id
 
     def log(self, record: dict[str, Any]) -> None:
         """Append a ``log.jsonl`` record. One that cannot be written only warns: the action
@@ -720,8 +730,10 @@ def open_pane(args: argparse.Namespace, ctx: Context) -> Result:
         open_cmd.record(
             backend, ctx.gateway, ctx.server.socket_path, created, ctx.open_id, query, ctx.warn
         )
-        # TODO(#24): step 8, --focus.
-        result = _opened(ctx, backend, created, created_at)
+        result, opened = _opened(ctx, backend, created, created_at)
+        # Step 8: focus without attaching (`open` never blocks); the outcome is `focused`.
+        if args.focus and opened is not None:
+            result.data["focused"] = _focus_opened(ctx, backend, opened)
         _audit_open(args, ctx, result.data)
     # Step 9: the post-open hooks, the log record and the output.
     run_post_open_hooks(args, ctx, result.data)
@@ -887,10 +899,13 @@ def _open_stopped(args: argparse.Namespace, ctx: Context, stop: BaseException) -
     ctx.log(_open_record(args, ctx, result="error", exit_code=128 + signum, message=message))
 
 
-def _opened(ctx: Context, backend: Backend, created: Created, created_at: str) -> Result:
-    """The ``open`` output, from a read after step 6: the pane object, or, if the pane is no
-    longer there, ``state: gone`` with the last known values (interface.md ``open``). A read
-    that fails also reports ``state: gone``, with a warning."""
+def _opened(
+    ctx: Context, backend: Backend, created: Created, created_at: str
+) -> tuple[Result, ManagedPane | None]:
+    """The ``open`` output, from a read after step 6, and the pane read: the pane object, or,
+    if the pane is no longer there, ``state: gone`` with the last known values (interface.md
+    ``open``) and no pane. A read that fails also reports ``state: gone``, with a warning.
+    ``focused`` is false until step 8 sets it."""
     assert ctx.plan is not None and ctx.open_id is not None and ctx.selection is not None
     socket_path = _socket_path(ctx)
     pane: ManagedPane | None = None
@@ -929,13 +944,134 @@ def _opened(ctx: Context, backend: Backend, created: Created, created_at: str) -
             "exit_signal": None,
             "keep_on_exit": ctx.plan.keep_on_exit,
         }
-    # TODO(#24): `focused` reports the outcome of --focus (step 8).
     data["focused"] = False
     data["decision_ids"] = list(ctx.decision_ids)
-    return Result(data, ctx.open_id)
+    return Result(data, ctx.open_id), pane
 
 
-COMMAND_STEPS = {"show": show, "exists": exists, "list": list_panes, "open": open_pane}
+def _focus_opened(ctx: Context, backend: Backend, pane: ManagedPane) -> bool:
+    """Open order step 8: switch a client by the rules of `focus`, never attaching. Whether a
+    client was switched; a failure (no client, a tmux error) is a warning and leaves the open
+    in place (interface.md "Open order")."""
+    assert ctx.tmux is not None
+    try:
+        where = focus_cmd.caller(ctx.environ, _socket_path(ctx), ctx.gateway)
+        decision = focus_cmd.decide(
+            backend, pane, where, client=None, attach_ok=False, tmux_bin=ctx.tmux.path
+        )
+        assert decision.client is not None
+        backend.switch_client(decision.client, pane.pane_id, pane.id)
+    except TermctlError as err:
+        ctx.warn(f"could not focus pane {pane.id}: {err.message}")
+        return False
+    return True
+
+
+def focus(args: argparse.Namespace, ctx: Context) -> Result:
+    """`focus` after id resolution: decide (steps 1 to 4), then switch the client or attach.
+    A real run logs its record before it switches or execs; ``_logged_focus`` logs a
+    failure."""
+    assert ctx.pane is not None and ctx.tmux is not None
+    pane, socket_path = ctx.pane, _socket_path(ctx)
+    backend = connect(ctx)
+    if backend is None:
+        raise TermctlError("not_found", f"managed pane {pane.id} is gone (no server running)")
+    attach_ok = (
+        args.client is None
+        and not args.no_attach
+        and ctx.gateway.stdin_isatty()
+        and ctx.gateway.stderr_isatty()
+    )
+    decision = focus_cmd.decide(
+        backend,
+        pane,
+        focus_cmd.caller(ctx.environ, socket_path, ctx.gateway),
+        client=args.client,
+        attach_ok=attach_ok,
+        tmux_bin=ctx.tmux.path,
+    )
+    ctx.focus_action = decision.action
+    data = focus_cmd.output(pane, decision, socket_path, dry_run=bool(args.dry_run))
+    if decision.argv is None:
+        assert decision.client is not None
+        if not args.dry_run:
+            backend.switch_client(decision.client, pane.pane_id, pane.id)
+            ctx.log(_focus_record(ctx, result="ok", exit_code=0))
+        return Result(data, decision.client)
+    if args.dry_run:
+        return Result(data, shlex.join(decision.argv))
+    # An attach is logged before the exec (interface.md "Audit and log"); with --json the
+    # caller execs the argv itself, with its own environment.
+    ctx.log(_focus_record(ctx, result="ok", exit_code=0))
+    if ctx.out.json:
+        return Result(data, "")
+    ctx.out.flush()
+    try:
+        # The caller's unfiltered environment: it is the user's own terminal, and -E keeps
+        # that environment out of the session.
+        ctx.gateway.exec_replace(decision.argv, ctx.environ)
+    except (OSError, ValueError) as exc:
+        reason = exc.strerror if isinstance(exc, OSError) and exc.strerror else str(exc)
+        raise TermctlError(
+            "attach_failed",
+            f"cannot run {validate.show(decision.argv[0], 200)}: {reason}",
+            details={"socket_path": socket_path},
+        ) from None
+
+
+def _focus_record(
+    ctx: Context,
+    *,
+    result: str,
+    exit_code: int,
+    message: str | None = None,
+    details: dict[str, Any] | None = None,
+) -> dict[str, Any]:
+    """The ``log.jsonl`` record of this ``focus``; ``action`` is the action decided, or
+    ``switched`` when it failed before one was."""
+    return jsonlog.log_record(
+        ctx.clock.now(),
+        event="focus",
+        result=result,
+        id=ctx.logged_id(),
+        socket_path=ctx.socket_path(),
+        exit_code=exit_code,
+        message=message,
+        details=details,
+        action=ctx.focus_action,
+    )
+
+
+def _logged_focus(args: argparse.Namespace, ctx: Context) -> Result:
+    """``focus`` past step 1, not a dry run: every outcome gets a ``log.jsonl`` record (the
+    success record is written by ``focus`` itself, before it switches or execs)."""
+    ctx.logged = True
+    try:
+        return _resolve_and_run(args, ctx)
+    except TermctlError as err:
+        ctx.log(
+            _focus_record(
+                ctx,
+                result="error",
+                exit_code=err.exit_code,
+                message=err.message,
+                details=err.details,
+            )
+        )
+        raise
+    except Exception as exc:
+        err = internal_error(exc)
+        ctx.log(_focus_record(ctx, result="error", exit_code=err.exit_code, message=err.message))
+        raise err from exc
+
+
+COMMAND_STEPS = {
+    "show": show,
+    "exists": exists,
+    "list": list_panes,
+    "open": open_pane,
+    "focus": focus,
+}
 
 
 def run_command(args: argparse.Namespace, ctx: Context) -> Result:
@@ -946,7 +1082,7 @@ def run_command(args: argparse.Namespace, ctx: Context) -> Result:
     if args.command == "placements":
         labels = validate.parse_labels(args.labels) if args.labels else None
         return placement.report(ctx.config, labels)
-    # TODO: each remaining command lands in its own issue (#19-#24).
+    # TODO: each remaining command lands in its own issue (#19-#23).
     raise TermctlError("internal", f"{PROG} {args.command} is not implemented yet")
 
 
@@ -956,6 +1092,8 @@ def dispatch(args: argparse.Namespace, ctx: Context) -> Result:
     load_config(args, ctx)
     if args.command == "open" and not args.dry_run:
         return _logged_open(args, ctx)
+    if args.command == "focus" and not args.dry_run:
+        return _logged_focus(args, ctx)
     return _resolve_and_run(args, ctx)
 
 

@@ -20,7 +20,7 @@ Every argument termctl passes to tmux is built here, so the rules cannot be skip
    the window containing it, and its elements are quoted by ``quote``. ``guard_outcome``
    reads the result.
 
-Targets are exact ids (``=S:``, ``@N``, ``%N``, ``=S:@W.%P``); ``Target`` checks that grammar
+Targets are exact ids (``=S:``, ``@N``, ``%N``, ``=$N:@W.%P``); ``Target`` checks that grammar
 however it is built. ``Format`` values come only from this module's factories. Value-taking
 flags (``-t``, ``-e``, ``-F``, ``-f``, ``-n``, ``-c``, ``-s`` everywhere, and per command
 those such as ``display -d``, ``select-pane -T`` and ``new-session -x``) are refused as bare
@@ -100,8 +100,9 @@ _TARGET_GRAMMARS: dict[str, re.Pattern[str]] = {
     "pane": _PANE_ID,
     "window": _WINDOW_ID,
     "session": re.compile(r"=[A-Za-z0-9_-]{1,64}:"),
-    "pane_in_session": re.compile(r"=[A-Za-z0-9_-]{1,64}:@[0-9]+\.%[0-9]+"),
+    "pane_in_session": re.compile(r"=\$[0-9]+:@[0-9]+\.%[0-9]+"),
 }
+_SESSION_ID = re.compile(r"\$[0-9]+")
 _TERMCTL_ID = re.compile(r"tc-[a-z2-7]{8}")
 _ENV_NAME = re.compile(r"[A-Za-z_][A-Za-z0-9_]*")
 _CONTROL = re.compile(r"[\x00-\x1f\x7f-\x9f]")
@@ -248,7 +249,7 @@ TargetKind = Literal["pane", "window", "session", "pane_in_session"]
 
 @dataclass(frozen=True)
 class Target:
-    """An exact tmux target: ``%N``, ``@N``, ``=S:`` or ``=S:@W.%P``. Build it with ``pane``,
+    """An exact tmux target: ``%N``, ``@N``, ``=S:`` or ``=$N:@W.%P``. Build it with ``pane``,
     ``window``, ``session`` or ``pane_in_session``; any other text is refused."""
 
     text: str
@@ -285,16 +286,18 @@ def session(name: str) -> Target:
     return Target(f"={_fullmatch(_SESSION_NAME, name, 'session name')}:")
 
 
-def pane_in_session(name: str, window_id: str, pane_id: str) -> Target:
-    """``=S:@W.%P``: fails unless the pane is in that window and the window in that session
-    (spike F7)."""
-    # TODO(#24): this refuses session names outside the session grammar, which tmux may report
-    # for a session a user renamed (e.g. "my work"); focus will meet those. "$N:@W.%P" with the
-    # session id works for any name and still enforces containment (verified on tmux 3.5a).
-    _fullmatch(_SESSION_NAME, name, "session name")
+def pane_in_session(session_id: str, window_id: str, pane_id: str) -> Target:
+    """``=$N:@W.%P``: fails unless the pane is in that window and the window in that session
+    (spike F7).
+
+    The session is named by its id, not its name: a session a user renamed may have any name
+    (``my work``, one with characters tmux prints escaped, or ``$9``, which ``=$9`` would look
+    up as a session id), while the id is tmux's own and still enforces containment (#24;
+    checked on tmux 3.5a)."""
+    _fullmatch(_SESSION_ID, session_id, "session id")
     _fullmatch(_WINDOW_ID, window_id, "window id")
     _fullmatch(_PANE_ID, pane_id, "pane id")
-    return Target(f"={name}:{window_id}.{pane_id}")
+    return Target(f"={session_id}:{window_id}.{pane_id}")
 
 
 # --- one tmux command ---------------------------------------------------------------------------
@@ -1224,6 +1227,88 @@ def is_duplicate_session(result: subprocess.CompletedProcess[str], name: str) ->
 def is_session_missing(result: subprocess.CompletedProcess[str], name: str) -> bool:
     """Whether a command targeting ``=name:`` failed because no such session exists."""
     return _first_line_is(result, f"can't find session: {name}")
+
+
+# --- focus (interface.md `focus`) ---------------------------------------------------------------
+
+# One line per client: its name, last activity (seconds), and its session's id and current
+# window. A client attached to no session prints empty session and window fields.
+CLIENT_FORMAT = fields("client_name", "client_activity", "session_id", "window_id")
+_CLIENT_LINE = re.compile(r"(\S+) ([0-9]{1,20}) (\$[0-9]+) (@[0-9]+)")
+# The caller's own pane and its session (focus step 1).
+CALLER_FORMAT = fields("pane_id", "session_id")
+_CALLER_LINE = re.compile(r"(%[0-9]+) (\$[0-9]+)\n?")
+
+
+class ClientInfo(NamedTuple):
+    """A client attached to a session, as ``list-clients`` reported it."""
+
+    name: str
+    activity: int
+    session_id: str
+    window_id: str
+
+
+def list_clients() -> Invocation:
+    """``list-clients -F CLIENT_FORMAT``: every client of the server, read-only."""
+    return Invocation.of(command("list-clients").format("-F", CLIENT_FORMAT).build())
+
+
+def parse_clients(stdout: str) -> tuple[ClientInfo, ...]:
+    """The clients ``list_clients`` printed that termctl can name: a line that is not exactly
+    the format (a client attached to no session) or whose name breaks the ``--client`` grammar
+    (``switch-client -c`` could not name it safely) is left out."""
+    found: list[ClientInfo] = []
+    for line in stdout.split("\n"):
+        match = _CLIENT_LINE.fullmatch(line)
+        if match is None or not is_client(match.group(1)):
+            continue
+        name, activity, session_id, window_id = match.groups()
+        found.append(ClientInfo(name, int(activity), session_id, window_id))
+    return tuple(found)
+
+
+def caller_session(pane_id: str) -> Invocation:
+    """``display -p -t %N '#{pane_id} #{session_id}'``: the session of the caller's pane."""
+    return Invocation.of(
+        command("display").flag("-p").target(pane(pane_id)).format_arg(CALLER_FORMAT).build()
+    )
+
+
+def parse_caller_session(stdout: str, pane_id: str) -> str | None:
+    """The session id ``caller_session`` printed, or None unless it printed exactly that pane's
+    line (``display`` of a missing pane prints empty fields, spike E6)."""
+    match = _CALLER_LINE.fullmatch(stdout)
+    if match is None or match.group(1) != pane_id:
+        return None
+    return match.group(2)
+
+
+def switch_client(client: str, pane_id: str) -> Invocation:
+    """``switch-client -E -c CLIENT -t %N``: always a named client, never the client's
+    environment imported into the session (spike F1), and the pane id, which selects the
+    session, window and pane."""
+    return Invocation.of(
+        command("switch-client").flag("-E").client(client).target(pane(pane_id)).build()
+    )
+
+
+def attach_argv(
+    tmux_bin: str, socket_path: str, session_id: str, window_id: str, pane_id: str
+) -> list[str]:
+    """``<tmux_bin> -S <socket_path> attach -E -t '=$N:@W.%P'``: the 7-element command that
+    attaches a terminal with the pane selected (spike D2), failing unless the pane is still in
+    that window and session (spike F7), with ``-E`` keeping the attaching terminal's
+    environment out of the session (spike F1)."""
+    attach = (
+        command("attach").flag("-E").target(pane_in_session(session_id, window_id, pane_id)).build()
+    )
+    return Invocation.of(attach).argv(tmux_bin, socket_path)
+
+
+def is_client_missing(result: subprocess.CompletedProcess[str], name: str) -> bool:
+    """Whether ``switch-client -c name`` failed because no such client is attached."""
+    return _first_line_is(result, f"can't find client: {name}")
 
 
 # --- the runner ---------------------------------------------------------------------------------
