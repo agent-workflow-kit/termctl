@@ -45,12 +45,12 @@ class Run:
         json_mode: bool = True,
     ) -> None:
         if config is None:
-            environ = {"XDG_CONFIG_HOME": str(tmp_path / "no-config")}
+            environ = {"XDG_CONFIG_HOME": str(tmp_path / "no-config"), "PATH": "/usr/bin"}
         else:
             path = tmp_path / "config.yaml"
             text = config if isinstance(config, str) else yaml.safe_dump(config, sort_keys=False)
             path.write_text(text, encoding="utf-8")
-            environ = {}
+            environ = {"PATH": "/usr/bin"}  # where the fake gateway finds tmux
             argv = ["--config", str(path), *argv]
         self.selection: placement.Selection | None = None
 
