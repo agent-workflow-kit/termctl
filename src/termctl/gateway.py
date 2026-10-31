@@ -113,12 +113,15 @@ class GroupRun(NamedTuple):
 
 class ProcessHandle(Protocol):
     """A handle on one process, from ``Gateway.open_process``: on Linux a pidfd, which keeps
-    naming that process even if it exits and its PID is reused; on macOS only the PID, so the
-    caller checks the start time immediately before each signal (``procs.signal_sequence``)."""
+    naming that process even if it exits and its PID is reused; on macOS a kqueue
+    ``NOTE_EXIT`` watch registered on the PID, which sees that process's exit, and the PID,
+    which ``send_signal`` signals only while the watch has not seen it exit (a reuse can then
+    be signaled only if the process exits and its PID is reused between that look and the
+    ``kill``). The caller also checks the start time before each signal
+    (``procs.signal_sequence``)."""
 
     def exited(self) -> bool:
-        """Whether the process is known to have exited (a zombie included). False when the
-        handle cannot tell (macOS); the caller also reads the process."""
+        """Whether the process is known to have exited (a zombie included)."""
         ...
 
     def send_signal(self, signum: int) -> bool:
@@ -280,7 +283,9 @@ class Gateway(Protocol):
     def socket_peer_pid(self, path: str) -> int:
         """Linux: connect to the Unix socket ``path`` and return the listener's PID from
         ``SO_PEERCRED``, as the kernel translates it into termctl's PID namespace (0 when the
-        listener is not visible there). Sends nothing. Raises ``OSError`` if it cannot."""
+        listener is not visible there). Sends nothing. Raises ``OSError`` if it cannot, and on
+        any other system (``SO_PEERCRED`` is Linux's; elsewhere it is missing or has another
+        layout), so the caller's check fails closed there."""
         ...
 
     def write_tty(self, path: str, data: bytes) -> None:
@@ -293,8 +298,10 @@ class Gateway(Protocol):
 
     def open_process(self, pid: int) -> ProcessHandle | None:
         """A handle on process ``pid`` (``close --force``), or None when no such process
-        exists. Linux: ``pidfd_open``; raises ``OSError`` when the kernel or Python has no
-        pidfd (the caller then sends no signal). macOS: a handle on the PID alone."""
+        exists (on macOS also when it is a zombie). Linux: ``pidfd_open``; macOS: a kqueue
+        ``NOTE_EXIT`` watch on the PID. Raises ``OSError`` when no handle can be opened (no
+        pidfd in the kernel or Python, no kqueue, the watch refused); the caller then sends
+        no signal."""
         ...
 
     def proc_is_own_namespace(self) -> bool:
@@ -537,6 +544,10 @@ class SystemGateway:
             return None
 
     def socket_peer_pid(self, path: str) -> int:
+        # Linux's struct ucred is (pid, uid, gid); OpenBSD's SO_PEERCRED is (uid, gid, pid)
+        # and macOS has none: anywhere else the check cannot be made.
+        if sys.platform != "linux" or not hasattr(socket, "SO_PEERCRED"):
+            raise OSError(errno.ENOPROTOOPT, f"SO_PEERCRED is not available on {sys.platform}")
         with socket.socket(socket.AF_UNIX, socket.SOCK_STREAM) as sock:
             sock.settimeout(SOCKET_TIMEOUT)
             sock.connect(path)
@@ -563,8 +574,8 @@ class SystemGateway:
             signal.pthread_sigmask(signal.SIG_SETMASK, previous)
 
     def open_process(self, pid: int) -> ProcessHandle | None:
-        if sys.platform == "darwin":  # pragma: no cover - macOS only
-            return _PidHandle(pid)
+        if self.platform() == "darwin":
+            return _PidHandle.open(pid)
         try:
             fd = _pidfd_open(pid)
         except ProcessLookupError:
@@ -675,20 +686,86 @@ class _PidfdHandle:
             os.close(fd)
 
 
-# TODO(#26): macOS signals a bare PID. The start time is checked through ps (one-second
-# resolution) just before os.kill, so a PID reused between that check and the kill could be
-# signaled (docs/design.md "Implementation notes", interface.md "Residual risks"); #26 owns the
-# macOS signaling path and its verification.
-class _PidHandle:  # pragma: no cover - macOS only
-    """macOS: the PID alone. The caller checks the start time just before each signal."""
+def _kqueue_api() -> Any:
+    """The module with ``kqueue`` (``select`` on macOS and the BSDs), or None where there is
+    none (Linux). Tests substitute an emulation."""
+    return select if hasattr(select, "kqueue") else None
 
-    def __init__(self, pid: int) -> None:
-        self._pid = pid
+
+# os.waitid with WNOWAIT: Linux, and macOS from Python 3.13.
+_HAS_WAITID = hasattr(os, "waitid") and hasattr(os, "WNOWAIT")
+
+
+class _KqueueExit:
+    """A kqueue ``EVFILT_PROC``/``NOTE_EXIT`` watch on one process (macOS). The kernel ties
+    the registration to the process that has the PID when it is made, so the watch fires
+    when that process exits, never for a later process given the same PID.
+
+    Raises ``ProcessLookupError`` when no such process exists (the kernel refuses to watch a
+    zombie too) and ``OSError`` for any other failure, such as no kqueue on this system."""
+
+    def __init__(self, pid: int, api: Any = None) -> None:
+        api = _kqueue_api() if api is None else api
+        if api is None:
+            raise OSError(errno.ENOSYS, "kqueue is not available on this system")
+        if not 1 <= pid <= _PID_T_MAX:
+            raise ProcessLookupError(errno.ESRCH, f"no process can have PID {pid}")
+        self._exited = False
+        self._kqueue: Any = api.kqueue()
+        event = api.kevent(
+            pid,
+            filter=api.KQ_FILTER_PROC,
+            flags=api.KQ_EV_ADD | api.KQ_EV_ONESHOT,
+            fflags=api.KQ_NOTE_EXIT,
+        )
+        try:
+            self._kqueue.control([event], 0, 0)
+        except BaseException:
+            self.close()
+            raise
 
     def exited(self) -> bool:
-        return False
+        if not self._exited:
+            if self._kqueue is None:
+                raise ValueError("the process watch is closed")
+            self._exited = bool(self._kqueue.control(None, 1, 0))
+        return self._exited
+
+    def close(self) -> None:
+        if self._kqueue is not None:
+            kqueue, self._kqueue = self._kqueue, None
+            kqueue.close()
+
+
+class _PidHandle:
+    """macOS: a kqueue exit watch registered on the PID, then the PID. ``send_signal`` looks
+    at the watch immediately before each ``kill`` and never signals once it has fired, so a
+    reused PID can be signaled only if the process exits and its PID is reused between that
+    look and the ``kill`` (interface.md "Residual risks"). The caller opens the handle before
+    it verifies the start time, so the watch names the process verified."""
+
+    def __init__(self, pid: int, watch: _KqueueExit) -> None:
+        self._pid = pid
+        self._watch: _KqueueExit | None = watch
+
+    @classmethod
+    def open(cls, pid: int, api: Any = None) -> _PidHandle | None:
+        """The handle, or None when no such process exists or it is a zombie; raises
+        ``OSError`` when the watch cannot be registered."""
+        try:
+            watch = _KqueueExit(pid, api)
+        except ProcessLookupError:
+            return None
+        return cls(pid, watch)
+
+    def exited(self) -> bool:
+        if self._watch is None:
+            raise ValueError("the process handle is closed")
+        return self._watch.exited()
 
     def send_signal(self, signum: int) -> bool:
+        if self.exited():
+            return False
         try:
             os.kill(self._pid, signum)
         except ProcessLookupError:
@@ -696,7 +773,9 @@ class _PidHandle:  # pragma: no cover - macOS only
         return True
 
     def close(self) -> None:
-        pass
+        if self._watch is not None:
+            watch, self._watch = self._watch, None
+            watch.close()
 
 
 def _restore_exec_signals() -> list[tuple[int, Any]]:
@@ -1040,15 +1119,15 @@ class _LeaderExit:
     group it leads) stays reserved until the caller reaps it.
 
     ``os.waitid`` with ``WNOWAIT`` where Python has it (Linux, and macOS from Python 3.13);
-    else a kqueue ``NOTE_EXIT`` filter (macOS before Python 3.13). Where neither works, or
-    setting it up fails, ``available`` is False and the exit is only seen when the streams
-    close. Never raises.
+    else a kqueue ``NOTE_EXIT`` watch (``_KqueueExit``; macOS before Python 3.13). Where
+    neither works, or setting it up fails, ``available`` is False and the exit is only seen
+    when the streams close. Never raises.
     """
 
     def __init__(self, pid: int) -> None:
         self._pid = pid
         self._exited = False
-        self._kqueue: Any = None
+        self._kqueue: _KqueueExit | None = None
         self.available = False
         try:
             self._watch()
@@ -1057,26 +1136,19 @@ class _LeaderExit:
             self.available = False
 
     def _watch(self) -> None:
-        self.available = hasattr(os, "waitid") and hasattr(os, "WNOWAIT")
-        if not self.available and sys.platform == "darwin":  # pragma: no cover - macOS only
-            self._kqueue = select.kqueue()
-            event = select.kevent(
-                self._pid,
-                filter=select.KQ_FILTER_PROC,
-                flags=select.KQ_EV_ADD | select.KQ_EV_ONESHOT,
-                fflags=select.KQ_NOTE_EXIT,
-            )
+        self.available = _HAS_WAITID
+        if not self.available and _kqueue_api() is not None:
             try:
-                self._kqueue.control([event], 0, 0)
-                self.available = True
-            except ProcessLookupError:  # already a zombie
-                self._exited = self.available = True
+                self._kqueue = _KqueueExit(self._pid)
+            except ProcessLookupError:  # already a zombie: the kernel refuses to watch it
+                self._exited = True
+            self.available = True
 
     def exited(self) -> bool:
         if self._exited or not self.available:
             return self._exited
-        if self._kqueue is not None:  # pragma: no cover - macOS only
-            self._exited = bool(self._kqueue.control(None, 1, 0))
+        if self._kqueue is not None:
+            self._exited = self._kqueue.exited()
             return self._exited
         try:
             result = os.waitid(os.P_PID, self._pid, os.WEXITED | os.WNOHANG | os.WNOWAIT)
@@ -1086,7 +1158,7 @@ class _LeaderExit:
         return self._exited
 
     def close(self) -> None:
-        if self._kqueue is not None:  # pragma: no cover - macOS only
+        if self._kqueue is not None:
             self._kqueue.close()
             self._kqueue = None
 

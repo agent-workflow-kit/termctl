@@ -40,7 +40,14 @@ _START = re.compile(r"[0-9]{1,20}")
 # Linux: Z zombie; X and x dead (being reaped).
 _LINUX_GONE_STATES = frozenset({"Z", "X", "x"})
 _LINUX_STATE = re.compile(r"[A-Za-z]")
-_LSTART_FORMAT = "%a %b %d %H:%M:%S %Y"
+# ps's lstart in the C locale: strftime("%c"), "%a %b %e %H:%M:%S %Y" ("Fri Oct  2 09:05:01
+# 2026"). Parsed here, not with strptime, whose %a and %b follow termctl's own LC_TIME.
+_LSTART = re.compile(
+    r"(Mon|Tue|Wed|Thu|Fri|Sat|Sun) (Jan|Feb|Mar|Apr|May|Jun|Jul|Aug|Sep|Oct|Nov|Dec) "
+    r"([0-9]{1,2}) ([0-9]{2}):([0-9]{2}):([0-9]{2}) ([0-9]{4})"
+)
+_MONTHS = ("Jan", "Feb", "Mar", "Apr", "May", "Jun", "Jul", "Aug", "Sep", "Oct", "Nov", "Dec")
+_WEEKDAYS = ("Mon", "Tue", "Wed", "Thu", "Fri", "Sat", "Sun")
 
 
 class ProcessError(Exception):
@@ -103,7 +110,8 @@ def _read_proc(gateway: Gateway, pid: int) -> Process | None:
 
 
 def _read_ps(gateway: Gateway, pid: int) -> Process | None:
-    """macOS. Not exercised by CI (architecture: macOS is checked manually; #26)."""
+    """macOS. CI runs it only against scripted ``ps`` output; design.md "macOS checklist"
+    checks it against the real ``ps``."""
     argv = [PS, "-o", "ppid=", "-o", "stat=", "-o", "lstart=", "-p", str(pid)]
     try:
         result = gateway.run(argv, timeout=PS_TIMEOUT, env=PS_ENV)
@@ -119,14 +127,37 @@ def _read_ps(gateway: Gateway, pid: int) -> Process | None:
     ppid, stat, lstart = tokens[0], tokens[1], " ".join(tokens[2:])
     if not _NUMBER.fullmatch(ppid):
         raise ProcessError(f"unexpected output of {PS} for process {pid}")
-    try:
-        started = datetime.strptime(lstart, _LSTART_FORMAT).replace(tzinfo=UTC)
-    except ValueError:
-        raise ProcessError(f"unexpected start time from {PS} for process {pid}") from None
-    start = str(int(started.timestamp()))
-    if not _START.fullmatch(start):  # before the epoch: outside the @termctl_pid_start grammar
+    start = _lstart_seconds(lstart)
+    if start is None:
         raise ProcessError(f"unexpected start time from {PS} for process {pid}")
     return Process(ppid=int(ppid), start=start, zombie=stat.startswith("Z"))
+
+
+def _lstart_seconds(lstart: str) -> str | None:
+    """``lstart`` (UTC, C locale, its blanks collapsed to one) in seconds since the epoch, or
+    None when it is not such a time: an impossible date or time, a weekday that does not
+    match the date, or a time before the epoch (outside the ``@termctl_pid_start``
+    grammar)."""
+    match = _LSTART.fullmatch(lstart)
+    if match is None:
+        return None
+    weekday, month, day, hour, minute, second, year = match.groups()
+    try:
+        started = datetime(
+            int(year),
+            _MONTHS.index(month) + 1,
+            int(day),
+            int(hour),
+            int(minute),
+            int(second),
+            tzinfo=UTC,
+        )
+    except ValueError:
+        return None
+    if _WEEKDAYS[started.weekday()] != weekday:
+        return None
+    start = str(int(started.timestamp()))
+    return start if _START.fullmatch(start) else None
 
 
 # --- close --force: proving the process and signaling it ---------------------------------------
