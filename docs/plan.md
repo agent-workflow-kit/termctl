@@ -133,6 +133,29 @@ Interim state: the CLI `open` runs every step: pre-open hooks, creation, PID rec
 
 **Status**: In Progress
 
+## 1.0 readiness
+
+Criteria from the version roadmap below, with their state. This list is the record: update it as blockers close. 1.0 is declared only when every row is met.
+
+| # | Criterion | State |
+|---|---|---|
+| 1 | Stage 1 to 4 features implemented (every command in [interface.md](interface.md#commands)) | Met (PRs open; merge pending) |
+| 2 | `make verify-floor` passes on tmux 3.2a, and `make verify` on the CI tmux | Met in the `tmux (floor)` and `tmux (latest)` CI jobs (#25) |
+| 3 | The agent-spawn flow runs end to end against real tmux using only the CLI | Met: `tests/test_agent_spawn_flow_integration.py` (#27) |
+| 4 | macOS checklist run on a Mac and recorded in [design.md](design.md#macos-checklist) | **Blocked:** needs a human run on a Mac; the results table is empty (#26) |
+| 5 | The `macos` CI job is green | Pending its first runs; not a required check by design |
+| 6 | README matches the implemented behavior | Met (#28): examples run against the real CLI on a private server |
+| 7 | agent-spawn has used termctl for its v1 ticket slice without interface changes | **Blocked:** outside this repository; needs agent-spawn's v1 slice to ship on termctl |
+| 8 | The interface is declared stable by a deliberate breaking-change commit (architecture section 18.3) | **Blocked** on 4 and 7; `docs/interface.md` still says `0.1.0-design` and the version is not hand-edited |
+
+Before the declaring commit also:
+
+- Maintainer: add `tmux (floor)` and `tmux (latest)` as required checks in branch protection (they are not part of `ci / ci-ok`); `macos` stays optional.
+- Maintainer: merge the stacked implementation PRs in order; the release job owns the changelog and version.
+- Update `awkit-docs/interface-registry.md` with the declaration (CLAUDE.md rule).
+- Open spec questions to settle or knowingly carry into 1.0 (each is also a candidate for a post-1.0 additive change): config file ownership checks; `--override-escalation` passing on any TTY even with an `auto:` actor; `target: pane` placements and markers on shared-window panes (reserved, 1.x: #29, #30).
+- Residual risks in [interface.md](interface.md#residual-risks) are accepted as written; re-read them once before declaring.
+
 ## Version roadmap
 
 - **0.1** (stage 1): read path and safety foundations (`show`, `exists`, `list`, `placements`).
