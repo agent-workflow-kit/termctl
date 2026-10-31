@@ -1193,6 +1193,8 @@ VALID: list[dict[str, Any]] = [
     {"rules": [{"match": {"kind.sub-x": "A-z0.9:/#@+=,-", "e": ""}, "placement": "default"}]},
     {"hooks": {"pre-open": [{"cmd": "x", "timeout": 1}]}},
     {"hooks": {"post-open": [{"cmd": "x", "timeout": 1.0}]}},
+    {"hooks": {"pre-open": [{"cmd": "x", "timeout": 600}]}},
+    {"hooks": {"post-close": [{"cmd": "x", "timeout": 600.0}]}},
     {"placements": {"a": {"max_panes": 2.0}}},
 ]
 
@@ -1243,6 +1245,8 @@ INVALID: list[tuple[dict[str, Any], str]] = [
     ({"hooks": {"pre-open": [{"cmd": ""}]}}, "hooks.pre-open[0].cmd"),
     ({"hooks": {"post-open": [{"cmd": "x", "timeout": 0}]}}, "hooks.post-open[0].timeout"),
     ({"hooks": {"pre-open": [{"cmd": "x", "timeout": 1.5}]}}, "hooks.pre-open[0].timeout"),
+    ({"hooks": {"pre-open": [{"cmd": "x", "timeout": 601}]}}, "hooks.pre-open[0].timeout"),
+    ({"hooks": {"post-open": [{"cmd": "x", "timeout": 10**30}]}}, "hooks.post-open[0].timeout"),
     ({"hooks": {"post-open": [{"cmd": "x", "async": "true"}]}}, "hooks.post-open[0].async"),
     ({"hooks": {"post-close": [{"cmd": "x", "env": {}}]}}, "hooks.post-close[0].env"),
     ({"hooks": {"post-open": [{"cmd": "x", "async_": True}]}}, "hooks.post-open[0].async_"),

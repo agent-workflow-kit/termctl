@@ -208,7 +208,9 @@
         "timeout": {
           "type": "integer",
           "minimum": 1,
-          "default": 30
+          "maximum": 600,
+          "default": 30,
+          "description": "Seconds (at most 600). On timeout termctl kills the hook's process group; a pre-hook timeout counts as a veto."
         },
         "async": {
           "type": "boolean",
@@ -230,7 +232,9 @@
         "timeout": {
           "type": "integer",
           "minimum": 1,
-          "default": 30
+          "maximum": 600,
+          "default": 30,
+          "description": "Seconds (at most 600). On timeout termctl kills the hook's process group; a pre-hook timeout counts as a veto."
         }
       },
       "additionalProperties": false,

@@ -3,8 +3,34 @@
 from __future__ import annotations
 
 import subprocess
-from collections.abc import Mapping
+from collections.abc import Callable, Mapping
+from dataclasses import dataclass
 from datetime import UTC, datetime, timedelta
+
+from termctl.gateway import GroupRun
+
+
+@dataclass
+class GroupCall:
+    """One ``run_group`` or ``spawn_group`` call as the fake saw it."""
+
+    argv: list[str]
+    stdin: bytes
+    env: dict[str, str]
+    timeout: float | None
+    stdout_limit: int | None
+    stderr_limit: int | None
+    spawned: bool
+
+
+# A scripted group run: a fixed result, an exception to raise, or a function of the call.
+GroupResponse = GroupRun | OSError | Callable[[GroupCall], GroupRun]
+
+
+def group_run(
+    returncode: int | None = 0, stdout: bytes = b"", stderr: bytes = b"", pgid: int = 4242
+) -> GroupRun:
+    return GroupRun(pgid, returncode, stdout, stderr, False, False)
 
 
 class FakeGateway:
@@ -32,6 +58,9 @@ class FakeGateway:
         self.tty = tty
         self.user = user
         self.dir_checks: list[str] = []
+        # run_group and spawn_group answers, keyed by argv.
+        self.group_responses: dict[tuple[str, ...], GroupResponse] = {}
+        self.group_calls: list[GroupCall] = []
 
     def run(
         self,
@@ -46,6 +75,38 @@ class FakeGateway:
             return self.responses[tuple(argv)]
         except KeyError:
             raise AssertionError(f"unexpected gateway call: {argv!r}") from None
+
+    def run_group(
+        self,
+        argv: list[str],
+        *,
+        stdin: bytes,
+        env: Mapping[str, str],
+        timeout: float,
+        stdout_limit: int,
+        stderr_limit: int,
+    ) -> GroupRun:
+        call = GroupCall(list(argv), stdin, dict(env), timeout, stdout_limit, stderr_limit, False)
+        self.group_calls.append(call)
+        response = self._group_response(argv)
+        if isinstance(response, OSError):
+            raise response
+        if isinstance(response, GroupRun):
+            return response
+        return response(call)
+
+    def spawn_group(self, argv: list[str], *, stdin: bytes, env: Mapping[str, str]) -> int:
+        self.group_calls.append(GroupCall(list(argv), stdin, dict(env), None, None, None, True))
+        response = self._group_response(argv)
+        if isinstance(response, OSError):
+            raise response
+        return 4343
+
+    def _group_response(self, argv: list[str]) -> GroupResponse:
+        try:
+            return self.group_responses[tuple(argv)]
+        except KeyError:
+            raise AssertionError(f"unexpected gateway group call: {argv!r}") from None
 
     def current_dir(self) -> str:
         if self.cwd is None:
