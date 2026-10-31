@@ -26,7 +26,8 @@ Status: planned, 2026-10-30. Implements [interface.md](interface.md) (normative)
 | `jsonlog.py` | 0 | `log.jsonl` (level derived from result) and `audit.jsonl` |
 | `lock.py` | 0 | per-server `flock` with 10 s wait, canonical-path hashing |
 | `hooks.py` | 0 | hook execution (process group, timeout, stdin payload, env vars, decision id parsing and validation), `--hook` and `--override-escalation` handling |
-| `tmux_backend.py` | 1 | tmux argument builder (all tmux argument rules), guarded-write wrapper, version check, socket resolution and safety checks, command chains |
+| `tmux_backend.py` | 1 | tmux argument builder (all tmux argument rules), guarded-write wrapper, version check, command chains |
+| `tmux_socket.py` | 1 | server selection, the canonical socket path, socket safety checks |
 | `panes.py` | 1 | the single `list-panes -a` read, field sanitizing, ownership check, option validation, deduplication, in-process filters |
 | `backend.py` | 1 | the `Backend` protocol the commands use |
 | `placement.py` | 2 | placement and rule resolution, inheritance from `default`, `not_supported` |

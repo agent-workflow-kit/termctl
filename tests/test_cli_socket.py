@@ -165,7 +165,7 @@ def test_relative_socket_over_100_bytes_after_resolution_is_usage() -> None:
     assert (code, envelope["error"]["code"]) == (2, "usage")
 
 
-def test_unsafe_socket_message_escapes_control_characters() -> None:
+def test_control_characters_in_socket_flag_exit_2_before_checks() -> None:
     files = {"/": directory(), "/s\x1b[2J": directory(0o777)}
     code, _, stderr = run(["--socket", "/s\x1b[2J/x", "list"], FakeGateway(files=files))
     # The grammar rejects control characters in the path as given (exit 2), before any check.

@@ -66,6 +66,10 @@ class Gateway(Protocol):
         missing or cannot be resolved."""
         ...
 
+    def read_link(self, path: str) -> str:
+        """The target of the symlink ``path``, as stored; raises ``OSError``."""
+        ...
+
 
 class Clock(Protocol):
     def now(self) -> datetime:
@@ -127,6 +131,9 @@ class SystemGateway:
 
     def real_path(self, path: str) -> str:
         return os.path.realpath(path, strict=True)
+
+    def read_link(self, path: str) -> str:
+        return os.readlink(path)
 
 
 class SystemClock:

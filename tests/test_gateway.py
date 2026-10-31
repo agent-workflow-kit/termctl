@@ -127,3 +127,14 @@ def test_system_gateway_real_path_is_strict(tmp_path: Path) -> None:
         gateway.real_path(str(tmp_path / "dangling"))
     with pytest.raises(OSError):
         gateway.real_path(str(tmp_path / "missing" / ".."))
+
+
+def test_system_gateway_read_link(tmp_path: Path) -> None:
+    (tmp_path / "link").symlink_to("relative/target")
+    (tmp_path / "file").write_text("")
+    gateway = SystemGateway()
+    assert gateway.read_link(str(tmp_path / "link")) == "relative/target"
+    with pytest.raises(OSError):
+        gateway.read_link(str(tmp_path / "file"))
+    with pytest.raises(FileNotFoundError):
+        gateway.read_link(str(tmp_path / "missing"))

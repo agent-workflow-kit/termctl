@@ -413,6 +413,12 @@ def check_tmux(args: argparse.Namespace, ctx: Context) -> None:
     # TODO(#10): the tmux binary and version checks, before the socket checks.
     assert ctx.server is not None
     ctx.socket_present = tmux_socket.check(ctx.server, ctx.gateway)
+    # TODO(#14): open re-checks the socket right before connecting, creates the default
+    # directory (default form only, mode 0700), and exits 12 for an explicit path whose parent
+    # is missing.
+    # TODO(#12): list prints an empty list and exists answers without a server.
+    # TODO(#11): a refused connection on an existing socket means no server; re-run the checks
+    # before connecting.
 
 
 def resolve_id(args: argparse.Namespace, ctx: Context) -> None:

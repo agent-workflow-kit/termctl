@@ -30,6 +30,8 @@ DEFAULT = "default"
 _GROUP_OTHER_WRITE = 0o022
 # tmux's own default directory rule, made stricter: no group write and no access by others.
 _DEFAULT_DIR_FORBIDDEN = 0o027
+# The most symlinks followed in one path, as the kernel's limit (Linux MAXSYMLINKS).
+_MAX_LINKS = 40
 
 
 @dataclass(frozen=True)
@@ -38,12 +40,16 @@ class Server:
 
     socket_path: str
     """Canonical; passed to tmux as ``-S`` and reported in every output."""
-    default_dir: str
-    """``${TMUX_TMPDIR:-/tmp}/tmux-<uid>`` with its ancestors canonical (its last component is
-    not resolved, so that a symlink there is caught by the checks)."""
+    default_dir: str | None
+    """``<tmpdir>/tmux-<uid>`` (``_tmpdir``) with its ancestors canonical (its last component
+    is not resolved, so that a symlink there is caught by the checks). None when the socket
+    was given as a path and ``TMUX_TMPDIR`` is invalid: then nothing is in default form."""
     default_form: bool
     """Whether the socket's parent is the default directory (safety rule 1)."""
     source: str
+    links: tuple[str, ...] = ()
+    """The symlinks followed while canonicalizing the socket path, in order; each is in a real
+    directory. The checks require them and their directories to be safe."""
 
 
 def socket_args(server: Server) -> list[str]:
@@ -69,48 +75,91 @@ def resolve(
     ``usage`` for the flag, ``config_invalid`` for config and the environment.
     """
     uid = gateway.real_uid()
-    raw_default_dir = _raw_default_dir(environ, uid)
-    default_dir = canonical_path(raw_default_dir, gateway)
-
     if flag is not None:
         source, value = FLAG, flag
     elif configured is not None:
         source, value = (ENV if ENV in environ else CONFIG), configured
-    elif environ.get(TMUX):
+    elif _inside_tmux(environ):
         source, value = TMUX, _tmux_socket(environ[TMUX])
     else:
         source, value = DEFAULT, DEFAULT_NAME
+    is_path = validate.is_socket_path(value)
 
-    if validate.is_socket_path(value):
+    # An invalid TMUX_TMPDIR matters only to a name (or the default): a path just has no
+    # default form.
+    try:
+        raw_default_dir: str | None = f"{_tmpdir(environ, gateway).rstrip('/')}/tmux-{uid}"
+    except TermctlError:
+        if not is_path:
+            raise
+        raw_default_dir = None
+    default_dir = None if raw_default_dir is None else canonical_path(raw_default_dir, gateway)
+
+    if is_path:
         given = value if value.startswith("/") else _join_cwd(value, gateway)
     else:
         given = f"{raw_default_dir}/{value}"
-    socket_path = canonical_path(given, gateway)
+    links: list[str] = []
+    socket_path = canonical_path(given, gateway, links)
     if problem := validate.socket_problem(socket_path, allow_relative=False):
         raise _invalid(source, f"socket path {validate.show(socket_path)}: {problem}", value)
-    default_form = posixpath.dirname(socket_path) == default_dir or _lexical(
-        posixpath.dirname(given)
-    ) == _lexical(raw_default_dir)
-    return Server(socket_path, default_dir, default_form, source)
+    default_form = _in_default_dir(socket_path, given, default_dir, gateway)
+    return Server(socket_path, default_dir, default_form, source, tuple(links))
 
 
-def _raw_default_dir(environ: Mapping[str, str], uid: int) -> str:
-    """``${TMUX_TMPDIR:-/tmp}/tmux-<uid>``. An empty ``TMUX_TMPDIR`` counts as unset, as in the
-    shell form and in tmux. It must be absolute and give a valid socket directory."""
-    tmpdir = environ.get("TMUX_TMPDIR") or DEFAULT_TMPDIR
-    path = f"{tmpdir.rstrip('/')}/tmux-{uid}"
-    problem = (
-        "must be an absolute path"
-        if not tmpdir.startswith("/")
-        else validate.socket_problem(f"{path}/{DEFAULT_NAME}", allow_relative=False)
-    )
-    if problem:
-        raise TermctlError(
-            "config_invalid",
-            f"invalid TMUX_TMPDIR {validate.show(tmpdir)}: {problem}",
-            details={"variable": "TMUX_TMPDIR"},
-        )
-    return path
+def _inside_tmux(environ: Mapping[str, str]) -> bool:
+    """Whether ``TMUX`` names a server. Empty, or starting with ``,`` (no socket path), it
+    counts as unset, as in tmux."""
+    value = environ.get(TMUX, "")
+    return value != "" and not value.startswith(",")
+
+
+def _tmpdir(environ: Mapping[str, str], gateway: Gateway) -> str:
+    """The directory of the default sockets, as tmux picks it: the first entry of the
+    ``:``-separated ``TMUX_TMPDIR`` that is an existing directory (symlinks followed), else
+    ``/tmp``. Empty entries are skipped. Raises ``config_invalid`` if any entry is relative or
+    has a control character, a ``,`` or invalid Unicode (termctl does not resolve a relative
+    entry, which tmux would)."""
+    value = environ.get("TMUX_TMPDIR", "")
+    entries = [entry for entry in value.split(":") if entry]
+    for entry in entries:
+        if problem := _tmpdir_problem(entry):
+            raise TermctlError(
+                "config_invalid",
+                f"invalid TMUX_TMPDIR {validate.show(value)}: {validate.show(entry)} {problem}",
+                details={"variable": "TMUX_TMPDIR"},
+            )
+    for entry in entries:
+        try:
+            if stat.S_ISDIR(gateway.lstat(gateway.real_path(entry)).mode):
+                return entry
+        except OSError:
+            continue
+    return DEFAULT_TMPDIR
+
+
+def _tmpdir_problem(entry: str) -> str | None:
+    if not entry.startswith("/"):
+        return "must be an absolute path"
+    if validate.has_control(entry):
+        return "must not contain control characters"
+    if validate.has_surrogate(entry):
+        return "must be valid Unicode text"
+    if "," in entry:
+        return "must not contain ','"
+    return None
+
+
+def _in_default_dir(socket_path: str, given: str, default_dir: str | None, gw: Gateway) -> bool:
+    """Whether the socket's parent is the default directory: its canonical parent is, or the
+    given parent canonicalized as the default directory is (last component unresolved), so a
+    symlinked default directory reached through an alias or ``..`` is still default form."""
+    if default_dir is None:
+        return False
+    if posixpath.dirname(socket_path) == default_dir:
+        return True
+    parent = posixpath.dirname(given)
+    return bool(_parts(parent)) and canonical_path(parent, gw) == default_dir
 
 
 def _tmux_socket(value: str) -> str:
@@ -158,11 +207,7 @@ def _parts(path: str) -> list[str]:
     return [part for part in path.split("/") if part not in ("", ".")]
 
 
-def _lexical(path: str) -> str:
-    return "/" + "/".join(_parts(path))
-
-
-def canonical_path(path: str, gateway: Gateway) -> str:
+def canonical_path(path: str, gateway: Gateway, links: list[str] | None = None) -> str:
     """The real path of the deepest existing ancestor directory of ``path``'s parent, joined
     with the rest of the parent's components and ``path``'s basename (never resolved).
 
@@ -170,26 +215,46 @@ def canonical_path(path: str, gateway: Gateway) -> str:
     followed, and ``..`` goes up from a real directory. The walk stops at the first component
     that is missing, cannot be read or resolved, or is not a directory; that component and the
     rest are kept as given (``..`` included), so the result names what the kernel would reach.
-    The safety checks then fail on, or find missing, the first kept component.
+    The safety checks then fail on, or find missing, the first kept component. Every symlink
+    followed for the components that were resolved is appended to ``links``.
     """
+    followed: list[str] = [] if links is None else links
     *parents, base = _parts(path)
     current = "/"
     for index, part in enumerate(parents):
         if part == "..":
             current = posixpath.dirname(current)
             continue
-        candidate = posixpath.join(current, part)
+        mark = len(followed)
         try:
-            info = gateway.lstat(candidate)
-            if stat.S_ISLNK(info.mode):
-                candidate = gateway.real_path(candidate)
-                info = gateway.lstat(candidate)
+            current = _enter(current, part, gateway, followed)
         except OSError:
+            del followed[mark:]
             return posixpath.join(current, *parents[index:], base)
-        if not stat.S_ISDIR(info.mode):
-            return posixpath.join(current, *parents[index:], base)
-        current = candidate
     return posixpath.join(current, base)
+
+
+def _enter(current: str, part: str, gateway: Gateway, followed: list[str]) -> str:
+    """The real directory that ``part`` of the real directory ``current`` leads to, following
+    symlinks one at a time and appending each to ``followed``. Raises ``OSError`` when a
+    component is missing, cannot be read, is not a directory, or there are too many links."""
+    candidate = posixpath.join(current, part)
+    info = gateway.lstat(candidate)
+    if stat.S_ISLNK(info.mode):
+        if len(followed) >= _MAX_LINKS:
+            raise OSError(errno.ELOOP, "too many levels of symbolic links", candidate)
+        followed.append(candidate)
+        target = gateway.read_link(candidate)
+        reached = "/" if target.startswith("/") else current
+        for step in _parts(target):
+            if step == "..":
+                reached = posixpath.dirname(reached)
+            else:
+                reached = _enter(reached, step, gateway, followed)
+        return reached
+    if not stat.S_ISDIR(info.mode):
+        raise NotADirectoryError(errno.ENOTDIR, "not a directory", candidate)
+    return candidate
 
 
 # --- safety checks ------------------------------------------------------------------------------
@@ -204,11 +269,14 @@ def check(server: Server, gateway: Gateway) -> bool:
     unsafe ancestor fails even when the socket is missing.
     """
     uid = gateway.real_uid()
+    for link in dict.fromkeys(server.links):
+        _check_link(server, link, uid, gateway)
     parent = posixpath.dirname(server.socket_path)
     info = _check_ancestors(server, parent, uid, gateway)
     if info is None:
         return False
     if server.default_form:
+        assert server.default_dir is not None
         info = _lstat(server, server.default_dir, gateway)
         if info is None:
             return False
@@ -242,6 +310,18 @@ def _check_ancestors(server: Server, parent: str, uid: int, gateway: Gateway) ->
     if info is not None:
         _check_ancestor(server, current, info, uid)
     return info
+
+
+def _check_link(server: Server, link: str, uid: int, gateway: Gateway) -> None:
+    """A symlink followed in resolution: still a symlink, owned by the uid or root, and its
+    directory and that directory's ancestors pass rule 4."""
+    info = _lstat(server, link, gateway)
+    if info is None or not stat.S_ISLNK(info.mode):
+        raise _unsafe(server, link, "it is no longer the symlink the socket path was resolved by")
+    if info.uid not in (uid, 0):
+        raise _unsafe(server, link, f"it is a symlink owned by uid {info.uid}, not {uid} or root")
+    if _check_ancestors(server, posixpath.dirname(link), uid, gateway) is None:
+        raise _unsafe(server, link, "its directory is missing")
 
 
 def _lstat(server: Server, path: str, gateway: Gateway) -> FileInfo | None:

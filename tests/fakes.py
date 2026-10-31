@@ -26,6 +26,11 @@ def regular_file(mode: int = 0o644, uid: int = UID) -> FileInfo:
     return FileInfo(mode=stat.S_IFREG | mode, uid=uid)
 
 
+def symlink(uid: int = UID) -> FileInfo:
+    """The ``lstat`` of a symlink; put it in ``files`` to give a link in ``links`` an owner."""
+    return FileInfo(mode=stat.S_IFLNK | 0o777, uid=uid)
+
+
 def safe_default_server(uid: int = UID, tmpdir: str = "/tmp") -> dict[str, FileInfo]:
     """A filesystem with a safe default socket at ``<tmpdir>/tmux-<uid>/default``."""
     files = {"/": directory()}
@@ -69,7 +74,8 @@ class FakeGateway:
         self.dir_checks: list[str] = []
         self.uid = uid
         # A fake filesystem for lstat and real_path: absolute normalized paths to their
-        # FileInfo, and symlinks to their targets. By default a safe default server exists.
+        # FileInfo, and symlinks to their targets (a link's owner is the uid unless ``files``
+        # has a ``symlink`` entry for it). By default a safe default server exists.
         self.files = dict(safe_default_server(uid) if files is None else files)
         self.links = dict(links or {})
         self.lstats: list[str] = []
@@ -109,13 +115,20 @@ class FakeGateway:
     def lstat(self, path: str) -> FileInfo:
         self.lstats.append(path)
         if path in self.links:
-            return FileInfo(mode=stat.S_IFLNK | 0o777, uid=self.uid)
+            return self.files.get(path, symlink(self.uid))
         if path in self.files:
             return self.files[path]
         raise FileNotFoundError(errno.ENOENT, os.strerror(errno.ENOENT), path)
 
     def real_path(self, path: str) -> str:
         return self._resolve(path, depth=0)
+
+    def read_link(self, path: str) -> str:
+        if path in self.links:
+            return self.links[path]
+        if path in self.files:
+            raise OSError(errno.EINVAL, os.strerror(errno.EINVAL), path)
+        raise FileNotFoundError(errno.ENOENT, os.strerror(errno.ENOENT), path)
 
     def _resolve(self, path: str, *, depth: int) -> str:
         if depth > 40:
