@@ -468,7 +468,8 @@ def resolve_id(args: argparse.Namespace, ctx: Context) -> None:
             f"no tmux server is running on {validate.show(ctx.server.socket_path, 200)}",
             details={"socket_path": ctx.server.socket_path},
         )
-    # TODO: read the managed panes (issue #11) and pick one with ids.resolve - issue #12
+    # TODO(#12): read the managed panes with backend.TmuxBackend.read_panes (no server: exit 10,
+    # no_server) and pick one with ids.resolve.
 
 
 def run_command(args: argparse.Namespace, ctx: Context) -> Result:

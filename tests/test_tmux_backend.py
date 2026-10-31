@@ -949,16 +949,118 @@ def test_guard_outcome(rc: int, stdout: str, outcome: GuardOutcome) -> None:
 
 def test_check_guard_raises_not_found_on_a_nomatch() -> None:
     with pytest.raises(TermctlError) as info:
-        tb.check_guard(_result(0, "termctl-nomatch\n"), "tc-abcdefgh")
+        tb.check_guard(_result(0, "termctl-nomatch\n"), "tc-abcdefgh", SOCK)
     assert info.value.code == "not_found" and info.value.exit_code == 10
-    tb.check_guard(_result(0, ""), "tc-abcdefgh")
+    tb.check_guard(_result(0, ""), "tc-abcdefgh", SOCK)
 
 
-def test_check_guard_never_treats_a_failure_as_a_match() -> None:
-    failed = _result(1, "")
-    with pytest.raises(tb.TmuxCommandFailed) as info:
-        tb.check_guard(failed, "tc-abcdefgh")
-    assert info.value.result is failed
+def _failed(stderr: str, rc: int = 1) -> subprocess.CompletedProcess[str]:
+    return subprocess.CompletedProcess(["tmux"], rc, "", stderr)
+
+
+@pytest.mark.parametrize(
+    "stderr",
+    [
+        "can't find pane: %9\n",
+        "can't find window: @9\n",
+        "can't find session: termctl\n",
+        "can't find session: $9\n",
+        "no server running on /tmp/tmux-1000/default\n",
+        "error connecting to /tmp/tmux-1000/default (No such file or directory)\n",
+    ],
+)
+def test_check_guard_maps_a_vanished_pane_to_not_found(stderr: str) -> None:
+    with pytest.raises(TermctlError) as info:
+        tb.check_guard(_failed(stderr), ID, SOCK)
+    assert info.value.code == "not_found" and info.value.exit_code == 10
+    assert ID in info.value.message
+
+
+@pytest.mark.parametrize(
+    "stderr",
+    [
+        "",
+        "error connecting to /tmp/tmux-1000/default (Permission denied)\n",
+        "server exited unexpectedly\n",
+        "unknown command: frob\n",
+        " can't find pane: %9\n",
+        "xcan't find pane: %9\n",
+        "no server running\n",
+        "termctl-nomatch\n",
+        # Only tmux's own first line counts, and only exactly (tmux 3.5a: a hook running
+        # source-file on a file named like the message makes a successful write fail so).
+        "can't find pane: %99: No such file or directory\n",
+        "x\ncan't find pane: %9\n",
+        "hook output\ncan't find window: @9\n",
+        "can't find pane: @9\n",
+        "can't find window: %9\n",
+        "can't find pane: %9 \n",
+        "can't find session: a b\n",
+    ],
+)
+def test_check_guard_maps_other_failures_to_server_unavailable(stderr: str) -> None:
+    """Never a match, and never not_found unless tmux said the pane, window, session or server
+    is gone."""
+    with pytest.raises(TermctlError) as info:
+        tb.check_guard(_failed(stderr), ID, SOCK)
+    assert info.value.code == "server_unavailable" and info.value.exit_code == 12
+
+
+def test_check_guard_maps_a_killed_tmux_to_server_unavailable() -> None:
+    with pytest.raises(TermctlError) as info:
+        tb.check_guard(_failed("can't find pane: %9\n", rc=-9), ID, SOCK)
+    assert info.value.code == "server_unavailable"
+
+
+def test_tmux_failure_message_is_one_bounded_line() -> None:
+    err = tb.tmux_failure(_failed("unknown command: " + "x" * 5000 + "\nsecond line\n"), ID, SOCK)
+    assert "second line" not in err.message
+    assert len(err.message) < 400
+
+
+def test_is_no_server_only_on_a_refused_connection() -> None:
+    def no_server(stderr: str) -> bool:
+        return tb.is_no_server(_failed(stderr), "/tmp/x/s")
+
+    assert no_server("no server running on /tmp/x/s\n")
+    assert not no_server("error connecting to /tmp/x/s (Permission denied)\n")
+    # A missing socket file or parent directory (#8 checks the filesystem first; this covers a
+    # socket removed in between). tmux sets only LC_CTYPE and LC_TIME, so strerror is English.
+    assert no_server("error connecting to /tmp/x/s (No such file or directory)\n")
+    assert not no_server("error connecting to /tmp/x/s (Not a directory)\n")
+    assert not no_server("can't find pane: %1\n")
+    no_server_but_ok = subprocess.CompletedProcess(["tmux"], 0, "", "no server running on /x\n")
+    assert not tb.is_no_server(no_server_but_ok, "/x")
+
+
+@pytest.mark.parametrize(
+    "stderr",
+    [
+        # A server hook (or anything else) printing the text first does not make it no-server.
+        "hook output\nno server running on /tmp/x/s\n",
+        "x\nerror connecting to /tmp/x/s (No such file or directory)\n",
+        "no server running on /tmp/x/other\n",
+        "no server running on /tmp/x/s and more\n",
+        "error connecting to /tmp/x/other (No such file or directory)\n",
+        " no server running on /tmp/x/s\n",
+    ],
+)
+def test_is_no_server_only_on_the_exact_first_line_for_this_socket(stderr: str) -> None:
+    assert not tb.is_no_server(_failed(stderr), "/tmp/x/s")
+
+
+def test_is_no_server_compares_the_path_as_tmux_received_it(
+    monkeypatch: pytest.MonkeyPatch,
+) -> None:
+    """argv goes out through os.fsencode (the locale encoding) and stderr comes back as UTF-8
+    with surrogateescape, so the path is compared as those bytes decode, not as the str."""
+    monkeypatch.setattr(tb.os, "fsencode", lambda path: path.encode("latin-1"))
+    # "\u00e9" sent as latin-1 b"\xe9" reads back as the lone surrogate "\udce9".
+    assert tb.is_no_server(_failed("no server running on /tmp/\udce9/s\n"), "/tmp/\u00e9/s")
+    assert tb.is_no_server(
+        _failed("error connecting to /tmp/\udce9/s (No such file or directory)\n"), "/tmp/\u00e9/s"
+    )
+    assert not tb.is_no_server(_failed("no server running on /tmp/\u00e9/s\n"), "/tmp/\u00e9/s")
 
 
 # --- the runner ---------------------------------------------------------------------------------
@@ -1368,3 +1470,61 @@ def test_guarded_display_takes_the_id_and_number_fields() -> None:
     for name in ("display", "display-message"):
         inner = command(name).flag("-p").target(tb.pane("%5")).format_arg(tb.fields(*names))
         assert tb.guarded(tb.pane("%5"), tb.owned(ID), inner.build()).guarded
+
+
+# --- record formats (the pane reader's list-panes -F) --------------------------------------------
+
+SENTINEL = "termctl-end-0123456789abcdef"
+
+
+def test_record_is_tab_separated_with_sanitized_fields_and_a_sentinel() -> None:
+    fmt = tb.record(("pane_id", "window_name", "@termctl_name"), {"window_name"}, SENTINEL)
+    assert fmt.text == ("#{pane_id}\t#{s/[\t\n]/ /:window_name}\t#{@termctl_name}\t" + SENTINEL)
+
+
+@pytest.mark.parametrize(
+    ("names", "sanitized", "sentinel"),
+    [
+        ((), set(), SENTINEL),
+        (("pane_id}",), set(), SENTINEL),
+        (("s/x/y/:pane_id",), set(), SENTINEL),
+        (("pane_id",), {"window_name"}, SENTINEL),
+        (("pane_id",), set(), ""),
+        (("pane_id",), set(), "short"),
+        (("pane_id",), set(), "termctl-end-#{pane_id}"),
+        (("pane_id",), set(), "termctl,end,0123456789"),
+        (("pane_id",), set(), "termctl-end-01234567}9"),
+        (("pane_id",), set(), "termctl-end-0123456789\t"),
+        (("pane_id",), set(), "termctl-end-0123456789\n"),
+        (("pane_id",), set(), "termctl-end-0123456789;"),
+        (("pane_id",), set(), "x" * 65),
+    ],
+)
+def test_record_refuses_bad_pieces(
+    names: tuple[str, ...], sanitized: set[str], sentinel: str
+) -> None:
+    with pytest.raises(ValueError):
+        tb.record(names, sanitized, sentinel)
+
+
+def test_format_still_refuses_control_characters_outside_records() -> None:
+    with pytest.raises(ValueError):
+        tb.fields("pane_id\t")
+
+
+def test_invocation_argv_with_utf8_output() -> None:
+    inv = Invocation.of(command("list-panes").flag("-a").build())
+    assert inv.argv(TMUX, SOCK, utf8=True) == [TMUX, "-u", "-S", SOCK, "list-panes", "-a"]
+    assert inv.shown_argv(TMUX, SOCK, utf8=True) == [TMUX, "-u", "-S", SOCK, "list-panes", "-a"]
+    assert inv.argv(TMUX, SOCK) == [TMUX, "-S", SOCK, "list-panes", "-a"]
+
+
+def test_runner_passes_utf8_output() -> None:
+    inv = Invocation.of(command("list-panes").flag("-a").build())
+    argv = inv.argv(TMUX, SOCK, utf8=True)
+    gateway = RecordingGateway({tuple(argv): _done(argv, out="x\n")})
+    traced: list[str] = []
+    tmux = Tmux(gateway, TMUX, SOCK, env={}, trace=traced.append)
+    assert tmux.run(inv, utf8=True).stdout == "x\n"
+    assert gateway.calls == [argv]
+    assert traced == [f"tmux: {TMUX} -u -S {SOCK} list-panes -a"]

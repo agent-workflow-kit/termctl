@@ -39,6 +39,8 @@ def tmux_version(tmux_bin: str | None = TMUX_BIN) -> tuple[int, int] | None:
 
 
 TMUX_VERSION = tmux_version()
+# tmux 3.3 to 3.5 escape control characters and bad UTF-8 in printed output; 3.6 prints them raw.
+TMUX_PRINTS_RAW = TMUX_VERSION is not None and TMUX_VERSION >= (3, 6)
 
 
 @dataclass

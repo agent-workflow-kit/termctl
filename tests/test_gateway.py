@@ -1,5 +1,6 @@
 from __future__ import annotations
 
+import ast
 import os
 import pwd
 import selectors
@@ -14,6 +15,7 @@ from typing import Any
 
 import pytest
 
+import termctl
 from termctl import gateway as gateway_module
 from termctl import hookwatch
 from termctl.gateway import (
@@ -40,6 +42,43 @@ def test_system_gateway_passes_stdin_and_env() -> None:
     script = "import os, sys; print(sys.stdin.read() + os.environ['X'])"
     result = SystemGateway().run([sys.executable, "-c", script], stdin="a", env={"X": "b"})
     assert result.stdout == "ab\n"
+
+
+# The child writes UTF-8 (a bell emoji and an accent) plus one invalid byte to stdout and
+# stderr, and echoes stdin back as bytes.
+_CHILD = (
+    "import sys; data = sys.stdin.buffer.read();"
+    "sys.stdout.buffer.write(data + b'caf\\xc3\\xa9 \\xf0\\x9f\\x94\\x94 \\xff');"
+    "sys.stderr.buffer.write(b'\\xc3\\xa9\\xff')"
+)
+_IN_ASCII_LOCALE = """
+import sys
+from termctl.gateway import SystemGateway
+r = SystemGateway().run([sys.executable, "-c", sys.argv[1]], stdin="\\u00e9\\udcfe")
+print(ascii((sys.getfilesystemencoding(), r.stdout, r.stderr)))
+"""
+
+
+def test_system_gateway_reads_and_writes_utf8_whatever_the_locale() -> None:
+    """tmux runs with -u and writes UTF-8, so output is decoded as UTF-8 (an undecodable byte
+    kept as a lone surrogate) even when termctl runs in a non-UTF-8 locale."""
+    src = str(Path(termctl.__file__).parent.parent)
+    env = {
+        "PATH": os.environ.get("PATH", "/usr/bin:/bin"),
+        "LC_ALL": "C",
+        "PYTHONCOERCECLOCALE": "0",
+        "PYTHONUTF8": "0",
+        "PYTHONPATH": src,
+    }
+    result = SystemGateway().run(
+        [sys.executable, "-c", _IN_ASCII_LOCALE, _CHILD], env=env, timeout=60
+    )
+    assert result.returncode == 0, result.stderr
+    fs_encoding, stdout, stderr = ast.literal_eval(result.stdout)
+    if fs_encoding.lower().replace("-", "") == "utf8":
+        pytest.skip("this host forces a UTF-8 filesystem encoding")
+    assert stdout == "\u00e9\udcfecaf\u00e9 \U0001f514 \udcff"
+    assert stderr == "\u00e9\udcff"
 
 
 def write_script(path: Path, body: str) -> list[str]:
@@ -191,6 +230,30 @@ def test_system_gateway_user_name_none_without_passwd_entry(
 
     monkeypatch.setattr(pwd, "getpwuid", missing)
     assert SystemGateway().user_name() is None
+
+
+def test_system_gateway_reads_output_faithfully() -> None:
+    """No newline translation, and undecodable bytes are kept as lone surrogates (#11)."""
+    script = (
+        "import sys; sys.stdout.buffer.write(b'a\\r\\nb\\rc\\xff\\xc3'); "
+        "sys.stderr.buffer.write(b'e\\r\\xfe')"
+    )
+    result = SystemGateway().run([sys.executable, "-c", script])
+    assert result.returncode == 0
+    assert result.stdout == "a\r\nb\rc\udcff\udcc3"
+    assert result.stderr == "e\r\udcfe"
+    assert os.fsencode(result.stdout) == b"a\r\nb\rc\xff\xc3"
+
+
+def test_system_gateway_decodes_utf8_output() -> None:
+    script = "import sys; sys.stdout.buffer.write('é\U0001f514'.encode())"
+    assert SystemGateway().run([sys.executable, "-c", script]).stdout == "é\U0001f514"
+
+
+def test_system_gateway_encodes_stdin_as_utf8() -> None:
+    script = "import sys; sys.stdout.buffer.write(sys.stdin.buffer.read())"
+    result = SystemGateway().run([sys.executable, "-c", script], stdin="é\n")
+    assert result.stdout == "é\n"
 
 
 # --- run_group ----------------------------------------------------------------------------------

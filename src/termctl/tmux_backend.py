@@ -28,7 +28,8 @@ flags.
 Builder misuse is a programming error and raises ``ValueError`` or ``TypeError``.
 
 Binary resolution and the version check (#10), socket resolution and safety (#8), the filtered
-environment (#15) and the pane reader (#11) are separate; ``Tmux`` takes their results.
+environment (#15) and the pane reader (``panes.py``) are separate; ``Tmux`` takes their
+results. ``record`` builds the reader's ``list-panes -F`` format.
 """
 
 from __future__ import annotations
@@ -38,7 +39,7 @@ import os
 import re
 import shlex
 import subprocess
-from collections.abc import Callable, Mapping
+from collections.abc import Callable, Collection, Mapping, Sequence
 from dataclasses import dataclass, field
 from typing import Literal, Self
 
@@ -190,6 +191,10 @@ class Format:
 def _format(text: str) -> Format:
     if not isinstance(text, str) or _CONTROL.search(text) or text.endswith(SEPARATOR):
         raise ValueError(f"invalid format: {text!r}")
+    return _new_format(text)
+
+
+def _new_format(text: str) -> Format:
     fmt = object.__new__(Format)
     object.__setattr__(fmt, "text", text)
     object.__setattr__(fmt, "_key", _FORMAT_KEY)
@@ -201,6 +206,41 @@ def fields(*names: str) -> Format:
     if not names:
         raise ValueError("fields needs at least one name")
     return _format(" ".join(f"#{{{_fullmatch(_FIELD_NAME, n, 'field name')}}}" for n in names))
+
+
+# tmux's regex substitution (#{s/re/replacement/:field}) with a literal tab and newline in the
+# bracket: POSIX ERE has no "\t" escape, and a ":" (as in "[[:space:]]") ends the modifier.
+_SANITIZE = "s/[\t\n]/ /:"
+_RECORD_SEPARATOR = "\t"
+_SENTINEL = re.compile(r"[A-Za-z0-9-]{16,64}")
+
+
+def record(names: Sequence[str], sanitized: Collection[str], sentinel: str) -> Format:
+    """``#{a}<TAB>#{b}...<TAB><sentinel>``: one ``list-panes -F`` record per line (design.md
+    "Internal architecture", data flow).
+
+    Fields named in ``sanitized`` (free text, such as ``window_name``) are read with every tab
+    and newline replaced by a space, so they cannot break the record; tmux itself escapes the
+    other control characters on output. Every other field is read as is: a tab or newline in
+    one (only a value someone else wrote can hold one) breaks its record, which the reader
+    detects. The sentinel ends each record; it is a fresh random token per read, so no value
+    can forge the end of a record. It does not protect against server hooks or commands run by
+    someone with socket access: an ``after-list-panes`` hook sees the format, sentinel
+    included, and can print a forged record.
+    """
+    names = tuple(names)
+    if not names:
+        raise ValueError("a record needs at least one field")
+    unknown = set(sanitized) - set(names)
+    if unknown:
+        raise ValueError(f"sanitized fields not in the record: {sorted(unknown)!r}")
+    for name in names:
+        _fullmatch(_FIELD_NAME, name, "field name")
+    pieces = [f"#{{{_SANITIZE if name in sanitized else ''}{name}}}" for name in names]
+    pieces.append(_fullmatch(_SENTINEL, sentinel, "record sentinel"))
+    # The pieces are checked above; the separator and _SANITIZE hold the only control
+    # characters, which a -F value passed as one argv element carries to tmux unchanged.
+    return _new_format(_RECORD_SEPARATOR.join(pieces))
 
 
 TargetKind = Literal["pane", "window", "session", "pane_in_session"]
@@ -575,18 +615,29 @@ class Invocation:
             joined.extend(part)
         return joined
 
-    def argv(self, tmux_bin: str, socket_path: str) -> list[str]:
-        """The argv to run: always the absolute binary and ``-S <socket_path>``, never ``-L``."""
+    def argv(self, tmux_bin: str, socket_path: str, *, utf8: bool = False) -> list[str]:
+        """The argv to run: always the absolute binary and ``-S <socket_path>``, never ``-L``.
+
+        ``utf8`` adds ``-u``: tmux then writes UTF-8 output whatever the locale of the
+        environment it runs with; without it, a client whose locale is not UTF-8 gets ``_`` for
+        every non-ASCII character, tab and newline (the pane reader's case)."""
         _check_tmux_bin(tmux_bin)
         _check_socket(socket_path)
-        return [tmux_bin, "-S", socket_path, *self._join([c.argv for c in self.commands])]
+        return [
+            *_client(tmux_bin, socket_path, utf8),
+            *self._join([c.argv for c in self.commands]),
+        ]
 
-    def shown_argv(self, tmux_bin: str, socket_path: str) -> list[str]:
+    def shown_argv(self, tmux_bin: str, socket_path: str, *, utf8: bool = False) -> list[str]:
         """``argv`` with ``--env`` values replaced by their names (``--verbose``, dry runs)."""
         _check_tmux_bin(tmux_bin)
         _check_socket(socket_path)
         shown = [tuple(escape_separator(e) for e in c.shown) for c in self.commands]
-        return [tmux_bin, "-S", socket_path, *self._join(shown)]
+        return [*_client(tmux_bin, socket_path, utf8), *self._join(shown)]
+
+
+def _client(tmux_bin: str, socket_path: str, utf8: bool) -> list[str]:
+    return [tmux_bin, *(["-u"] if utf8 else []), "-S", socket_path]
 
 
 # --- rule 5: guarded writes ---------------------------------------------------------------------
@@ -806,14 +857,6 @@ class GuardOutcome(enum.Enum):
     FAILED = "failed"
 
 
-class TmuxCommandFailed(Exception):
-    """A guarded invocation exited non-zero; ``result`` is tmux's result."""
-
-    def __init__(self, result: subprocess.CompletedProcess[str]) -> None:
-        super().__init__(f"tmux exited {result.returncode}: {result.stderr.strip()}")
-        self.result = result
-
-
 def guard_outcome(result: subprocess.CompletedProcess[str]) -> GuardOutcome:
     """Read a guarded invocation's result: a non-zero exit is ``FAILED``; otherwise any stdout
     line equal to ``termctl-nomatch`` is ``NOMATCH`` (so output that merely looks like one
@@ -830,13 +873,85 @@ def guard_outcome(result: subprocess.CompletedProcess[str]) -> GuardOutcome:
     return GuardOutcome.MATCHED
 
 
-def check_guard(result: subprocess.CompletedProcess[str], termctl_id: str) -> None:
-    """Raise ``not_found`` (exit 10) on ``NOMATCH`` and ``TmuxCommandFailed`` on ``FAILED``;
+# What tmux prints when it cannot reach a server (client.c), naming the -S path exactly as given:
+# a refused connection, and a missing socket file or parent directory. tmux sets only LC_CTYPE and
+# LC_TIME from the environment, so strerror (the text in parentheses) is not translated.
+_NO_SERVER = "no server running on {}"
+_CONNECT_MISSING = "error connecting to {} (No such file or directory)"
+# What tmux prints when a target is gone (cmd-find.c), as tmux 3.5a prints it for the targets
+# termctl builds: the pane or window id, or the session id or bare name (``=S:`` gives ``S``).
+_GONE = re.compile(
+    "can't find "
+    f"(pane: {_PANE_ID.pattern}|window: {_WINDOW_ID.pattern}"
+    rf"|session: (\$[0-9]+|{_SESSION_NAME.pattern}))"
+)
+_MESSAGE_MAX = 200
+
+
+def _stderr_lines(result: subprocess.CompletedProcess[str]) -> list[str]:
+    return result.stderr.splitlines()
+
+
+def is_no_server(result: subprocess.CompletedProcess[str], socket_path: str) -> bool:
+    """Whether a failed tmux call failed because no server runs on ``socket_path`` (interface.md
+    "Server selection": the connection is refused, or the socket file or its parent directory
+    does not exist). Any other connection error, such as permission denied, is not.
+
+    Only stderr's first line counts, and it must be exactly tmux's message for this socket: a
+    server hook can print any text, but only after tmux has connected.
+    """
+    if result.returncode == 0:
+        return False
+    lines = _stderr_lines(result)
+    # tmux got the path as os.fsencode's bytes and stderr is decoded as UTF-8, so a non-ASCII path
+    # under a non-UTF-8 locale comes back as those bytes decode, not as the str.
+    printed = os.fsencode(socket_path).decode("utf-8", "surrogateescape")
+    return bool(lines) and lines[0] in (
+        _NO_SERVER.format(printed),
+        _CONNECT_MISSING.format(printed),
+    )
+
+
+def _is_gone(result: subprocess.CompletedProcess[str]) -> bool:
+    """Whether stderr's first line is exactly tmux's message for a missing target: a server hook
+    can print any text, even one that starts like it, but only after tmux's own error."""
+    lines = _stderr_lines(result)
+    return bool(lines) and _GONE.fullmatch(lines[0]) is not None
+
+
+def tmux_message(result: subprocess.CompletedProcess[str]) -> str:
+    """tmux's first stderr line, bounded, for an error message (escaped when printed)."""
+    lines = [line.strip() for line in _stderr_lines(result) if line.strip()]
+    if not lines:
+        return f"tmux exited {result.returncode} without a message"
+    first = lines[0]
+    return first if len(first) <= _MESSAGE_MAX else first[:_MESSAGE_MAX] + "..."
+
+
+def tmux_failure(
+    result: subprocess.CompletedProcess[str], termctl_id: str, socket_path: str
+) -> TermctlError:
+    """The error for a failed tmux call on ``socket_path`` that acts on managed pane
+    ``termctl_id`` after id resolution (interface.md "Panes that vanish"): ``not_found`` (exit
+    10) when tmux says the
+    pane, window or session is gone, or that no server runs any more (the pane went with it);
+    ``server_unavailable`` (exit 12) for anything else, a tmux killed by a signal included.
+    ``close`` counts the first case as closed instead."""
+    if result.returncode > 0 and (_is_gone(result) or is_no_server(result, socket_path)):
+        return TermctlError(
+            "not_found", f"managed pane {termctl_id} is gone ({tmux_message(result)})"
+        )
+    return TermctlError("server_unavailable", f"tmux failed: {tmux_message(result)}")
+
+
+def check_guard(
+    result: subprocess.CompletedProcess[str], termctl_id: str, socket_path: str
+) -> None:
+    """Raise ``not_found`` (exit 10) on ``NOMATCH``, and ``tmux_failure`` on ``FAILED``;
     ``close`` instead treats ``NOMATCH`` as already closed and calls ``guard_outcome``."""
     outcome = guard_outcome(result)
     if outcome is GuardOutcome.FAILED:
-        # TODO(#11): map a failed guarded invocation to its exit code (not_found or exit 12).
-        raise TmuxCommandFailed(result)
+        raise tmux_failure(result, termctl_id, socket_path)
     if outcome is GuardOutcome.NOMATCH:
         raise TermctlError(
             "not_found", f"managed pane {termctl_id} is gone or no longer the one resolved"
@@ -876,12 +991,15 @@ class Tmux:
         self.env = dict(env)
         self.trace = trace
 
-    def run(self, invocation: Invocation) -> subprocess.CompletedProcess[str]:
+    def run(
+        self, invocation: Invocation, *, utf8: bool = False
+    ) -> subprocess.CompletedProcess[str]:
         """Run ``invocation`` and return tmux's result; mapping tmux's failures to exit codes
-        is the caller's, since it depends on the command."""
-        argv = invocation.argv(self.tmux_bin, self.socket_path)
+        is the caller's, since it depends on the command (``tmux_failure``, ``is_no_server``).
+        ``utf8``: see ``Invocation.argv``."""
+        argv = invocation.argv(self.tmux_bin, self.socket_path, utf8=utf8)
         if self.trace is not None:
-            shown = shlex.join(invocation.shown_argv(self.tmux_bin, self.socket_path))
+            shown = shlex.join(invocation.shown_argv(self.tmux_bin, self.socket_path, utf8=utf8))
             self.trace("tmux: " + _escape_controls(shown))
         try:
             return self.gateway.run(argv, timeout=TMUX_TIMEOUT, env=self.env)
