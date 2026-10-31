@@ -79,7 +79,9 @@ Terminal placement, tmux backend. Layer 1 (primitive), fully standalone (archite
 | `procs.py` | process start time and parent check for the recorded PID, the `close --force` signal sequence |
 | `gateway.py` | the only module that runs subprocesses or touches the filesystem outside config and logs (tmux, `ps`, `/proc`, socket `stat`, the cwd check, stdin TTY test and OS user name, BEL write); also holds the injectable clock |
 | `hooks.py` | hook execution per the design guide |
+| `hookwatch.py` | the detached watchdog that runs an async post-hook and enforces its timeout; started by `gateway.py` as `python -I` with its absolute file path and importing only the standard library, it is the one other module that starts a process |
 | `jsonlog.py` | `log.jsonl` and `audit.jsonl` |
+| `statedir.py` | the state directory: its path, and opening `log.jsonl`, `audit.jsonl` and `locks/` without following symlinks, creating missing directories 0700 and files 0600, refusing entries not owned by the user, writable by group or others, or (files) hard-linked |
 | `lock.py` | per-server `flock` (D20) |
 
 Data flow for `open`: `cli` → `config` + `validate` → `placement` → `tmux_bin` (resolution, version check) → `tmux_backend` + `panes` (socket checks, id-collision check) → `hooks` (pre) → `tmux_backend` (session, placeholder pane, options, respawn) → `procs` (record PID) → `hooks` (post) → `jsonlog`. All tmux reads use one `list-panes -a -F` call with tab-separated fields, free-text fields sanitized in the format string and an end-of-record sentinel (spike A8). Targets are always exact ids (`=session:`, `@N`, `%N`), never names or indexes (spike A6, B7).

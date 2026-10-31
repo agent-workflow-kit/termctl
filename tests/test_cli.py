@@ -2,6 +2,7 @@ from __future__ import annotations
 
 import io
 import json
+import signal
 import subprocess
 import sys
 import tomllib
@@ -13,6 +14,7 @@ import pytest
 from termctl import __version__, cli
 from termctl.cli import Context, Result, main, parse_args
 from termctl.errors import TermctlError, UsageError
+from termctl.gateway import Terminated
 
 from .fakes import TMUX, FakeClock, FakeGateway, is_list_panes, pane_row
 from .schemas import validate
@@ -759,6 +761,25 @@ def test_unexpected_exception_is_internal(monkeypatch: pytest.MonkeyPatch) -> No
     }
 
 
+@pytest.mark.parametrize(
+    ("stop", "code", "message"),
+    [
+        (KeyboardInterrupt(), 130, "termctl: interrupted\n"),
+        (Terminated(signal.SIGTERM), 143, "termctl: terminated by signal 15\n"),
+        (Terminated(signal.SIGHUP), 129, "termctl: terminated by signal 1\n"),
+    ],
+)
+def test_a_stop_signal_exits_128_plus_its_number_without_a_traceback(
+    monkeypatch: pytest.MonkeyPatch, stop: BaseException, code: int, message: str
+) -> None:
+    def stopped(args: Any, ctx: Context) -> Result:
+        raise stop
+
+    monkeypatch.setattr(cli, "run_command", stopped)
+    run = Run(["--json", "--quiet", "placements"])
+    assert (run.code, run.stdout, run.stderr) == (code, "", message)
+
+
 def test_quiet_suppresses_warnings_but_not_errors(monkeypatch: pytest.MonkeyPatch) -> None:
     def warn_then_fail(args: Any, ctx: Context) -> Result:
         ctx.out.warn("careful")
@@ -806,7 +827,7 @@ def test_context_carries_injected_gateway_and_clock(monkeypatch: pytest.MonkeyPa
 # --- unimplemented commands ---------------------------------------------------------------------
 
 
-IMPLEMENTED = {"show", "exists", "list"}
+IMPLEMENTED = {"show", "exists", "list", "placements"}
 UNIMPLEMENTED = sorted(set(MINIMAL) - IMPLEMENTED)
 
 
@@ -821,11 +842,9 @@ def test_unimplemented_command_is_internal_error(command: str) -> None:
         "code": "internal",
         "message": f"termctl {command} is not implemented yet",
     }
-    # Only the tmux checks (none for placements) and, for an id, the one pane read ran.
+    # Only the tmux checks and, for an id, the one pane read ran.
     calls = run.gateway.calls
-    if command == "placements":
-        assert calls == []
-    elif command == "open":
+    if command == "open":
         assert calls == [[TMUX, "-V"]]
     else:
         assert calls[0] == [TMUX, "-V"] and len(calls) == 2 and is_list_panes(calls[1])
