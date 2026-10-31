@@ -118,6 +118,9 @@ def safe_default_server(uid: int = UID, tmpdir: str = "/tmp") -> dict[str, FileI
     return files
 
 
+# procs' macOS ps call, before ``-p <pid>``.
+_PS_ARGV = ("/bin/ps", "-o", "ppid=", "-o", "stat=", "-o", "lstart=")
+
 # The fields of /proc/<pid>/stat between the parent PID (field 4) and the start time (22).
 _STAT_MIDDLE = " ".join(["0"] * 17)
 
@@ -152,6 +155,16 @@ class FakeProcess:
             return None
         state = "Z" if self.done() else "S"
         return f"{self.pid} (sh) {state} {self.ppid} {_STAT_MIDDLE} {self.start} 0 0\n"
+
+    def ps(self) -> subprocess.CompletedProcess[Any]:
+        """macOS: what ``/bin/ps -o ppid= -o stat= -o lstart= -p <pid>`` prints for it in the
+        C locale with ``TZ=UTC0`` (``start`` is seconds since the epoch there)."""
+        if self.done() and not self.zombie:
+            return completed("", returncode=1)
+        state = "Z" if self.done() else "Ss"
+        started = datetime.fromtimestamp(int(self.start), UTC)
+        lstart = started.strftime("%a %b ") + f"{started.day:2d}" + started.strftime(" %H:%M:%S %Y")
+        return completed(f"{self.ppid:>5} {state:<4} {lstart}\n")
 
 
 class FakeHandle:
@@ -376,7 +389,10 @@ class FakeGateway:
         try:
             response = self.responses[tuple(argv)]
         except KeyError:
-            if is_list_panes(argv) and self.list_panes is not None:
+            ps_pid = self._ps_pid(argv) if self.system == "darwin" else None
+            if ps_pid is not None and ps_pid in self.processes:
+                response = self.processes[ps_pid].ps()
+            elif is_list_panes(argv) and self.list_panes is not None:
                 response = self.list_panes
             elif is_list_panes(argv) and self.panes is not None:
                 sentinel = argv[-1].rsplit("\t", 1)[-1]
@@ -388,6 +404,13 @@ class FakeGateway:
         if isinstance(response, BaseException):
             raise response
         return response
+
+    @staticmethod
+    def _ps_pid(argv: list[str]) -> int | None:
+        """The PID of a ``procs`` ``ps`` call (macOS), else None."""
+        if argv[:-1] == [*_PS_ARGV, "-p"] and argv[-1].isdigit():
+            return int(argv[-1])
+        return None
 
     def run_group(
         self,

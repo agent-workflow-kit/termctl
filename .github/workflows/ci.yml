@@ -1,8 +1,11 @@
 name: ci
 
-# Thin caller for agent-workflow-kit/awkit-ci, plus a `tmux` job that runs the real-tmux tests.
-# Status checks: `ci / ci-ok` (required) and `tmux`. `tmux` is not part of `ci / ci-ok`; it
-# gates merges only once it is added as a required check in branch protection (maintainer).
+# Thin caller for agent-workflow-kit/awkit-ci, plus a `tmux` job that runs the real-tmux tests
+# and a `macos` job that runs the whole suite on macOS.
+# Status checks: `ci / ci-ok` (required), `tmux` and `macos`. Neither `tmux` nor `macos` is part
+# of `ci / ci-ok`; `tmux` gates merges only once it is added as a required check in branch
+# protection (maintainer). `macos` is not required (macOS is best-effort, and the manual
+# checklist in docs/design.md remains) and does not gate the release.
 # Source: https://github.com/agent-workflow-kit/awkit-ci/tree/main/templates
 
 on:
@@ -42,6 +45,31 @@ jobs:
         run: |
           sudo apt-get update
           sudo apt-get install -y --no-install-recommends tmux
+          tmux -V
+      - name: uv sync
+        run: uv sync --python "$UV_PYTHON"
+      - name: make verify
+        run: make verify
+
+  # The macOS-only paths (ps process reads, the kqueue process handle and hook-exit watch,
+  # /private/tmp) against the real kernel, ps and tmux. Not required, not a release gate.
+  macos:
+    name: macos
+    runs-on: macos-latest
+    timeout-minutes: 30
+    permissions:
+      contents: read
+    env:
+      TERMCTL_REQUIRE_TMUX: "1"
+      UV_PYTHON: "3.12"
+    steps:
+      - uses: actions/checkout@3d3c42e5aac5ba805825da76410c181273ba90b1 # v7.0.1
+        with:
+          persist-credentials: false
+      - uses: astral-sh/setup-uv@1c37ad07a6a961277cf70c0d37d6f313000f5884 # v10.3.0
+      - name: Install tmux
+        run: |
+          brew install tmux
           tmux -V
       - name: uv sync
         run: uv sync --python "$UV_PYTHON"

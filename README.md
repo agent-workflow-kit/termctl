@@ -60,7 +60,7 @@ Global flags: `--json`, `--socket NAME|PATH`, `--config PATH`, `--verbose`, `--q
 
 ## Platforms
 
-Linux and WSL. macOS best-effort (checked manually; CI runs on Linux).
+Linux and WSL. macOS best-effort: CI also runs the suite on macOS in a job that is not required, and a manual checklist (`docs/design.md`) is run before releases.
 
 ## Install
 
