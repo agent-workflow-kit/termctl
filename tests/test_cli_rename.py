@@ -612,15 +612,6 @@ def test_an_unusable_state_directory_exits_12_locked_before_any_write(state: Pat
     assert writes(gateway) == []
 
 
-def test_dry_run_is_not_implemented_yet_and_not_logged(state: Path) -> None:
-    gateway = renaming()
-    result = run(["--json", "rename", ID, "new", "--dry-run"], gateway, state)
-    assert (result.code, result.json()["error"]["code"]) == (1, "internal")
-    assert writes(gateway) == []
-    assert result.log() == []
-    assert not (state / "termctl" / "locks").exists()
-
-
 def test_an_unexpected_failure_is_logged_as_internal(
     state: Path, monkeypatch: pytest.MonkeyPatch
 ) -> None:
