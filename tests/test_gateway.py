@@ -764,6 +764,56 @@ def test_a_stop_signal_during_a_hook_kills_its_group(tmp_path: Path, signum: int
     assert wait_gone(child)
 
 
+def test_ignored_hangups_stop_neither_the_run_nor_a_hook_it_runs() -> None:
+    # close from its re-check on (closing termctl's own pane hangs up its terminal).
+    with stop_signals() as signals:
+        signals.ignore_hangups()
+        os.kill(os.getpid(), signal.SIGHUP)  # this process: exact, and handled
+        time.sleep(0.05)
+        run = SystemGateway().run_group(
+            [SH, "-c", "kill -HUP $PPID; sleep 0.2; echo done"], stdin=b"", env=base_env(),
+            timeout=10, stdout_limit=100, stderr_limit=100,
+        )  # fmt: skip
+        assert run.stdout == b"done\n"
+        # A program termctl runs gets SIGHUP at its default, and so does a hook.
+        child = SystemGateway().run([SH, "-c", "kill -HUP $$; echo alive"])
+        assert child.returncode == -signal.SIGHUP
+        hook = SystemGateway().run_group(
+            [SH, "-c", "kill -HUP $$; echo alive"], stdin=b"", env=base_env(), timeout=10,
+            stdout_limit=100, stderr_limit=100,
+        )  # fmt: skip
+        assert hook.returncode == -signal.SIGHUP
+        # SIGTERM still stops the run.
+        with pytest.raises(Terminated):
+            os.kill(os.getpid(), signal.SIGTERM)  # this process: exact, and handled
+            time.sleep(1)
+
+
+def test_an_ignored_hangup_in_a_deferred_block_is_not_raised_but_sigterm_is() -> None:
+    with stop_signals() as signals:
+        signals.ignore_hangups()
+        with signals.deferred():
+            os.kill(os.getpid(), signal.SIGHUP)  # this process: exact, and handled
+            time.sleep(0.05)
+        with pytest.raises(Terminated) as info:
+            with signals.deferred():
+                os.kill(os.getpid(), signal.SIGHUP)  # this process: exact, and handled
+                os.kill(os.getpid(), signal.SIGTERM)
+                time.sleep(0.05)
+    assert info.value.signum == signal.SIGTERM
+
+
+def test_ignore_hangups_leaves_an_ignored_sighup_ignored_and_restores_the_handlers() -> None:
+    before = signal.signal(signal.SIGHUP, signal.SIG_IGN)
+    try:
+        with stop_signals() as signals:
+            signals.ignore_hangups()
+            assert signal.getsignal(signal.SIGHUP) == signal.SIG_IGN
+        assert signal.getsignal(signal.SIGHUP) == signal.SIG_IGN
+    finally:
+        signal.signal(signal.SIGHUP, before)
+
+
 # --- spawn_watched ------------------------------------------------------------------------------
 
 

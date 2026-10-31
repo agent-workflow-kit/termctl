@@ -1,0 +1,1 @@
+{"id": "tc-abcdefgh", "pane_closed": true, "was_running": true, "forced": true, "signals_sent": ["SIGTERM"], "exited": true, "pid_mismatch": false, "decision_ids": [], "duration_ms": 10000, "socket_path": "/tmp/tmux-1000/default"}
