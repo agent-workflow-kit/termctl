@@ -105,7 +105,7 @@
     },
     "display_updated": {
       "type": "boolean",
-      "description": "termctl renamed the window. false for a no-op, for label add and label remove, and when the window is not the pane's own single-pane window (only the options were updated)."
+      "description": "termctl renamed the window (in a dry run: would rename it). false for a no-op, for label add and label remove, and when the window is not the pane's own single-pane window (only the options were updated)."
     },
     "dry_run": {
       "type": "boolean",

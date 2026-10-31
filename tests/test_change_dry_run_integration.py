@@ -2,6 +2,8 @@
 real tmux, through ``main`` with the system gateway, on a private server (``tmux_server`` in
 conftest.py): the pane is reported as the real run then makes it, and nothing changes: no
 option, no window name, no bell, no lock file and no log record (interface.md "Dry runs").
+The one exception is ``display_name`` of a renamed window: the dry run reports the name termctl
+computes, the real run the form tmux reads back, which can be escaped (interface.md "Names").
 
 The CI ``tmux`` job runs these on the runner's tmux; tmux 3.2 runs are TODO(#25).
 """
@@ -12,7 +14,10 @@ from typing import Any
 
 import pytest
 
-from .conftest import TmuxServer, wait_for
+from termctl.display import _tmux_forms
+from termctl.tmux_bin import TmuxVersion
+
+from .conftest import TMUX_VERSION, TmuxServer, wait_for
 from .schemas import validate
 from .test_mark_integration import bell_flag, config
 from .test_panes_integration import ID, new_window, tag
@@ -95,3 +100,31 @@ def test_a_dry_run_on_a_split_window_reports_the_current_window_name(
     out = dry.json()
     assert (out["name"], out["display_name"], out["display_updated"]) == ("new", shown, False)
     assert option(tmux_server, pane_id) == "KEY-12"
+
+
+def test_a_dry_run_reports_the_computed_name_where_tmux_reports_it_escaped(
+    tmux_server: TmuxServer,
+) -> None:
+    # tmux stores a renamed window's name escaped (interface.md "Names"): the dry run reports
+    # the name termctl computes, the real run the form tmux reads back.
+    pane_id = managed(tmux_server)
+    name = "a\\b $c"
+    dry = termctl(tmux_server, "--json", "rename", ID, name, "--dry-run")
+    assert (dry.code, dry.stderr) == (0, "")
+    out = dry.json()
+    assert out["display_name"] == name
+    real = termctl(tmux_server, "--json", "rename", ID, name)
+    assert real.code == 0
+    reported = real.json()
+    assert reported["display_name"] == window_name(tmux_server, pane_id)
+    assert reported["display_name"] != name
+    assert reported["display_name"] in _tmux_forms(name, version())
+    del out["display_name"], reported["display_name"]
+    assert comparable(out) == comparable(reported)
+
+
+def version() -> TmuxVersion | None:
+    if TMUX_VERSION is None:
+        return None
+    major, minor = TMUX_VERSION
+    return TmuxVersion(major, minor, f"{major}.{minor}")
