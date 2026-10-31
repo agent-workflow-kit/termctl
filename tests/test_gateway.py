@@ -1104,3 +1104,85 @@ def test_write_tty_follows_no_trailing_symlink_to_a_regular_file(tmp_path: Path)
     with pytest.raises(OSError):
         SystemGateway().write_tty(str(tmp_path / "link"), b"\a")
     assert target.read_bytes() == b"content"
+
+
+def test_write_tty_blocks_sigttou_while_writing_and_restores_the_mask(
+    monkeypatch: pytest.MonkeyPatch,
+) -> None:
+    masks: list[set[Any]] = []
+    real_write = os.write
+
+    def observed_write(fd: int, data: bytes) -> int:
+        masks.append(signal.pthread_sigmask(signal.SIG_BLOCK, []))
+        return real_write(fd, data)
+
+    before = signal.pthread_sigmask(signal.SIG_BLOCK, [])
+    monkeypatch.setattr(os, "write", observed_write)
+    master, slave = os.openpty()
+    try:
+        SystemGateway().write_tty(os.ttyname(slave), b"\a")
+    finally:
+        os.close(master)
+        os.close(slave)
+    [during] = masks
+    assert signal.SIGTTOU in during
+    assert signal.pthread_sigmask(signal.SIG_BLOCK, []) == before
+
+
+def test_write_tty_restores_the_mask_when_the_open_fails(tmp_path: Path) -> None:
+    before = signal.pthread_sigmask(signal.SIG_BLOCK, [])
+    with pytest.raises(FileNotFoundError):
+        SystemGateway().write_tty(str(tmp_path / "missing"), b"\a")
+    assert signal.pthread_sigmask(signal.SIG_BLOCK, []) == before
+
+
+# A session of its own with a private pty as its controlling terminal and tostop set; a forked
+# child in a background process group writes the bell to it. Without SIGTTOU blocked the child
+# would stop. Only the pty this script creates is written to.
+_BACKGROUND_BELL = """
+import fcntl, os, signal, sys, termios
+from termctl.gateway import SystemGateway
+
+master, slave = os.openpty()
+fcntl.ioctl(slave, termios.TIOCSCTTY, 0)
+attrs = termios.tcgetattr(slave)
+attrs[3] |= termios.TOSTOP
+termios.tcsetattr(slave, termios.TCSANOW, attrs)
+name = os.ttyname(slave)
+pid = os.fork()
+if pid == 0:
+    os.setpgid(0, 0)
+    try:
+        SystemGateway().write_tty(name, b"\\a")
+    except BaseException:
+        os._exit(1)
+    os._exit(0)
+try:
+    os.setpgid(pid, pid)
+except OSError:
+    pass  # the child already did it, or has exited
+_, status = os.waitpid(pid, os.WUNTRACED)
+if os.WIFSTOPPED(status):
+    os.kill(pid, signal.SIGKILL)  # the exact child this script forked
+    os.waitpid(pid, 0)
+    print("stopped")
+else:
+    print(os.waitstatus_to_exitcode(status), repr(os.read(master, 16)))
+"""
+
+
+def test_write_tty_from_a_background_group_with_tostop_does_not_stop() -> None:
+    src = str(Path(termctl.__file__).parent.parent)
+    env = {"PATH": os.environ.get("PATH", "/usr/bin:/bin"), "PYTHONPATH": src}
+    result = subprocess.run(
+        [sys.executable, "-c", _BACKGROUND_BELL],
+        capture_output=True,
+        text=True,
+        timeout=60,
+        env=env,
+        stdin=subprocess.DEVNULL,
+        start_new_session=True,
+        check=False,
+    )
+    assert result.returncode == 0, result.stderr
+    assert result.stdout == "0 b'\\x07'\n"

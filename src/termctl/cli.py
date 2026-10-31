@@ -1048,12 +1048,16 @@ def _ring_bell(ctx: Context, pane: ManagedPane) -> None:
     """The bell of a changed ``mark``; a failure is a warning only (interface.md "Markers")."""
     if pane.dead:
         return
-    backend = connect(ctx)
-    warning = (
-        f"bell not written: no tmux server is running for managed pane {pane.id}"
-        if backend is None
-        else display.ring_bell(backend, ctx.gateway, pane)
-    )
+    try:
+        backend = connect(ctx)
+        warning = (
+            f"bell not written: no tmux server is running for managed pane {pane.id}"
+            if backend is None
+            else display.ring_bell(backend, ctx.gateway, pane)
+        )
+    except TermctlError as exc:
+        # The socket checks run again before connecting; the change is already made.
+        warning = f"bell not written: {exc.message}"
     if warning is not None:
         ctx.warn(warning)
 

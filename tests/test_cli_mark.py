@@ -11,8 +11,9 @@ from pathlib import Path
 
 import pytest
 
-from termctl import cli, display, lock
+from termctl import cli, display, lock, tmux_socket
 from termctl import tmux_backend as tb
+from termctl.errors import TermctlError
 from termctl.tmux_backend import command
 
 from .fakes import TMUX, FakeGateway, completed, is_list_panes, pane_row
@@ -510,6 +511,49 @@ def test_an_unreadable_terminal_warns_and_writes_nothing(
     assert result.code == 0
     assert "bell" in result.stderr
     assert gateway.tty_writes == []
+
+
+def test_a_terminal_that_is_not_a_pseudo_terminal_has_its_own_warning(
+    state: Path, tmp_path: Path
+) -> None:
+    gateway = marking()
+    gateway.responses[TTY_QUERY] = tty_answer(tty="/dev/sda")
+    result = run([*config(tmp_path, BELL_CONFIG), "mark", ID, "attention"], gateway, state)
+    assert result.code == 0
+    assert "/dev/sda" in result.stderr and "is not a pseudo-terminal" in result.stderr
+    assert "cannot read" not in result.stderr
+    assert gateway.tty_writes == []
+
+
+def test_a_failed_socket_check_at_the_bell_is_a_warning_only(
+    state: Path, tmp_path: Path, monkeypatch: pytest.MonkeyPatch
+) -> None:
+    gateway = marking()
+    gateway.responses[TTY_QUERY] = tty_answer()
+    gateway.ttys[TTY] = None
+    real_check = tmux_socket.check
+
+    def check(server: tmux_socket.Server, gw: object) -> bool:
+        # Only the check right before the bell (after the marker is set) fails.
+        assert gateway.panes is not None
+        if gateway.panes[0]["@termctl_marker"] == "attention":
+            raise TermctlError("server_unavailable", "unsafe tmux socket: replaced")
+        return real_check(server, gateway)
+
+    monkeypatch.setattr(tmux_socket, "check", check)
+    result = run(
+        [*config(tmp_path, BELL_CONFIG), "--json", "mark", ID, "attention"], gateway, state
+    )
+    assert result.code == 0
+    assert result.json()["changed"] is True
+    assert "bell not written" in result.stderr and "unsafe tmux socket" in result.stderr
+    assert gateway.tty_writes == []
+    warning, done = result.log()
+    for record in (warning, done):
+        validate(record, "termctl/log.json")
+    assert (warning["event"], warning["result"], warning["id"]) == ("warning", "warning", ID)
+    assert (done["event"], done["result"]) == ("mark", "ok")
+    assert gateway.panes is not None and gateway.panes[0]["@termctl_marker"] == "attention"
 
 
 def test_quiet_silences_the_bell_warning(state: Path, tmp_path: Path) -> None:
