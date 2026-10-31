@@ -30,12 +30,11 @@ import pytest
 from termctl.cli import main
 from termctl.gateway import SystemGateway
 
-from .conftest import TMUX_VERSION, TmuxServer, wait_for
+from .conftest import NO_CONFIG, TMUX_VERSION, TmuxServer, wait_for
 from .schemas import validate
 
 pytestmark = pytest.mark.tmux
 
-NO_CONFIG = str(Path(__file__).parent / "no-config")
 AGENT = "/tmp/termctl-test-agent.sock"
 
 # TODO(#25): tmux 3.2 differs from 3.3+ where these tests expect 3.5a's behaviour: it reports a

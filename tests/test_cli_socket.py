@@ -19,10 +19,6 @@ from .schemas import validate
 
 GOLDEN = Path(__file__).parent / "golden"
 NO_CONFIG = {"XDG_CONFIG_HOME": str(Path(__file__).parent / "no-config")}
-# A PATH on which the fake gateway finds tmux: the binary checks come first in step 3.
-ENVIRON = {**NO_CONFIG, "PATH": "/usr/bin"}
-# The only tmux call before the socket checks: the version check.
-VERSION_ONLY = [[TMUX, "-V"]]
 ID = "tc-abcdefgh"
 TMUX_COMMANDS = [
     ["open"],
@@ -47,7 +43,9 @@ def run(
         ["--json", *argv],
         gateway=gateway,
         clock=FakeClock(),
-        environ=private_environ({**ENVIRON, **(environ or {})}),
+        environ=private_environ(
+            {**NO_CONFIG, "PATH": "/usr/bin", **(environ or {})}
+        ),  # PATH: where tmux is
         stdout=stdout,
         stderr=stderr,
     )
@@ -61,13 +59,14 @@ def unsafe_ancestor() -> FakeGateway:
 
 
 @pytest.mark.parametrize("argv", TMUX_COMMANDS)
-def test_unsafe_ancestor_exits_12_and_never_connects(argv: list[str]) -> None:
+def test_unsafe_ancestor_exits_12_and_never_runs_tmux(argv: list[str]) -> None:
     gateway = unsafe_ancestor()
     code, envelope, _ = run(argv, gateway)
     validate(envelope, "termctl/cli/error.json")
     assert code == 12
     assert envelope["error"]["code"] == "server_unavailable"
-    assert gateway.calls == VERSION_ONLY
+    # Only the version probe ran; the socket checks come after it and stop before any connection.
+    assert gateway.calls == [[TMUX, "-V"]]
 
 
 def test_server_unavailable_golden() -> None:
@@ -101,7 +100,7 @@ def test_missing_default_directory_is_no_server_and_creates_nothing() -> None:
     gateway = FakeGateway(files={"/": directory(), "/tmp": directory(0o1777)})
     code, envelope, _ = run(["show", ID], gateway)
     assert (code, envelope["error"]["code"]) == (10, "no_server")
-    assert gateway.calls == VERSION_ONLY
+    assert gateway.calls == [[TMUX, "-V"]]
 
 
 @pytest.fixture

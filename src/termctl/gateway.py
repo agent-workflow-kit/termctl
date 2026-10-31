@@ -7,8 +7,12 @@ run with an argv list; the gateway never adds a shell (a hook's ``sh -c`` is in 
 
 from __future__ import annotations
 
+import ctypes
+import errno
 import os
+import platform
 import pwd
+import re
 import select
 import selectors
 import signal
@@ -31,27 +35,6 @@ from .hookwatch import kill_unreaped
 
 # How long connecting to a Unix socket may block (a listener with a full backlog).
 SOCKET_TIMEOUT = 10.0
-
-
-class BoundedOutput(NamedTuple):
-    """The result of ``Gateway.run_bounded``: at most ``limit`` bytes of each stream, and
-    whether either stream had more. When output was truncated the child is killed if still
-    running, so ``returncode`` is either its own exit status or the negative kill signal;
-    callers must not rely on it when ``truncated`` is true."""
-
-    returncode: int
-    stdout: bytes
-    stderr: bytes
-    truncated: bool
-
-
-@dataclass(frozen=True)
-class FileInfo:
-    """What termctl reads from ``lstat``: the file type and permission bits, and the owner."""
-
-    mode: int
-    uid: int
-
 
 _CHUNK = 65536
 # How long run_group keeps reading after the program exited while something it left behind
@@ -106,6 +89,46 @@ class GroupRun(NamedTuple):
         return self.returncode is None
 
 
+@dataclass(frozen=True)
+class FileInfo:
+    """What termctl reads from ``lstat``: the file type and permission bits, and the owner."""
+
+    mode: int
+    uid: int
+
+
+class BoundedOutput(NamedTuple):
+    """The result of ``Gateway.run_bounded``: at most ``limit`` bytes of each stream, and
+    whether either stream had more. When output was truncated the child is killed if still
+    running, so ``returncode`` is either its own exit status or the negative kill signal;
+    callers must not rely on it when ``truncated`` is true."""
+
+    returncode: int
+    stdout: bytes
+    stderr: bytes
+    truncated: bool
+
+
+class ProcessHandle(Protocol):
+    """A handle on one process, from ``Gateway.open_process``: on Linux a pidfd, which keeps
+    naming that process even if it exits and its PID is reused; on macOS only the PID, so the
+    caller checks the start time immediately before each signal (``procs.signal_sequence``)."""
+
+    def exited(self) -> bool:
+        """Whether the process is known to have exited (a zombie included). False when the
+        handle cannot tell (macOS); the caller also reads the process."""
+        ...
+
+    def send_signal(self, signum: int) -> bool:
+        """Send ``signum`` to the process and nothing else, never a group; False when it is
+        gone (``ESRCH``). Raises ``OSError`` for any other failure (``EPERM``)."""
+        ...
+
+    def close(self) -> None:
+        """Release the handle; idempotent."""
+        ...
+
+
 class Gateway(Protocol):
     """External effects termctl needs. Later stages add tty writes here."""
 
@@ -117,22 +140,6 @@ class Gateway(Protocol):
         timeout: float | None = None,
         env: Mapping[str, str] | None = None,
     ) -> subprocess.CompletedProcess[str]: ...
-
-    def run_bounded(
-        self,
-        argv: list[str],
-        *,
-        env: Mapping[str, str],
-        timeout: float,
-        limit: int,
-    ) -> BoundedOutput:
-        """Run ``argv`` with no stdin and keep at most ``limit`` bytes of stdout and of stderr.
-
-        Output beyond ``limit`` kills the program and sets ``truncated``. Raises
-        ``subprocess.TimeoutExpired`` (after killing it) if it has not finished, and closed
-        both streams, within ``timeout`` seconds, and ``OSError`` if it cannot be started.
-        """
-        ...
 
     def run_group(
         self,
@@ -187,6 +194,22 @@ class Gateway(Protocol):
         Raises ``OSError`` or ``ValueError`` if the watchdog cannot be started."""
         ...
 
+    def run_bounded(
+        self,
+        argv: list[str],
+        *,
+        env: Mapping[str, str],
+        timeout: float,
+        limit: int,
+    ) -> BoundedOutput:
+        """Run ``argv`` with no stdin and keep at most ``limit`` bytes of stdout and of stderr.
+
+        Output beyond ``limit`` kills the program and sets ``truncated``. Raises
+        ``subprocess.TimeoutExpired`` (after killing it) if it has not finished, and closed
+        both streams, within ``timeout`` seconds, and ``OSError`` if it cannot be started.
+        """
+        ...
+
     def current_dir(self) -> str:
         """The caller's current directory; raises ``OSError`` if it cannot be read."""
         ...
@@ -197,27 +220,6 @@ class Gateway(Protocol):
 
     def is_executable_file(self, path: str) -> bool:
         """Whether ``path`` is a regular file (symlinks followed) the real uid may execute."""
-        ...
-
-    def stdin_isatty(self) -> bool:
-        """Whether stdin (fd 0) is a terminal."""
-        ...
-
-    def stderr_isatty(self) -> bool:
-        """Whether stderr (fd 2) is a terminal."""
-        ...
-
-    def exec_replace(self, argv: list[str], env: Mapping[str, str]) -> NoReturn:
-        """Replace termctl with ``argv`` (an absolute path first) run with exactly ``env``,
-        keeping termctl's terminal, process group and descriptors: the one interactive path,
-        for ``focus``'s attach (interface.md `focus` step 2), which needs the caller's terminal
-        and so never goes through ``run``. SIGPIPE and SIGXFSZ, which Python ignores, are reset
-        to their defaults first, as ``subprocess`` does for a child. Returns only by raising
-        ``OSError`` (or ``ValueError``) when the exec fails."""
-        ...
-
-    def user_name(self) -> str | None:
-        """The real uid's user name from the password database, or None if it has none."""
         ...
 
     def real_uid(self) -> int:
@@ -258,6 +260,39 @@ class Gateway(Protocol):
         listener is not visible there). Sends nothing. Raises ``OSError`` if it cannot."""
         ...
 
+    def stdin_isatty(self) -> bool:
+        """Whether stdin (fd 0) is a terminal."""
+        ...
+
+    def stderr_isatty(self) -> bool:
+        """Whether stderr (fd 2) is a terminal."""
+        ...
+
+    def exec_replace(self, argv: list[str], env: Mapping[str, str]) -> NoReturn:
+        """Replace termctl with ``argv`` (an absolute path first) run with exactly ``env``,
+        keeping termctl's terminal, process group and descriptors: the one interactive path,
+        for ``focus``'s attach (interface.md `focus` step 2), which needs the caller's terminal
+        and so never goes through ``run``. SIGPIPE and SIGXFSZ, which Python ignores, are reset
+        to their defaults first, as ``subprocess`` does for a child. Returns only by raising
+        ``OSError`` (or ``ValueError``) when the exec fails."""
+        ...
+
+    def user_name(self) -> str | None:
+        """The real uid's user name from the password database, or None if it has none."""
+        ...
+
+    def open_process(self, pid: int) -> ProcessHandle | None:
+        """A handle on process ``pid`` (``close --force``), or None when no such process
+        exists. Linux: ``pidfd_open``; raises ``OSError`` when the kernel or Python has no
+        pidfd (the caller then sends no signal). macOS: a handle on the PID alone."""
+        ...
+
+    def proc_is_own_namespace(self) -> bool:
+        """Linux: whether ``/proc`` shows termctl's own PID namespace (``/proc/self`` names
+        termctl's PID), so ``/proc/<pid>`` is the process a pidfd or ``SO_PEERCRED`` names.
+        Raises ``OSError`` if ``/proc/self`` cannot be read."""
+        ...
+
 
 class Clock(Protocol):
     def now(self) -> datetime:
@@ -266,6 +301,10 @@ class Clock(Protocol):
 
     def monotonic(self) -> float:
         """Seconds on a clock that never goes backwards, for timeouts and durations."""
+        ...
+
+    def sleep(self, seconds: float) -> None:
+        """Wait ``seconds`` (the waits of ``close --force``)."""
         ...
 
 
@@ -323,40 +362,6 @@ class SystemGateway:
             completed.stdout.decode("utf-8", "surrogateescape"),
             completed.stderr.decode("utf-8", "surrogateescape"),
         )
-
-    def run_bounded(
-        self,
-        argv: list[str],
-        *,
-        env: Mapping[str, str],
-        timeout: float,
-        limit: int,
-    ) -> BoundedOutput:
-        deadline = time.monotonic() + timeout
-        proc = subprocess.Popen(
-            argv,
-            stdin=subprocess.DEVNULL,
-            stdout=subprocess.PIPE,
-            stderr=subprocess.PIPE,
-            env=dict(env),
-        )
-        try:
-            stdout, stderr, truncated = _read_bounded(proc, deadline, limit)
-            if truncated:
-                _kill(proc)
-            else:
-                proc.wait(timeout=max(deadline - time.monotonic(), 0))
-        except subprocess.TimeoutExpired:
-            _kill(proc)
-            raise subprocess.TimeoutExpired(argv, timeout) from None
-        except BaseException:
-            _kill(proc)
-            raise
-        finally:
-            for stream in (proc.stdout, proc.stderr):
-                if stream is not None:
-                    stream.close()
-        return BoundedOutput(proc.returncode, stdout, stderr, truncated)
 
     def run_group(
         self,
@@ -424,6 +429,40 @@ class SystemGateway:
             _release_with_pgid(stops, None if record is not None else proc.pid)
             return proc.pid
 
+    def run_bounded(
+        self,
+        argv: list[str],
+        *,
+        env: Mapping[str, str],
+        timeout: float,
+        limit: int,
+    ) -> BoundedOutput:
+        deadline = time.monotonic() + timeout
+        proc = subprocess.Popen(
+            argv,
+            stdin=subprocess.DEVNULL,
+            stdout=subprocess.PIPE,
+            stderr=subprocess.PIPE,
+            env=dict(env),
+        )
+        try:
+            stdout, stderr, truncated = _read_bounded(proc, deadline, limit)
+            if truncated:
+                _kill(proc)
+            else:
+                proc.wait(timeout=max(deadline - time.monotonic(), 0))
+        except subprocess.TimeoutExpired:
+            _kill(proc)
+            raise subprocess.TimeoutExpired(argv, timeout) from None
+        except BaseException:
+            _kill(proc)
+            raise
+        finally:
+            for stream in (proc.stdout, proc.stderr):
+                if stream is not None:
+                    stream.close()
+        return BoundedOutput(proc.returncode, stdout, stderr, truncated)
+
     def current_dir(self) -> str:
         return os.getcwd()
 
@@ -435,31 +474,6 @@ class SystemGateway:
             return os.path.isfile(path) and os.access(path, os.X_OK)
         except ValueError:  # an embedded NUL
             return False
-
-    def stdin_isatty(self) -> bool:
-        return os.isatty(0)
-
-    def stderr_isatty(self) -> bool:
-        return os.isatty(2)
-
-    def exec_replace(self, argv: list[str], env: Mapping[str, str]) -> NoReturn:
-        if not argv or not os.path.isabs(argv[0]):
-            raise ValueError(f"exec needs an absolute program path: {argv!r}")
-        restored = _restore_exec_signals()
-        try:
-            os.execve(argv[0], argv, dict(env))
-        except BaseException:
-            # The exec failed: termctl goes on, with the handlers it had.
-            for signum, handler in restored:
-                signal.signal(signum, handler)
-            raise
-
-    def user_name(self) -> str | None:
-        # The password database, not $USER or $LOGNAME, which the caller's environment can set.
-        try:
-            return pwd.getpwuid(os.getuid()).pw_name
-        except KeyError:
-            return None
 
     def real_uid(self) -> int:
         return os.getuid()
@@ -495,53 +509,166 @@ class SystemGateway:
         pid, _uid, _gid = struct.unpack("3i", creds)
         return pid
 
+    def stdin_isatty(self) -> bool:
+        return os.isatty(0)
 
-def _restore_exec_signals() -> list[tuple[int, Any]]:
-    """Reset the signals Python ignores (SIGPIPE, SIGXFSZ) to their defaults before an exec,
-    which would otherwise keep them ignored; returns the handlers replaced."""
-    replaced: list[tuple[int, Any]] = []
-    for name in ("SIGPIPE", "SIGXFSZ"):
-        signum = getattr(signal, name, None)
-        if signum is not None:
-            replaced.append((signum, signal.signal(signum, signal.SIG_DFL)))
-    return replaced
+    def stderr_isatty(self) -> bool:
+        return os.isatty(2)
+
+    def exec_replace(self, argv: list[str], env: Mapping[str, str]) -> NoReturn:
+        if not argv or not os.path.isabs(argv[0]):
+            raise ValueError(f"exec needs an absolute program path: {argv!r}")
+        restored = _restore_exec_signals()
+        try:
+            os.execve(argv[0], argv, dict(env))
+        except BaseException:
+            # The exec failed: termctl goes on, with the handlers it had.
+            for signum, handler in restored:
+                signal.signal(signum, handler)
+            raise
+
+    def user_name(self) -> str | None:
+        # The password database, not $USER or $LOGNAME, which the caller's environment can set.
+        try:
+            return pwd.getpwuid(os.getuid()).pw_name
+        except KeyError:
+            return None
+
+    def open_process(self, pid: int) -> ProcessHandle | None:
+        if sys.platform == "darwin":  # pragma: no cover - macOS only
+            return _PidHandle(pid)
+        try:
+            fd = _pidfd_open(pid)
+        except ProcessLookupError:
+            return None
+        return _PidfdHandle(fd)
+
+    def proc_is_own_namespace(self) -> bool:
+        return os.readlink("/proc/self") == str(os.getpid())
 
 
-def _kill(proc: subprocess.Popen[bytes]) -> None:
-    """Kill and reap the one child ``run_bounded`` started (never anything else)."""
-    if proc.poll() is None:
-        proc.kill()
-    proc.wait()
+# The Linux system call numbers of pidfd_send_signal (5.1) and pidfd_open (5.3) on the
+# architectures that use the unified numbering for calls added since 5.1. Others differ: alpha
+# (534, 544), ia64 (1448, 1458) and MIPS (4424/4434 o32, 5424/5434 n64, 6424/6434 n32), and
+# x32 needs __X32_SYSCALL_BIT; there the raw calls are refused (ENOSYS).
+_SYS_PIDFD_SEND_SIGNAL = 424
+_SYS_PIDFD_OPEN = 434
+# platform.machine() of the architectures known to use those numbers.
+_UNIFIED_SYSCALL_MACHINE = re.compile(r"x86_64|i[3-6]86|aarch64|arm.*|riscv64|ppc64(le)?|s390x")
+# The largest PID (and pidfd_open's pid_t argument): a C int.
+_PID_T_MAX = 2**31 - 1
 
 
-def _read_bounded(
-    proc: subprocess.Popen[bytes], deadline: float, limit: int
-) -> tuple[bytes, bytes, bool]:
-    """Read ``proc``'s stdout and stderr until both close, keeping at most ``limit`` bytes of
-    each. Stops early, with ``truncated`` set, once either has more than ``limit`` bytes;
-    raises ``subprocess.TimeoutExpired`` at ``deadline``."""
-    assert proc.stdout is not None and proc.stderr is not None
-    buffers = {proc.stdout.fileno(): bytearray(), proc.stderr.fileno(): bytearray()}
-    with selectors.DefaultSelector() as selector:
-        for fd in buffers:
-            selector.register(fd, selectors.EVENT_READ)
-        while selector.get_map():
-            remaining = deadline - time.monotonic()
-            if remaining <= 0:
-                raise subprocess.TimeoutExpired(proc.args, 0)
-            for key, _ in selector.select(remaining):
-                buffer = buffers[key.fd]
-                # One byte past the limit is enough to know the limit was exceeded.
-                chunk = os.read(key.fd, limit + 1 - len(buffer))
-                if not chunk:
-                    selector.unregister(key.fd)
-                    continue
-                buffer += chunk
-                if len(buffer) > limit:
-                    out, err = (bytes(b[:limit]) for b in buffers.values())
-                    return out, err, True
-    out, err = (bytes(b) for b in buffers.values())
-    return out, err, False
+def _syscall_numbers_known() -> bool:
+    """Whether ``_SYS_PIDFD_*`` are this machine's numbers: Linux on an allowlisted
+    architecture, and on x86_64 the 64-bit ABI (not x32, whose pointers are 4 bytes)."""
+    if sys.platform != "linux":
+        return False
+    machine = platform.machine()
+    if _UNIFIED_SYSCALL_MACHINE.fullmatch(machine) is None:
+        return False
+    return machine != "x86_64" or ctypes.sizeof(ctypes.c_void_p) == 8
+
+
+def _syscall(number: int, *args: ctypes.c_int | ctypes.c_uint | None) -> int:
+    """A raw Linux system call through libc's ``syscall``, for Python builds whose ``os`` lacks
+    the pidfd functions (some standalone builds); raises ``OSError`` with its errno, and
+    ``ENOSYS`` where the system call numbers are not known (``_syscall_numbers_known``)."""
+    if not _syscall_numbers_known():
+        raise OSError(errno.ENOSYS, "pidfd system calls are not known on this architecture")
+    libc = ctypes.CDLL(None, use_errno=True)
+    result = libc.syscall(ctypes.c_long(number), *args)
+    if result < 0:
+        code = ctypes.get_errno()
+        raise OSError(code, os.strerror(code))
+    return int(result)
+
+
+def _pidfd_open(pid: int) -> int:
+    """``pidfd_open(pid, 0)``; ``ProcessLookupError`` when no such process exists (a PID
+    outside 1 to 2**31-1 never does, and is never passed on), another ``OSError`` (``ENOSYS``
+    before Linux 5.3) when no handle can be opened."""
+    if not 1 <= pid <= _PID_T_MAX:
+        raise ProcessLookupError(errno.ESRCH, f"no process can have PID {pid}")
+    if hasattr(os, "pidfd_open"):
+        return os.pidfd_open(pid)
+    try:
+        fd = _syscall(_SYS_PIDFD_OPEN, ctypes.c_int(pid), ctypes.c_uint(0))
+    except OSError as err:
+        if err.errno == errno.ESRCH:
+            raise ProcessLookupError(err.errno, err.strerror) from None
+        raise
+    os.set_inheritable(fd, False)  # pidfd_open sets O_CLOEXEC itself; made sure here
+    return fd
+
+
+def _pidfd_send_signal(fd: int, signum: int) -> None:
+    """``pidfd_send_signal(fd, signum, NULL, 0)``; ``ProcessLookupError`` when its process
+    has exited."""
+    if hasattr(signal, "pidfd_send_signal"):
+        signal.pidfd_send_signal(fd, signum)
+        return
+    try:
+        _syscall(
+            _SYS_PIDFD_SEND_SIGNAL, ctypes.c_int(fd), ctypes.c_int(signum), None, ctypes.c_uint(0)
+        )
+    except OSError as err:
+        if err.errno == errno.ESRCH:
+            raise ProcessLookupError(err.errno, err.strerror) from None
+        raise
+
+
+class _PidfdHandle:
+    """A Linux pidfd: signals reach the process it was opened on, or nobody (``ESRCH``)."""
+
+    def __init__(self, fd: int) -> None:
+        self._fd: int | None = fd
+
+    def exited(self) -> bool:
+        if self._fd is None:
+            raise ValueError("the process handle is closed")
+        # A pidfd polls readable once its process has exited (a zombie included).
+        poller = select.poll()
+        poller.register(self._fd, select.POLLIN)
+        return bool(poller.poll(0))
+
+    def send_signal(self, signum: int) -> bool:
+        if self._fd is None:
+            raise ValueError("the process handle is closed")
+        try:
+            _pidfd_send_signal(self._fd, signum)
+        except ProcessLookupError:
+            return False
+        return True
+
+    def close(self) -> None:
+        if self._fd is not None:
+            fd, self._fd = self._fd, None
+            os.close(fd)
+
+
+# TODO(#26): macOS signals a bare PID. The start time is checked through ps (one-second
+# resolution) just before os.kill, so a PID reused between that check and the kill could be
+# signaled (docs/design.md "Implementation notes", interface.md "Residual risks"); #26 owns the
+# macOS signaling path and its verification.
+class _PidHandle:  # pragma: no cover - macOS only
+    """macOS: the PID alone. The caller checks the start time just before each signal."""
+
+    def __init__(self, pid: int) -> None:
+        self._pid = pid
+
+    def exited(self) -> bool:
+        return False
+
+    def send_signal(self, signum: int) -> bool:
+        try:
+            os.kill(self._pid, signum)
+        except ProcessLookupError:
+            return False
+        return True
+
+    def close(self) -> None:
+        pass
 
 
 class _Capture:
@@ -601,12 +728,14 @@ class _StopSignals:
     the fork and the moment the caller has the process to kill, nor lose a hook that ended.
     ``stop_signals`` installs one for a whole run; a hook's handler has the run's as its
     ``parent``: holding it holds the parent too (SIGINT stays with the run's handler), and
-    only the first signal of either raises. Not blocked with ``pthread_sigmask``: the hook
-    (or tmux and the pane) would inherit the blocked mask.
+    only the first signal of either raises. A signal in ``ignored`` (the run's, for a hook's
+    handler) does nothing at all (``RunSignals.ignore_hangups``). Not blocked with
+    ``pthread_sigmask``: the hook (or tmux and the pane) would inherit the blocked mask.
     """
 
     def __init__(self, parent: _StopSignals | None = None) -> None:
         self._parent = parent
+        self.ignored: set[int] = set()
         self._raised = False
         self._held = False
         self._holding_parent = False
@@ -615,10 +744,15 @@ class _StopSignals:
     def _done(self) -> bool:
         return self._raised or (self._parent is not None and self._parent._raised)
 
+    def _ignores(self, signum: int) -> bool:
+        return signum in self.ignored or (
+            self._parent is not None and signum in self._parent.ignored
+        )
+
     def handle(self, signum: int, frame: FrameType | None) -> None:
         # Only the first signal raises, so a second one cannot interrupt the cleanup; the run's
         # handler, restored after a hook, must not raise again either (review round 2, R2-3).
-        if self._done():
+        if self._done() or self._ignores(signum):
             return
         self._raised = True
         if self._parent is not None:
@@ -690,6 +824,13 @@ class RunSignals:
     def finish(self) -> None:
         """The run is ending (its last record is being written): ignore later stop signals."""
         self._stops.ignore_later()
+
+    def ignore_hangups(self) -> None:
+        """From now on SIGHUP does nothing, a hook's handler included (``close`` from its
+        re-check on: closing the pane termctl runs in hangs up its terminal, and the run must
+        still complete and write its records). It stays handled, not ``SIG_IGN``, so the
+        programs termctl runs get it at its default."""
+        self._stops.ignored.add(signal.SIGHUP)
 
 
 @contextmanager
@@ -944,6 +1085,54 @@ def _stop(proc: subprocess.Popen[bytes]) -> None:
         raise GroupNotStopped(proc.pid) from None
 
 
+def _restore_exec_signals() -> list[tuple[int, Any]]:
+    """Reset the signals Python ignores (SIGPIPE, SIGXFSZ) to their defaults before an exec,
+    which would otherwise keep them ignored; returns the handlers replaced."""
+    replaced: list[tuple[int, Any]] = []
+    for name in ("SIGPIPE", "SIGXFSZ"):
+        signum = getattr(signal, name, None)
+        if signum is not None:
+            replaced.append((signum, signal.signal(signum, signal.SIG_DFL)))
+    return replaced
+
+
+def _kill(proc: subprocess.Popen[bytes]) -> None:
+    """Kill and reap the one child ``run_bounded`` started (never anything else)."""
+    if proc.poll() is None:
+        proc.kill()
+    proc.wait()
+
+
+def _read_bounded(
+    proc: subprocess.Popen[bytes], deadline: float, limit: int
+) -> tuple[bytes, bytes, bool]:
+    """Read ``proc``'s stdout and stderr until both close, keeping at most ``limit`` bytes of
+    each. Stops early, with ``truncated`` set, once either has more than ``limit`` bytes;
+    raises ``subprocess.TimeoutExpired`` at ``deadline``."""
+    assert proc.stdout is not None and proc.stderr is not None
+    buffers = {proc.stdout.fileno(): bytearray(), proc.stderr.fileno(): bytearray()}
+    with selectors.DefaultSelector() as selector:
+        for fd in buffers:
+            selector.register(fd, selectors.EVENT_READ)
+        while selector.get_map():
+            remaining = deadline - time.monotonic()
+            if remaining <= 0:
+                raise subprocess.TimeoutExpired(proc.args, 0)
+            for key, _ in selector.select(remaining):
+                buffer = buffers[key.fd]
+                # One byte past the limit is enough to know the limit was exceeded.
+                chunk = os.read(key.fd, limit + 1 - len(buffer))
+                if not chunk:
+                    selector.unregister(key.fd)
+                    continue
+                buffer += chunk
+                if len(buffer) > limit:
+                    out, err = (bytes(b[:limit]) for b in buffers.values())
+                    return out, err, True
+    out, err = (bytes(b) for b in buffers.values())
+    return out, err, False
+
+
 class SystemClock:
     """The real clock."""
 
@@ -952,3 +1141,6 @@ class SystemClock:
 
     def monotonic(self) -> float:
         return time.monotonic()
+
+    def sleep(self, seconds: float) -> None:
+        time.sleep(max(seconds, 0.0))

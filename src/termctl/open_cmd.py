@@ -232,6 +232,71 @@ def check_size(invocations: Iterable[Invocation], tmux_bin: str, socket_path: st
         )
 
 
+# --- the dry run --------------------------------------------------------------------------------
+
+# The tokens a dry run shows for the pane and window ids tmux has not assigned yet.
+NEW_PANE_TOKEN = "%NEW"
+NEW_WINDOW_TOKEN = "@NEW"
+
+
+def dry_run_commands(
+    session: str,
+    plan: Plan,
+    termctl_id: str,
+    created_at: str,
+    state: SessionState,
+    env: Mapping[str, str],
+    tmux_bin: str,
+    socket_path: str,
+) -> list[list[str]]:
+    """What ``open --dry-run`` reports as ``tmux_commands``: the invocations of steps 5 and 6
+    that create and tag the pane, as argv after the tmux argument rules with ``--env`` values
+    replaced by their names (``Invocation.shown_argv``). ``state`` is what the dry run's
+    ``has-session`` found: an existing session gets ``new-window``, any other state
+    ``new-session``, prefixed with ``exit-unattached off`` when no server runs; ``env`` is the
+    filtered environment its ``set-environment`` values come from. The read-only probes and
+    confirmations a real run makes around them, and the PID recording of step 7 (which
+    depends on the process), are not listed (interface.md ``open``)."""
+    # TODO(#24): list the step-8 focus invocation when --focus is given, or document its
+    # omission in interface.md.
+    if state is SessionState.EXISTS:
+        create = tb.new_window(session, plan.window)
+    else:
+        start = state is SessionState.NO_SERVER
+        create = tb.new_session(session, plan.window, start_server=start, env=env)
+    return [
+        create.shown_argv(tmux_bin, socket_path),
+        _shown_tagging(plan, termctl_id, created_at, tmux_bin, socket_path),
+    ]
+
+
+def _shown_tagging(
+    plan: Plan, termctl_id: str, created_at: str, tmux_bin: str, socket_path: str
+) -> list[str]:
+    """The tagging invocation of step 6 as shown, with ``%NEW`` and ``@NEW`` for the ids tmux
+    has not assigned yet.
+
+    It is built with placeholder ids ``%N`` and ``@N`` that are then replaced. ``N`` is chosen
+    so that neither appears in the invocation built with the ids ``%0`` and ``@0``: the
+    caller's text (name, cwd, argv, labels, socket path) is the same in both builds, so every
+    ``%N`` and ``@N`` left in the second build is an id termctl put there, never the caller's
+    text."""
+
+    def shown(created: Created) -> list[str]:
+        invocation = plan.tag_invocation(termctl_id, created, created_at)
+        return invocation.shown_argv(tmux_bin, socket_path)
+
+    reference = "\n".join(shown(Created("%0", "@0")))
+    number = 4294967295
+    while f"%{number}" in reference or f"@{number}" in reference:
+        number -= 1
+    pane_id, window_id = f"%{number}", f"@{number}"
+    return [
+        element.replace(pane_id, NEW_PANE_TOKEN).replace(window_id, NEW_WINDOW_TOKEN)
+        for element in shown(Created(pane_id, window_id))
+    ]
+
+
 # --- step 5: server and session -----------------------------------------------------------------
 
 
@@ -369,7 +434,8 @@ def record(
     """Open order step 7: record the pane's process in ``@termctl_pid`` and
     ``@termctl_pid_start``, only if the query of step 6's invocation answered, the pane was not
     dead, on Linux the server at ``socket_path`` is the queried server as termctl's PID
-    namespace sees it, and the process is alive (not a zombie) with the tmux server as its
+    namespace sees it and ``/proc`` shows that namespace (``procs.namespace_problem``), and
+    the process is alive (not a zombie) with the tmux server as its
     parent, so the PID cannot belong to an unrelated process (spike E6). Whether it was
     recorded.
 
@@ -384,7 +450,7 @@ def record(
     if gateway.platform() != "darwin":
         # #{pid} and #{pane_pid} are in the server's PID namespace, /proc in termctl's: the
         # server's PID as the kernel shows it to termctl must be #{pid} (macOS has no PID
-        # namespaces). TODO(#23): close --force repeats this check before signaling.
+        # namespaces). close --force repeats this check before signaling (procs.verify).
         try:
             peer = gateway.socket_peer_pid(socket_path)
         except OSError as err:
@@ -394,6 +460,13 @@ def record(
             )
             return False
         if peer != query.server_pid:
+            return False
+        problem = procs.namespace_problem(gateway)
+        if problem is not None:
+            warn(
+                f"could not check the process of pane {created.pane_id}: {problem};"
+                " its PID is not recorded"
+            )
             return False
     try:
         process = procs.read(gateway, query.pane_pid)
