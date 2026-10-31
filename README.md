@@ -4,7 +4,7 @@ Places commands in terminal panes (tmux backend): open, rename, mark, focus, lis
 
 ## Status
 
-Designed: interface 0.1.0-design ([docs/interface.md](docs/interface.md)); not yet implemented. Implementation plan: [docs/plan.md](docs/plan.md).
+Implemented: interface 0.1.0-design ([docs/interface.md](docs/interface.md)). Implementation plan: [docs/plan.md](docs/plan.md).
 
 ## Layer
 

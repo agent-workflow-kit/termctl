@@ -1,0 +1,1 @@
+{"id": "tc-abcdefgh", "action": "switched", "client": "/dev/pts/2", "dry_run": false, "socket_path": "/tmp/tmux-1000/default", "session": "termctl", "window_id": "@2", "pane_id": "%3"}

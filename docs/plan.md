@@ -55,7 +55,7 @@ Status: planned, 2026-10-30. Implements [interface.md](interface.md) (normative)
 - hooks: order, veto stops later hooks (11), escalation lets later hooks run (13), timeout counts as veto, process-group kill on timeout, payload on stdin, `TERMCTL_HOOK`/`TERMCTL_ID`/`TERMCTL_OBJECT_TYPE`, decision ids from stdout validated (bad ones dropped with a warning), `--hook` name and timeout rules, `--override-escalation` gate (TTY or `--actor human:*`) and exit-13-as-allow.
 - `placements --label`: rule matching, `origin` values.
 
-**Status**: In Progress
+**Status**: Complete
 
 ## Stage 1: tmux core and the read path (0.1)
 
@@ -73,7 +73,7 @@ Status: planned, 2026-10-30. Implements [interface.md](interface.md) (normative)
 - untrusted pane fields: the pane schema marks `name`, `labels`, `marker`, `marker_text`, `placement`, `pid` as `x-untrusted` (schema test); a forged but grammar-valid option value is reported as read.
 - `show`/`exists`/`list` outputs: golden files for running, dead (with and without exit status; `exit_signal` null on 3.2), and the `exists` exit-10 output.
 
-**Status**: In Progress
+**Status**: Complete
 
 ## Stage 2: open (0.2)
 
@@ -93,7 +93,7 @@ Status: planned, 2026-10-30. Implements [interface.md](interface.md) (normative)
 
 Interim state: the CLI `open` runs every step: pre-open hooks, creation, PID recording, the read for its output, focus (#24), post-open hooks, and the log and audit records. `open --dry-run` stops after step 3 and reports the plan with `%NEW`/`@NEW` tokens (#18).
 
-**Status**: Not Started
+**Status**: Complete
 
 ## Stage 3: rename, markers and labels (0.3)
 
@@ -108,7 +108,7 @@ Interim state: the CLI `open` runs every step: pre-open hooks, creation, PID rec
 - dry runs for `rename`, `mark`, `unmark`, `label add/remove`: computed vs current display name per interface "Dry runs".
 - dead panes accept all of these.
 
-**Status**: Not Started
+**Status**: Complete
 
 ## Stage 4: close and focus (0.4)
 
@@ -119,7 +119,7 @@ Interim state: the CLI `open` runs every step: pre-open hooks, creation, PID rec
 - close: running without `--force` → 20 `running`; `--force` gate (TTY or `--actor human:*`); full id required with `--force`; pre-close hooks then re-check; `state_changed` (12) when the state changed; gone at re-check → 0 with post-close hooks; `kill-pane` only (spike D5); kernel SIGHUP then grace, SIGTERM, 5 s, SIGKILL, 1 s (spike F3); PID plus start time check before every signal, `pid_mismatch`; `@termctl_pid` not equal to the same row's `#{pane_pid}` at step 1 or at step-3 re-resolution → `pid_mismatch: true`, no signal ever sent; pane gone at re-check signals only a PID that passed the step-1 check; zombie counts as exited; survives SIGKILL → `exited: false`, exit 0; audit records for forced and override runs; `--dry-run` (`signals_possible`).
 - focus: step 1 only for clients on the caller's session (the third field of `TMUX`, used only when it holds `$TMUX_PANE`, validated `%N`); step 2 when stdin and stderr are terminals (exec in human mode; `--json` returns the 7-element attach argv with `-E`); step 3 most recent client preferring the pane's session, always `-c`; step 4 `no_client`; `--client` skips steps 1–2; `-E` keeps the session environment unchanged (spike F1); `=$N:@W.%P` targets (spike D2, F7); log written before exec; `--dry-run`.
 
-**Status**: Not Started
+**Status**: Complete
 
 ## Stage 5: Platform checks and 1.0 readiness
 
@@ -131,7 +131,7 @@ Interim state: the CLI `open` runs every step: pre-open hooks, creation, PID rec
 - macOS checklist (manual; start-time resolution, `ps` parsing, `/private/tmp` canonicalization).
 - agent-spawn flow script (in this repo's integration tests, using only termctl's CLI).
 
-**Status**: Not Started
+**Status**: In Progress
 
 ## Version roadmap
 
