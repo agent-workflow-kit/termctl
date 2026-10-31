@@ -265,8 +265,8 @@ def default_actor(*, stdin_is_tty: bool, user: str | None) -> tuple[str, str | N
 def resolve_actor(given: str | None, gateway: Gateway) -> tuple[str, str | None]:
     """``--actor`` if given, else the default; returns the actor and a warning, if any.
 
-    No caller yet: the ``--override-escalation`` gate and audit records of ``open`` (#17) and
-    the ``close --force`` gate (#23) will call it.
+    ``cli.resolve_actor`` calls it once per run, for the payloads and the log and audit
+    records. TODO(#23): close resolves its actor the same way.
     """
     if given is not None:
         return check_actor(given), None

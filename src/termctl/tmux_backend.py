@@ -41,7 +41,7 @@ import shlex
 import subprocess
 from collections.abc import Callable, Collection, Mapping, Sequence
 from dataclasses import dataclass, field
-from typing import Literal, Self
+from typing import Literal, NamedTuple, Self
 
 from .errors import TermctlError
 from .gateway import Gateway
@@ -752,6 +752,9 @@ _GUARDED_WINDOW_OPTIONS = frozenset({"automatic-rename", "allow-rename"})
 _GUARDED_DISPLAY_FIELDS = ("pane_pid", "pane_dead", "pid", "pane_id", "window_id")
 _GUARDED_DISPLAY_FIELD = "#{(?:" + "|".join(_GUARDED_DISPLAY_FIELDS) + ")}"
 _GUARDED_DISPLAY_FORMAT = re.compile(f"{_GUARDED_DISPLAY_FIELD}( {_GUARDED_DISPLAY_FIELD})*")
+# The constant line the tagging invocation of Open order step 6 ends with: the only fixed
+# text a guarded display may print besides those fields (review round 2 of #17, R2-1).
+TAG_CONFIRMATION = "termctl-tagged"
 
 
 def _check_guarded_arguments(inner: Command) -> None:
@@ -765,11 +768,13 @@ def _check_guarded_arguments(inner: Command) -> None:
     if inner.name in _FORMAT_POSITIONAL_COMMANDS:
         if "-p" not in inner.flags:
             raise ValueError(f"{inner.name} inside a guard takes -p")
-        if len(inner.positionals) != 1 or not _GUARDED_DISPLAY_FORMAT.fullmatch(
-            inner.positionals[0]
+        if len(inner.positionals) != 1 or not (
+            _GUARDED_DISPLAY_FORMAT.fullmatch(inner.positionals[0])
+            or inner.positionals[0] == TAG_CONFIRMATION
         ):
             raise ValueError(
                 f"{inner.name} inside a guard prints only {', '.join(_GUARDED_DISPLAY_FIELDS)}"
+                f" or {TAG_CONFIRMATION}"
             )
 
 
@@ -927,6 +932,12 @@ def _is_gone(result: subprocess.CompletedProcess[str]) -> bool:
     return bool(lines) and _GONE.fullmatch(lines[0]) is not None
 
 
+def is_gone(result: subprocess.CompletedProcess[str]) -> bool:
+    """Whether a tmux call failed because its target pane, window or session is gone (only
+    stderr's first line counts, as for ``_is_gone``)."""
+    return result.returncode > 0 and _is_gone(result)
+
+
 def tmux_message(result: subprocess.CompletedProcess[str]) -> str:
     """tmux's first stderr line, bounded, for an error message (escaped when printed)."""
     lines = [line.strip() for line in _stderr_lines(result) if line.strip()]
@@ -968,6 +979,259 @@ def check_guard(
         raise TermctlError(
             "not_found", f"managed pane {termctl_id} is gone or no longer the one resolved"
         )
+
+
+# --- open: server and session (interface.md "Open order" step 5) --------------------------------
+
+# What new-session and new-window print with -P: the ids of the pane and window they created.
+CREATED_FORMAT = fields("pane_id", "window_id")
+_CREATED = re.compile(r"(%[0-9]+) (@[0-9]+)\n?")
+
+
+@dataclass(frozen=True)
+class WindowSpec:
+    """The window ``open`` creates: its displayed name, its absolute working directory, the
+    command (``None`` for tmux's default shell) and its ``-e`` variables."""
+
+    name: str
+    cwd: str
+    command: tuple[str, ...] | None
+    env: tuple[tuple[str, str], ...] = ()
+
+
+def has_session(name: str) -> Invocation:
+    """``has-session -t =S:``: whether the session exists, and whether a server runs."""
+    return Invocation.of(command("has-session").target(session(name)).build())
+
+
+def _create(builder: CommandBuilder, spec: WindowSpec) -> Command:
+    """The rest of ``new-session`` or ``new-window``: always ``-d`` (never the current window),
+    the name, the directory, the variables and the command."""
+    if not os.path.isabs(spec.cwd):
+        raise ValueError(f"the working directory must be absolute: {spec.cwd!r}")
+    builder.window_name(spec.name).option("-c", spec.cwd)
+    for name, value in spec.env:
+        builder.env(name, value)
+    for element in spec.command or ():
+        builder.arg(element)
+    return builder.build()
+
+
+def _created(name: str) -> CommandBuilder:
+    return command(name).flag("-d").flag("-P").format("-F", CREATED_FORMAT)
+
+
+def new_window(name: str, spec: WindowSpec) -> Invocation:
+    """A window in the existing session ``name`` (exact ``=S:``)."""
+    return Invocation.of(_create(_created("new-window").target(session(name)), spec))
+
+
+def new_session(
+    name: str, spec: WindowSpec, *, start_server: bool, env: Mapping[str, str]
+) -> Invocation:
+    """The session ``name`` with its first window, chained with ``destroy-unattached off``
+    (spike C2) and, for each ``-e`` variable ``K``, a ``set-environment`` that replaces the
+    ``-e`` value in the session environment, so that only the first pane keeps it: ``K`` with
+    its value in ``env``, the filtered environment the invocation runs with, or, when ``env``
+    lacks ``K``, a removal marker (``-r``). A plain removal (``-u``) would let later windows
+    inherit the server's global ``K`` (review round 1, R1-2). The entry takes precedence for
+    later windows, also for a ``K`` outside ``update-environment`` (review round 2, R2-1:
+    documented, not restored exactly). ``start_server``
+    prefixes ``set -s exit-unattached off``, for a server this invocation starts (spike F2);
+    never for a server termctl did not start."""
+    target = session(name)
+    commands: list[Command] = []
+    if start_server:
+        commands.append(command("set").server_scope().arg("exit-unattached").arg("off").build())
+    commands.append(_create(_created("new-session").session_name(name), spec))
+    commands.append(command("set").target(target).arg("destroy-unattached").arg("off").build())
+    for variable, _ in spec.env:
+        restore = command("set-environment").target(target)
+        if variable in env:
+            restore.arg(variable).arg(env[variable])
+        else:
+            restore.flag("-r").arg(variable)
+        commands.append(restore.build())
+    return Invocation.of(*commands)
+
+
+# --- open: the pane (interface.md "Open order" step 6, "Command") -------------------------------
+
+# Every command termctl runs in a pane starts with this, so tmux always receives at least two
+# arguments and executes them directly (tmux runs a single argument through ``sh -c``).
+COMMAND_PREFIX = ("/usr/bin/env", "--")
+
+
+@dataclass(frozen=True)
+class Respawn:
+    """The real command that replaces the placeholder (``respawn-pane -k``): ``argv`` run as
+    ``/usr/bin/env -- [PATH=<path>] <argv...>`` in ``cwd``, with the ``--env`` variables
+    ``env`` as ``-e`` (``PATH`` excluded: tmux ignores ``-e PATH``, spike C7, so it reaches the
+    program through ``env`` instead, spike G4)."""
+
+    cwd: str
+    argv: tuple[str, ...]
+    env: tuple[tuple[str, str], ...] = ()
+    path: str | None = None
+
+
+def _respawn(target: Target, respawn: Respawn) -> Command:
+    if not respawn.argv:
+        raise ValueError("a respawn needs a command")
+    if not os.path.isabs(respawn.cwd):
+        raise ValueError(f"the working directory must be absolute: {respawn.cwd!r}")
+    builder = command("respawn-pane").flag("-k").target(target).option("-c", respawn.cwd)
+    for name, value in respawn.env:
+        if name == "PATH":
+            raise ValueError("PATH is passed through /usr/bin/env, never as -e")
+        builder.env(name, value)
+    for element in COMMAND_PREFIX:
+        builder.arg(element)
+    if respawn.path is not None:
+        builder.env_arg("PATH", respawn.path)
+    for element in respawn.argv:
+        builder.arg(element)
+    return builder.build()
+
+
+def tag_pane(
+    pane_id: str,
+    window_id: str,
+    options: Sequence[tuple[str, str]],
+    remain_on_exit: str,
+    respawn: Respawn | None,
+) -> Invocation:
+    """The tagging invocation of Open order step 6, guarded by ``untagged_in_window``: the
+    pane options ``options`` (each written with ``set -p``, an empty value as ``''``), the
+    window options ``automatic-rename off`` and ``allow-rename off``, the pane option
+    ``remain-on-exit``, then, with argv, ``respawn-pane -k`` with the real command, the
+    query of step 7 (``PROCESS_QUERY``), and last ``display -p termctl-tagged``
+    (``TAG_CONFIRMATION``), which says the chain ran to the end; ``tagged_query`` reads the
+    output.
+    """
+    if remain_on_exit not in ("off", "failed", "on"):
+        raise ValueError(f"invalid remain-on-exit value: {remain_on_exit!r}")
+    target = pane(pane_id)
+    inner = [
+        command("set").flag("-p").target(target).arg(name).arg(value).build()
+        for name, value in options
+    ]
+    for name in ("automatic-rename", "allow-rename"):
+        inner.append(command("set").flag("-w").target(target).arg(name).arg("off").build())
+    inner.append(
+        command("set").flag("-p").target(target).arg("remain-on-exit").arg(remain_on_exit).build()
+    )
+    if respawn is not None:
+        inner.append(_respawn(target, respawn))
+    inner.append(_process_query(target))
+    inner.append(
+        command("display").flag("-p").target(target).format_arg(_format(TAG_CONFIRMATION)).build()
+    )
+    return Invocation.of(guarded(target, untagged_in_window(window_id), *inner))
+
+
+def tagged_query(stdout: str) -> str | None:
+    """What a tagging invocation (``tag_pane``) that exited 0 printed before its last line
+    (the query's answer, for ``parse_process_query``), or None when that last line is not
+    ``TAG_CONFIRMATION``: tmux dropped the rest of the chain (its client was killed, say), so
+    the pane may be untagged."""
+    text = stdout.removesuffix("\n")
+    head, newline, last = text.rpartition("\n")
+    if last != TAG_CONFIRMATION:
+        return None
+    return head + newline
+
+
+# --- open: the process (interface.md "Open order" step 7) ---------------------------------------
+
+# The query of step 7: the pane's process, whether the pane is dead, and the server's PID.
+PROCESS_QUERY = fields("pane_pid", "pane_dead", "pid")
+# What PROCESS_QUERY prints: PIDs in the @termctl_pid grammar (interface.md "Pane options").
+_PROCESS_QUERY = re.compile(r"([1-9][0-9]{0,9}) ([01]) ([1-9][0-9]{0,9})\n?")
+_PID = re.compile(r"[1-9][0-9]{0,9}")
+_PID_START = re.compile(r"[0-9]{1,20}")
+
+
+class ProcessQuery(NamedTuple):
+    """What the query of step 7 reported: the pane's PID, whether the pane is dead, and the
+    tmux server's PID."""
+
+    pane_pid: int
+    dead: bool
+    server_pid: int
+
+
+def _process_query(target: Target) -> Command:
+    return command("display").flag("-p").target(target).format_arg(PROCESS_QUERY).build()
+
+
+def parse_process_query(stdout: str) -> ProcessQuery | None:
+    """The query's answer, or None for anything but exactly one such line: the query failed
+    (``display`` of a missing pane prints empty fields, spike E6; anything else that printed
+    is not trusted)."""
+    match = _PROCESS_QUERY.fullmatch(stdout)
+    if match is None:
+        return None
+    return ProcessQuery(int(match.group(1)), match.group(2) == "1", int(match.group(3)))
+
+
+def owned_process(termctl_id: str, pid: str) -> Format:
+    """``owned`` plus: the pane is not dead and still runs ``pid`` (the PID recording guard of
+    Open order step 7)."""
+    _fullmatch(_TERMCTL_ID, termctl_id, "termctl id")
+    _fullmatch(_PID, pid, "PID")
+    return all_of(
+        owned(termctl_id),
+        _format(_eq("#{pane_dead}", "0")),
+        _format(_eq("#{pane_pid}", pid)),
+    )
+
+
+def record_process(pane_id: str, termctl_id: str, pid: str, start: str) -> Invocation:
+    """Write ``@termctl_pid`` and ``@termctl_pid_start`` together, in one guarded invocation,
+    so no reader ever sees one without the other (#11), guarded by ``owned_process``."""
+    _fullmatch(_PID_START, start, "process start time")
+    target = pane(pane_id)
+    return Invocation.of(
+        guarded(
+            target,
+            owned_process(termctl_id, pid),
+            command("set").flag("-p").target(target).arg("@termctl_pid").arg(pid).build(),
+            command("set").flag("-p").target(target).arg("@termctl_pid_start").arg(start).build(),
+        )
+    )
+
+
+def cleanup_kill(pane_id: str, window_id: str) -> Invocation:
+    """The kill after a failed tagging (Open order): the pane by its exact id, only while it
+    is in ``window_id`` and its ``@termctl_pane`` is empty or its own id (``cleanup``)."""
+    target = pane(pane_id)
+    return Invocation.of(
+        guarded(target, cleanup(window_id), command("kill-pane").target(target).build())
+    )
+
+
+def parse_created(stdout: str) -> tuple[str, str] | None:
+    """The pane and window ids that ``-P -F CREATED_FORMAT`` printed, or None for anything but
+    exactly one such line."""
+    match = _CREATED.fullmatch(stdout)
+    return None if match is None else (match.group(1), match.group(2))
+
+
+def _first_line_is(result: subprocess.CompletedProcess[str], line: str) -> bool:
+    lines = _stderr_lines(result)
+    return result.returncode != 0 and bool(lines) and lines[0] == line
+
+
+def is_duplicate_session(result: subprocess.CompletedProcess[str], name: str) -> bool:
+    """Whether ``new-session`` failed because the session ``name`` exists (another caller
+    created it first). Only stderr's first line counts, as for ``is_no_server``."""
+    return _first_line_is(result, f"duplicate session: {name}")
+
+
+def is_session_missing(result: subprocess.CompletedProcess[str], name: str) -> bool:
+    """Whether a command targeting ``=name:`` failed because no such session exists."""
+    return _first_line_is(result, f"can't find session: {name}")
 
 
 # --- the runner ---------------------------------------------------------------------------------

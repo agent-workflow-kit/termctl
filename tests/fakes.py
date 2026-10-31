@@ -6,12 +6,13 @@ import errno
 import os
 import stat
 import subprocess
-from collections.abc import Mapping, Sequence
+from collections.abc import Callable, Mapping, Sequence
+from dataclasses import dataclass
 from datetime import UTC, datetime, timedelta
 from typing import Any
 
 from termctl import panes as panes_module
-from termctl.gateway import BoundedOutput, FileInfo
+from termctl.gateway import BoundedOutput, FileInfo, GroupRun
 
 # The tmux binary the fakes know about by default, found on ``PATH=/usr/bin``.
 TMUX = "/usr/bin/tmux"
@@ -116,6 +117,30 @@ def safe_default_server(uid: int = UID, tmpdir: str = "/tmp") -> dict[str, FileI
     return files
 
 
+@dataclass
+class GroupCall:
+    """One ``run_group`` or ``spawn_watched`` call as the fake saw it."""
+
+    argv: list[str]
+    stdin: bytes
+    env: dict[str, str]
+    timeout: float | None
+    stdout_limit: int | None
+    stderr_limit: int | None
+    spawned: bool
+
+
+# A scripted group run: a fixed result, an exception to raise (``KeyboardInterrupt`` and
+# ``Terminated`` included), or a function of the call.
+GroupResponse = GroupRun | BaseException | Callable[[GroupCall], GroupRun]
+
+
+def group_run(
+    returncode: int | None = 0, stdout: bytes = b"", stderr: bytes = b"", pgid: int = 4242
+) -> GroupRun:
+    return GroupRun(pgid, returncode, stdout, stderr, False, False)
+
+
 class FakeGateway:
     """Records every call and answers from a table of scripted results.
 
@@ -144,7 +169,21 @@ class FakeGateway:
         executables: set[str] | None = None,
         panes: Sequence[Mapping[str, str]] | None = None,
         list_panes: Response | None = None,
+        mkdir_error: OSError | None = None,
+        system: str = "linux",
+        proc_stats: Mapping[int, str | None | BaseException] | None = None,
+        peer_pids: Mapping[str, int | BaseException] | None = None,
     ) -> None:
+        # ``platform`` answers ``system``; ``read_proc_stat`` answers from ``proc_stats``
+        # (text, None for no such process, or an exception to raise), and an unscripted PID
+        # fails the test.
+        self.system = system
+        self.proc_stats: dict[int, str | None | BaseException] = dict(proc_stats or {})
+        self.proc_reads: list[int] = []
+        # ``socket_peer_pid`` answers from ``peer_pids`` (socket path to the peer's PID, or an
+        # exception to raise); an unscripted path fails the test.
+        self.peer_pids: dict[str, int | BaseException] = dict(peer_pids or {})
+        self.peer_checks: list[str] = []
         self.panes = None if panes is None else [dict(row) for row in panes]
         self.list_panes = list_panes
         self.responses: dict[tuple[str, ...], Response] = {
@@ -171,6 +210,18 @@ class FakeGateway:
         self.files = dict(safe_default_server(uid) if files is None else files)
         self.links = dict(links or {})
         self.lstats: list[str] = []
+        # ``make_dir`` calls as (path, mode); ``mkdir_error`` is raised by the next one, and
+        # ``appears`` (paths with their lstat) is added to ``files`` just before it, as another
+        # process creating them meanwhile would.
+        self.mkdirs: list[tuple[str, int]] = []
+        self.mkdir_error = mkdir_error
+        self.appears: dict[str, FileInfo] = {}
+        # run_group and spawn_watched answers, keyed by argv.
+        self.group_responses: dict[tuple[str, ...], GroupResponse] = {}
+        self.group_calls: list[GroupCall] = []
+        # A stop (or any exception) raised after the call's ``record`` ran, as the real
+        # gateway raises a stop signal that came while the run was being recorded; by argv.
+        self.stops_after_record: dict[tuple[str, ...], BaseException] = {}
 
     def run(
         self,
@@ -218,6 +269,57 @@ class FakeGateway:
             raise response
         return response
 
+    def run_group(
+        self,
+        argv: list[str],
+        *,
+        stdin: bytes,
+        env: Mapping[str, str],
+        timeout: float,
+        stdout_limit: int,
+        stderr_limit: int,
+        record: Callable[[GroupRun], None] | None = None,
+    ) -> GroupRun:
+        call = GroupCall(list(argv), stdin, dict(env), timeout, stdout_limit, stderr_limit, False)
+        self.group_calls.append(call)
+        response = self._group_response(argv)
+        if isinstance(response, BaseException):
+            raise response
+        run = response if isinstance(response, GroupRun) else response(call)
+        if record is not None:
+            record(run)
+        self._stop_after_record(argv)
+        return run
+
+    def spawn_watched(
+        self,
+        argv: list[str],
+        *,
+        stdin: bytes,
+        env: Mapping[str, str],
+        timeout: float,
+        record: Callable[[int], None] | None = None,
+    ) -> int:
+        self.group_calls.append(GroupCall(list(argv), stdin, dict(env), timeout, None, None, True))
+        response = self._group_response(argv)
+        if isinstance(response, BaseException):
+            raise response
+        if record is not None:
+            record(4343)
+        self._stop_after_record(argv)
+        return 4343
+
+    def _stop_after_record(self, argv: list[str]) -> None:
+        stop = self.stops_after_record.get(tuple(argv))
+        if stop is not None:
+            raise stop
+
+    def _group_response(self, argv: list[str]) -> GroupResponse:
+        try:
+            return self.group_responses[tuple(argv)]
+        except KeyError:
+            raise AssertionError(f"unexpected gateway group call: {argv!r}") from None
+
     def current_dir(self) -> str:
         if self.cwd is None:
             raise FileNotFoundError("current directory removed")
@@ -257,6 +359,41 @@ class FakeGateway:
         if path in self.files:
             raise OSError(errno.EINVAL, os.strerror(errno.EINVAL), path)
         raise FileNotFoundError(errno.ENOENT, os.strerror(errno.ENOENT), path)
+
+    def make_dir(self, path: str, mode: int) -> None:
+        """Adds a directory owned by the uid with ``mode`` (no umask), as ``mkdir`` would."""
+        self.mkdirs.append((path, mode))
+        self.files.update(self.appears)
+        self.appears = {}
+        if self.mkdir_error is not None:
+            error, self.mkdir_error = self.mkdir_error, None
+            raise error
+        if path in self.files or path in self.links:
+            raise FileExistsError(errno.EEXIST, os.strerror(errno.EEXIST), path)
+        if os.path.dirname(path) not in self.files:
+            raise FileNotFoundError(errno.ENOENT, os.strerror(errno.ENOENT), path)
+        self.files[path] = directory(mode, self.uid)
+
+    def platform(self) -> str:
+        return self.system
+
+    def read_proc_stat(self, pid: int) -> str | None:
+        self.proc_reads.append(pid)
+        if pid not in self.proc_stats:
+            raise AssertionError(f"unexpected /proc read: {pid}")
+        answer = self.proc_stats[pid]
+        if isinstance(answer, BaseException):
+            raise answer
+        return answer
+
+    def socket_peer_pid(self, path: str) -> int:
+        self.peer_checks.append(path)
+        if path not in self.peer_pids:
+            raise AssertionError(f"unexpected socket peer check: {path}")
+        answer = self.peer_pids[path]
+        if isinstance(answer, BaseException):
+            raise answer
+        return answer
 
     def _resolve(self, path: str, *, depth: int) -> str:
         if depth > 40:

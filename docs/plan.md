@@ -23,7 +23,7 @@ Status: planned, 2026-10-30. Implements [interface.md](interface.md) (normative)
 | `config.py` | 0 | YAML + `config.d` merge (maps deep, hook lists appended, other lists replaced), Pydantic models, `TERMCTL_*` scalars, load-time checks |
 | `validate.py` | 0 | grammars: ids, names, marker names and texts, labels, sessions, placement names, env names, durations, actor, decision ids, client names, socket names and paths, cwd |
 | `ids.py` | 0 | id generation, input normalization, prefix resolution (10/21, candidates) |
-| `gateway.py` | 0 | the only boundary: subprocess (tmux, `ps`), `/proc`, `stat`/`lstat`/`mkdir`, tty writes, `pidfd` (config file reads in `config.py` are the documented exception, see design.md Internal architecture) |
+| `gateway.py` | 0 | the only boundary: subprocess (tmux, `ps`), `/proc`, the server socket's `SO_PEERCRED`, `stat`/`lstat`/`mkdir`, tty writes, `pidfd` (config file reads in `config.py` are the documented exception, see design.md Internal architecture) |
 | `procs.py` | 0, 4 | process start time and parent PID (Linux `/proc`, macOS `ps`), zombie detection, the `close --force` signal sequence |
 | `jsonlog.py` | 0 | `log.jsonl` (level derived from result) and `audit.jsonl` |
 | `lock.py` | 0 | per-server `flock` with 10 s wait, canonical-path hashing |
@@ -81,15 +81,17 @@ Status: planned, 2026-10-30. Implements [interface.md](interface.md) (normative)
 **Success Criteria**: `open` creates a managed pane in the configured placement on a running or absent server, under a user config with `destroy-unattached on` and `exit-unattached on`, and the pane carries every option before the real command can exit; `--env` values reach only that pane; a cron-like caller's credentials never reach tmux; dry runs change nothing.
 **Tests**:
 
-- check order: usage → resolve (placement, cwd, `command_not_found` on the filtered or `--env` PATH, size limit 12288 bytes on the worst case) → tmux checks and id-collision check → pre-open hooks → session → pane → record → focus → post-open.
+- check order: usage (including the cwd) → resolve (server, `tmux_bin` with `tmux_missing`, placement, id, `command_not_found` on the filtered or `--env` PATH, size limit 12288 bytes on the worst case) → tmux checks and id-collision check → pre-open hooks → session → pane → record → focus → post-open.
 - placement: rules (first match, empty match), `--placement`, `--session`/`--target` overrides, inheritance from `default`, `not_supported` for `target: pane` and related fields.
 - session creation: exact `=S:` targets; duplicate-session race (two concurrent opens, one server, both panes created); `destroy-unattached off` chained (spike C2); `exit-unattached off` only when the re-probe found no server (spike F2); `has-session` confirmation; the vanished-session retry, never exit 10; re-run socket checks and `mkdir`/`EEXIST`/`lstat` before starting a server.
 - placeholder + respawn (spike C1, E5): options set before a fast-exiting command (`true`, `false`); keep `never|failed|always`; no leftover placeholder; `state: gone` output; `-d` always; PID recorded only when not dead and parented by the server (spike E6).
-- no-argv path: login shell (spike E2); `-e` via `new-window` or `new-session` + `set-environment -u` (spike G3c).
+- no-argv path: login shell (spike E2); `-e` via `new-window`, or `new-session` + `set-environment` replacing the session entry with the filtered value, or `-r` when the filtered environment lacks the variable (spike G3c; later windows get the filtered value or none, never the server's global value, even for a variable outside `update-environment`).
 - environment: every tmux invocation runs with the filtered environment (spike C7, D3); `--env` never in the session environment (spike G1–G3); `--env PATH=X` via `/usr/bin/env -- PATH=X` (spike G4); `--env PATH` without argv → 2; repeated names → 2; values redacted under `--verbose`.
 - failure handling: `tag_failed` with the guarded cleanup kill; no post-open hooks; log `result: error`.
 - hooks: pre-open payload fields (env names only), veto/escalate/override, decision ids in output, log and audit (override runs).
 - `--dry-run`: read-only tmux queries only, tmux checks, `%NEW`/`@NEW` tokens, no hooks, nothing created.
+
+Interim state: the CLI `open` runs every step but 8 (focus): pre-open hooks, creation, PID recording, the read for its output, post-open hooks, and the log and audit records. Its output has `focused: false` until focus-on-open lands (#24). `open --dry-run` still refuses (exit 1, `internal`) until #18.
 
 **Status**: Not Started
 

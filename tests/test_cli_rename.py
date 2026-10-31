@@ -469,7 +469,7 @@ def test_a_log_that_cannot_be_written_warns_and_keeps_the_exit_code(state: Path)
     result = run(["--json", "rename", ID, "new"], gateway, state)
     assert result.code == 0
     assert result.json()["changed"] is True
-    assert "cannot write the log" in result.stderr
+    assert "could not write the log record" in result.stderr
     assert "log.jsonl" in result.stderr
 
 
@@ -478,7 +478,7 @@ def test_a_log_failure_after_an_error_keeps_the_error(state: Path) -> None:
     (state / "termctl" / "log.jsonl").mkdir()
     result = run(["--json", "rename", "tc-zzzzzzzz", "n"], renaming(), state)
     assert (result.code, result.json()["error"]["code"]) == (10, "not_found")
-    assert "cannot write the log" in result.stderr
+    assert "could not write the log record" in result.stderr
 
 
 def test_quiet_suppresses_the_log_failure_warning(state: Path) -> None:

@@ -1485,6 +1485,17 @@ def test_guard_sets_only_the_options_of_the_spec(inner: Command) -> None:
         .format_arg(tb.fields("pane_pid", "pane_title"))
         .build(),
         command("display").flag("-p").target(tb.pane("%5")).format_arg(tb.owned(ID)).build(),
+        # The only fixed text allowed is the tagging's confirmation, exactly.
+        command("display")
+        .flag("-p")
+        .target(tb.pane("%5"))
+        .format_arg(tb._format(tb.NOMATCH))
+        .build(),
+        command("display")
+        .flag("-p")
+        .target(tb.pane("%5"))
+        .format_arg(tb._format(tb.TAG_CONFIRMATION + " #{pane_id}"))
+        .build(),
     ],
     ids=lambda c: " ".join(c.elements),
 )
@@ -1556,3 +1567,333 @@ def test_runner_passes_utf8_output() -> None:
     assert tmux.run(inv, utf8=True).stdout == "x\n"
     assert gateway.calls == [argv]
     assert traced == [f"tmux: {TMUX} -u -S {SOCK} list-panes -a"]
+
+
+# --- open: server and session (Open order step 5) -----------------------------------------------
+
+PLACEHOLDER = ("/usr/bin/env", "--", "sleep", "30")
+SPEC = tb.WindowSpec(name="KEY-12", cwd="/home/u/src", command=PLACEHOLDER)
+CREATED = ["-d", "-P", "-F", "#{pane_id} #{window_id}"]
+
+
+def test_has_session_is_an_exact_target() -> None:
+    assert tb.has_session("work").argv(TMUX, SOCK) == [
+        TMUX, "-S", SOCK, "has-session", "-t", "=work:",
+    ]  # fmt: skip
+
+
+def test_new_window_targets_the_session_exactly() -> None:
+    assert tb.new_window("work", SPEC).argv(TMUX, SOCK) == [
+        TMUX, "-S", SOCK, "new-window", *CREATED, "-t", "=work:", "-n", "KEY-12",
+        "-c", "/home/u/src", "--", *PLACEHOLDER,
+    ]  # fmt: skip
+
+
+def test_new_session_chains_destroy_unattached_off() -> None:
+    # Spike C2: a user's destroy-unattached on would remove the session before a second
+    # invocation could run.
+    assert tb.new_session("work", SPEC, start_server=False, env={}).argv(TMUX, SOCK) == [
+        TMUX, "-S", SOCK, "new-session", *CREATED, "-s", "work", "-n", "KEY-12",
+        "-c", "/home/u/src", "--", *PLACEHOLDER,
+        ";", "set", "-t", "=work:", "--", "destroy-unattached", "off",
+    ]  # fmt: skip
+
+
+def test_new_session_starting_a_server_is_prefixed_with_exit_unattached_off() -> None:
+    # Spike F2: the prefix runs after the user's config is loaded.
+    argv = tb.new_session("work", SPEC, start_server=True, env={}).argv(TMUX, SOCK)
+    assert argv[:9] == [TMUX, "-S", SOCK, "set", "-s", "--", "exit-unattached", "off", ";"]
+    assert argv[9:] == tb.new_session("work", SPEC, start_server=False, env={}).argv(TMUX, SOCK)[3:]
+
+
+def test_new_session_without_a_command_runs_the_default_shell() -> None:
+    spec = tb.WindowSpec(name="shell", cwd="/", command=None)
+    argv = tb.new_window("work", spec).argv(TMUX, SOCK)
+    assert argv[-2:] == ["-c", "/"]
+    assert "--" not in argv
+
+
+def test_new_session_env_is_restored_or_marked_removed_in_the_session() -> None:
+    # Spike G3c, review round 1 R1-2: -e on new-session, then for each variable what the
+    # session would hold without -e: the filtered value if the filtered environment has it,
+    # else a removal marker (-r), never -u (later windows would get the server's global value).
+    spec = tb.WindowSpec(name="shell", cwd="/", command=None, env=(("A", "1;"), ("B", "x")))
+    invocation = tb.new_session("work", spec, start_server=False, env={"A": "-filtered;"})
+    argv = invocation.argv(TMUX, SOCK)
+    assert argv[argv.index("-e") : argv.index("-e") + 4] == ["-e", "A=1\\;", "-e", "B=x"]
+    assert argv[-14:] == [
+        ";", "set-environment", "-t", "=work:", "--", "A", "-filtered\\;",
+        ";", "set-environment", "-t", "=work:", "-r", "--", "B",
+    ]  # fmt: skip
+    assert "-u" not in argv
+    assert "1;" not in " ".join(invocation.shown_argv(TMUX, SOCK))
+
+
+def test_new_session_without_env_sets_no_session_environment() -> None:
+    spec = tb.WindowSpec(name="shell", cwd="/", command=None)
+    argv = tb.new_session("work", spec, start_server=False, env={"A": "1"}).argv(TMUX, SOCK)
+    assert "set-environment" not in argv
+
+
+def test_new_window_env_is_for_that_pane_only() -> None:
+    spec = tb.WindowSpec(name="shell", cwd="/", command=None, env=(("A", "1"),))
+    argv = tb.new_window("work", spec).argv(TMUX, SOCK)
+    assert argv[-4:] == ["-c", "/", "-e", "A=1"]
+    assert "set-environment" not in argv
+
+
+@pytest.mark.parametrize("value", HOSTILE)
+def test_open_invocations_apply_the_argument_rules(value: str) -> None:
+    if "#[" in value or "\x00" in value:
+        pytest.skip("rejected as input earlier")
+    spec = tb.WindowSpec(name=value or "x", cwd="/" + value, command=(value, value))
+    for invocation in (
+        tb.new_session("work", spec, start_server=True, env={}),
+        tb.new_window("work", spec),
+    ):
+        argv = invocation.argv(TMUX, SOCK)
+        # Only termctl's own separators are a bare ";": no element ends in an unescaped one.
+        assert all(not e.endswith(";") or e.endswith("\\;") or e == ";" for e in argv)
+        assert argv.count("--") >= 1
+
+
+@pytest.mark.parametrize("name", ["", "a b", "=x", "x:", "a.b", "#", "x;", "x" * 65])
+def test_open_invocations_refuse_an_invalid_session_name(name: str) -> None:
+    with pytest.raises(ValueError):
+        tb.new_session(name, SPEC, start_server=False, env={})
+    with pytest.raises(ValueError):
+        tb.new_window(name, SPEC)
+    with pytest.raises(ValueError):
+        tb.has_session(name)
+
+
+@pytest.mark.parametrize("cwd", ["rel", "-rel", ""])
+def test_open_invocations_refuse_a_relative_cwd(cwd: str) -> None:
+    with pytest.raises(ValueError):
+        tb.new_window("work", tb.WindowSpec(name="x", cwd=cwd, command=None))
+
+
+def test_a_session_name_starting_with_a_dash_is_a_value() -> None:
+    argv = tb.new_session("-x", SPEC, start_server=False, env={}).argv(TMUX, SOCK)
+    assert argv[argv.index("-s") + 1] == "-x"
+
+
+# --- open: the pane (Open order step 6) ---------------------------------------------------------
+
+OPTIONS = [("@termctl_v", "1"), ("@termctl_name", "a b;"), ("@termctl_marker", "")]
+
+
+def test_tag_pane_shape_with_respawn() -> None:
+    respawn = tb.Respawn(cwd="/w", argv=("tool", "-x"), env=(("A", "1"),), path="/opt/bin")
+    argv = tb.tag_pane("%5", "@2", OPTIONS, "failed", respawn).argv(TMUX, SOCK)
+    assert argv[:9] == [TMUX, "-S", SOCK, "if-shell", "-F", "-t", "%5", "--",
+                        "#{&&:#{==:#{@termctl_pane},},#{==:#{window_id},@2}}"]  # fmt: skip
+    assert argv[9].split(" ; ") == [
+        "'set' '-p' '-t' '%5' '--' '@termctl_v' '1'",
+        "'set' '-p' '-t' '%5' '--' '@termctl_name' 'a b;'",
+        "'set' '-p' '-t' '%5' '--' '@termctl_marker' ''",
+        "'set' '-w' '-t' '%5' '--' 'automatic-rename' 'off'",
+        "'set' '-w' '-t' '%5' '--' 'allow-rename' 'off'",
+        "'set' '-p' '-t' '%5' '--' 'remain-on-exit' 'failed'",
+        "'respawn-pane' '-k' '-t' '%5' '-c' '/w' '-e' 'A=1' '--' '/usr/bin/env' '--'"
+        " 'PATH=/opt/bin' 'tool' '-x'",
+        # Open order step 7: the query (spike E6), then the confirmation that the chain ran to
+        # the end (review round 2 of #17, R2-1).
+        "'display' '-p' '-t' '%5' '--' '#{pane_pid} #{pane_dead} #{pid}'",
+        "'display' '-p' '-t' '%5' '--' 'termctl-tagged'",
+    ]
+    assert argv[10] == "'display' '-p' '--' 'termctl-nomatch'"
+    assert len(argv) == 11
+
+
+def test_tag_pane_without_respawn_sets_options_then_queries() -> None:
+    argv = tb.tag_pane("%5", "@2", OPTIONS, "off", None).argv(TMUX, SOCK)
+    assert "respawn-pane" not in argv[9]
+    inner = argv[9].split(" ; ")
+    assert inner[-3].endswith("'remain-on-exit' 'off'")
+    assert inner[-2] == "'display' '-p' '-t' '%5' '--' '#{pane_pid} #{pane_dead} #{pid}'"
+    assert inner[-1] == "'display' '-p' '-t' '%5' '--' 'termctl-tagged'"
+
+
+@pytest.mark.parametrize(
+    ("stdout", "expected"),
+    [
+        ("termctl-tagged\n", ""),
+        ("termctl-tagged", ""),
+        ("4242 0 77\ntermctl-tagged\n", "4242 0 77\n"),
+        ("  \ntermctl-tagged\n", "  \n"),
+        ("", None),
+        ("\n", None),
+        ("4242 0 77\n", None),
+        ("termctl-tagged\n4242 0 77\n", None),
+        ("termctl-tagged\n\n", None),
+        ("xtermctl-tagged\n", None),
+        ("termctl-tagged \n", None),
+    ],
+)
+def test_tagged_query_requires_the_confirmation_as_the_last_line(
+    stdout: str, expected: str | None
+) -> None:
+    assert tb.tagged_query(stdout) == expected
+
+
+@pytest.mark.parametrize(
+    ("stdout", "expected"),
+    [
+        ("4242 0 77\n", tb.ProcessQuery(4242, False, 77)),
+        ("4242 1 77", tb.ProcessQuery(4242, True, 77)),
+        ("9999999999 0 1\n", tb.ProcessQuery(9999999999, False, 1)),
+        ("", None),
+        ("\n", None),
+        ("  \n", None),  # display of a missing pane: empty fields (spike E6)
+        (" 0 \n", None),
+        ("0 0 77\n", None),
+        ("4242 0 0\n", None),
+        ("04242 0 77\n", None),
+        ("4242 2 77\n", None),
+        ("4242 0 77\n4242 0 77\n", None),
+        ("termctl-nomatch\n", None),
+        ("12345678901 0 77\n", None),
+        ("4242  0 77\n", None),
+        ("4242 0 77 \n", None),
+        ("٤٢ 0 77\n", None),
+        ("hook output\n4242 0 77\n", None),
+    ],
+)
+def test_parse_process_query(stdout: str, expected: tb.ProcessQuery | None) -> None:
+    assert tb.parse_process_query(stdout) == expected
+
+
+def test_record_process_writes_both_options_in_one_guard() -> None:
+    argv = tb.record_process("%5", "tc-abcdefgh", "4242", "823520334").argv(TMUX, SOCK)
+    assert argv[3:] == [
+        "if-shell", "-F", "-t", "%5", "--",
+        "#{&&:#{&&:#{==:#{@termctl_pane},#{pane_id}},#{==:#{@termctl_id},tc-abcdefgh}},"
+        "#{&&:#{==:#{pane_dead},0},#{==:#{pane_pid},4242}}}",
+        "'set' '-p' '-t' '%5' '--' '@termctl_pid' '4242' ; "
+        "'set' '-p' '-t' '%5' '--' '@termctl_pid_start' '823520334'",
+        "'display' '-p' '--' 'termctl-nomatch'",
+    ]  # fmt: skip
+
+
+@pytest.mark.parametrize(
+    ("termctl_id", "pid", "start"),
+    [
+        ("tc-abcdefgh", "0", "1"),
+        ("tc-abcdefgh", "01", "1"),
+        ("tc-abcdefgh", "12345678901", "1"),
+        ("tc-abcdefgh", "1,2", "1"),
+        ("tc-abcdefgh", "1}", "1"),
+        ("tc-abcdefgh", "#{pid}", "1"),
+        ("tc-abcdefgh", "1", ""),
+        ("tc-abcdefgh", "1", "1" * 21),
+        ("tc-abcdefgh", "1", "1;"),
+        ("tc-abcdefgh", "1", "-1"),
+        ("tc-ABCDEFGH", "1", "1"),
+        ("tc-abc}defg", "1", "1"),
+    ],
+)
+def test_record_process_refuses_values_outside_the_grammars(
+    termctl_id: str, pid: str, start: str
+) -> None:
+    with pytest.raises(ValueError):
+        tb.record_process("%5", termctl_id, pid, start)
+
+
+def test_respawn_without_path_runs_argv_after_usr_bin_env() -> None:
+    respawn = tb.Respawn(cwd="/w", argv=("A=b-is-an-argument", "x"))
+    argv = tb.tag_pane("%5", "@2", OPTIONS, "on", respawn).argv(TMUX, SOCK)
+    assert argv[9].split(" ; ")[-3].endswith("'--' '/usr/bin/env' '--' 'A=b-is-an-argument' 'x'")
+
+
+def test_tag_pane_shows_env_names_never_values() -> None:
+    respawn = tb.Respawn(
+        cwd="/w", argv=("t",), env=(("TOKENISH", "s3cret-value"),), path="/s3cret-path"
+    )
+    invocation = tb.tag_pane("%5", "@2", OPTIONS, "on", respawn)
+    shown = " ".join(invocation.shown_argv(TMUX, SOCK))
+    assert "s3cret" not in shown
+    assert "'-e' 'TOKENISH'" in shown and "'PATH' 't'" in shown
+    assert "s3cret-value" in " ".join(invocation.argv(TMUX, SOCK))
+
+
+@pytest.mark.parametrize("value", HOSTILE)
+def test_tag_pane_applies_the_argument_rules(value: str) -> None:
+    if "\x00" in value:
+        pytest.skip("rejected as input earlier")
+    respawn = tb.Respawn(cwd="/w", argv=(value or "x", value), env=(("A", value),), path=value)
+    argv = tb.tag_pane("%5", "@2", [("@termctl_name", value)], "on", respawn).argv(TMUX, SOCK)
+    # One guard: the hostile value never adds a separator or a command of its own.
+    assert argv.count(";") == 0
+    assert len(argv) == 11
+
+
+def test_respawn_refuses_path_as_e_and_an_empty_command() -> None:
+    with pytest.raises(ValueError):
+        tb.tag_pane(
+            "%5", "@2", OPTIONS, "on", tb.Respawn(cwd="/", argv=("x",), env=(("PATH", "/"),))
+        )
+    with pytest.raises(ValueError):
+        tb.tag_pane("%5", "@2", OPTIONS, "on", tb.Respawn(cwd="/", argv=()))
+    with pytest.raises(ValueError):
+        tb.tag_pane("%5", "@2", OPTIONS, "on", tb.Respawn(cwd="rel", argv=("x",)))
+
+
+@pytest.mark.parametrize("remain", ["", "yes", "always", "ON"])
+def test_tag_pane_refuses_other_remain_on_exit_values(remain: str) -> None:
+    with pytest.raises(ValueError):
+        tb.tag_pane("%5", "@2", OPTIONS, remain, None)
+
+
+def test_tag_pane_refuses_options_outside_the_spec() -> None:
+    with pytest.raises(ValueError):
+        tb.tag_pane("%5", "@2", [("status", "off")], "on", None)
+
+
+def test_cleanup_kill_is_guarded_by_the_window_and_ownership() -> None:
+    argv = tb.cleanup_kill("%5", "@2").argv(TMUX, SOCK)
+    assert argv[3:] == [
+        "if-shell", "-F", "-t", "%5", "--",
+        "#{&&:#{==:#{window_id},@2},"
+        "#{||:#{==:#{@termctl_pane},},#{==:#{@termctl_pane},#{pane_id}}}}",
+        "'kill-pane' '-t' '%5'",
+        "'display' '-p' '--' 'termctl-nomatch'",
+    ]  # fmt: skip
+
+
+@pytest.mark.parametrize(
+    ("stdout", "expected"),
+    [
+        ("%3 @2\n", ("%3", "@2")),
+        ("%0 @0", ("%0", "@0")),
+        ("", None),
+        ("%3\n", None),
+        ("%3 @2 extra\n", None),
+        ("@2 %3\n", None),
+        ("%3 @2\n%4 @5\n", None),
+        ("%x @2\n", None),
+        (" %3 @2\n", None),
+    ],
+)
+def test_parse_created(stdout: str, expected: tuple[str, str] | None) -> None:
+    assert tb.parse_created(stdout) == expected
+
+
+def result(stderr: str, returncode: int = 1) -> subprocess.CompletedProcess[str]:
+    return subprocess.CompletedProcess([], returncode, "", stderr)
+
+
+def test_duplicate_session_is_tmux_exact_message() -> None:
+    assert tb.is_duplicate_session(result("duplicate session: work\n"), "work")
+    assert not tb.is_duplicate_session(result("duplicate session: work\n"), "wor")
+    assert not tb.is_duplicate_session(result("duplicate session: work\n", 0), "work")
+    assert not tb.is_duplicate_session(result("x\nduplicate session: work\n"), "work")
+    assert not tb.is_duplicate_session(result("duplicate session: work2\n"), "work")
+
+
+def test_missing_session_is_tmux_exact_message() -> None:
+    assert tb.is_session_missing(result("can't find session: work\n"), "work")
+    assert not tb.is_session_missing(result("can't find session: work\n", 0), "work")
+    assert not tb.is_session_missing(result("can't find session: other\n"), "work")
+    assert not tb.is_session_missing(result("can't find pane: %3\n"), "work")
+    assert not tb.is_session_missing(result("hook\ncan't find session: work\n"), "work")

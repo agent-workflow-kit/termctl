@@ -23,16 +23,16 @@ replaces a forged value.
 
 from __future__ import annotations
 
-from collections.abc import Callable, Mapping
+from collections.abc import Callable, Mapping, Sequence
 from dataclasses import dataclass
+from typing import Protocol
 
 from . import ids
-from .backend import Backend
 from .display import may_rename_window, shows
 from .errors import TermctlError
 from .gateway import Clock
 from .lock import server_lock
-from .panes import ManagedPane
+from .panes import ManagedPane, PaneRead
 from .tmux_bin import TmuxVersion
 from .validate import show
 
@@ -43,6 +43,21 @@ _CURRENT: dict[str, Callable[[ManagedPane], str]] = {
     "@termctl_marker_text": lambda pane: pane.marker_text or "",
     "@termctl_labels": lambda pane: " ".join(pane.labels),
 }
+
+
+class PaneWriter(Protocol):
+    """What a pane change needs of a backend (``backend.Backend`` has all of it)."""
+
+    @property
+    def socket_path(self) -> str: ...
+
+    def read_panes(self) -> PaneRead: ...
+
+    def write_pane(
+        self, pane: ManagedPane, options: Mapping[str, str], window_name: str | None
+    ) -> bool: ...
+
+    def byte_lengths(self, pane_id: str, names: Sequence[str]) -> tuple[int, ...] | None: ...
 
 
 @dataclass(frozen=True)
@@ -65,7 +80,7 @@ class Outcome:
 
 
 def change_pane(
-    backend: Backend,
+    backend: PaneWriter,
     termctl_id: str,
     plan: Callable[[ManagedPane], Change],
     *,
@@ -91,7 +106,7 @@ def change_pane(
         return Outcome(pane=_resolve(backend, termctl_id), changed=True, display_updated=updated)
 
 
-def _resolve(backend: Backend, termctl_id: str) -> ManagedPane:
+def _resolve(backend: PaneWriter, termctl_id: str) -> ManagedPane:
     """The pane carrying exactly ``termctl_id``, read now."""
     read = backend.read_panes()
     if not read.server_running:
@@ -107,7 +122,7 @@ def _resolve(backend: Backend, termctl_id: str) -> ManagedPane:
 
 
 def _is_no_op(
-    backend: Backend, pane: ManagedPane, change: Change, version: TmuxVersion | None
+    backend: PaneWriter, pane: ManagedPane, change: Change, version: TmuxVersion | None
 ) -> bool:
     # Each compared value as printed, by the field that stores it.
     compared: dict[str, str] = {}

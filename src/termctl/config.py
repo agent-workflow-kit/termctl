@@ -25,6 +25,7 @@ from pydantic import (
     BeforeValidator,
     ConfigDict,
     Field,
+    PrivateAttr,
     TypeAdapter,
     ValidationError,
     field_validator,
@@ -66,6 +67,9 @@ DEFAULTS: dict[str, Any] = {
 ENV_KEYS = ("socket", "tmux_bin", "backend", "keep_on_exit", "close_grace", "marker_display")
 
 PRE_HOOKS = ("pre-open", "pre-close")
+
+DEFAULT_HOOK_TIMEOUT_S = 30
+MAX_HOOK_TIMEOUT_S = 600
 
 
 class ConfigError(TermctlError):
@@ -120,7 +124,21 @@ def _integral(value: Any) -> Any:
 
 
 NonEmpty = Annotated[str, Field(min_length=1)]
+
+
+def _no_nul(value: str) -> str:
+    # A command line cannot hold a NUL, so such a hook could never be started.
+    if "\x00" in value:
+        raise ValueError("must not contain a NUL character")
+    return value
+
+
+HookCmd = Annotated[str, Field(min_length=1), AfterValidator(_no_nul)]
 PositiveInt = Annotated[int, BeforeValidator(_integral), Field(ge=1)]
+# A hook timeout in whole seconds (interface.md "Hooks"): at most 10 minutes, like every other
+# duration termctl accepts, which leaves room for a gate with agent checks (design guide
+# section 8 gives such a gate 600 s).
+HookTimeout = Annotated[int, BeforeValidator(_integral), Field(ge=1, le=MAX_HOOK_TIMEOUT_S)]
 Socket = Annotated[str, _problem(_config_socket_problem, "socket")]
 Duration = Annotated[str, _grammar(_is_duration, "duration (e.g. 10s, 500ms, 2m; at most 10m)")]
 MarkerName = Annotated[str, _grammar(validate.is_marker_name, "marker name")]
@@ -172,10 +190,8 @@ class Rule(_Model):
 
 
 class PreHook(_Model):
-    cmd: NonEmpty
-    # TODO(#6): bound hook timeout (schema allows arbitrarily large ints; clamp or add a schema
-    # maximum).
-    timeout: PositiveInt = 30
+    cmd: HookCmd
+    timeout: HookTimeout = DEFAULT_HOOK_TIMEOUT_S
 
 
 class PostHook(PreHook):
@@ -204,6 +220,15 @@ class Config(_Model):
     placements: dict[PlacementName, Placement]
     rules: list[Rule]
     hooks: Hooks
+
+    # The fields of placements.default that the config files set (empty for the built-in
+    # config). Merging over DEFAULTS hides where a field came from; `placements` reports it.
+    _configured_default_fields: frozenset[str] = PrivateAttr(default=frozenset())
+
+    @property
+    def configured_default_fields(self) -> frozenset[str]:
+        """The fields of the ``default`` placement that config files set."""
+        return self._configured_default_fields
 
 
 def defaults() -> Config:
@@ -637,14 +662,28 @@ def _check_rules(cfg: Config) -> None:
             raise _key_error(f"rules[{index}].placement", f"undefined placement {rule.placement!r}")
 
 
+def _configured_default_fields(files: Mapping[str, Any]) -> frozenset[str]:
+    """The keys of ``placements.default`` in the merged files (before ``DEFAULTS``)."""
+    placements = files.get("placements")
+    default = placements.get("default") if isinstance(placements, dict) else None
+    return frozenset(default) if isinstance(default, dict) else frozenset()  # pyright: ignore[reportUnknownArgumentType]
+
+
 def load(environ: Mapping[str, str], explicit: str | None = None) -> Config:
     """Load the effective config: built-in defaults, the main file, the drop-ins in code point
     order, then ``TERMCTL_<KEY>`` scalars. Raises ``ConfigError`` naming the key, variable or
     file. A missing main file is an error only when given with ``--config``."""
     main = config_path(environ, explicit)
-    data = merge(copy.deepcopy(DEFAULTS), _read(main, optional=explicit is None))
+    files = _read(main, optional=explicit is None)
+    data = merge(copy.deepcopy(DEFAULTS), files)
     for path in _dropins(main):
-        data = merge(data, _read(path))
+        dropin = _read(path)
+        data = merge(data, dropin)
+        files = merge(files, dropin)
+    if isinstance(data.get("placements"), dict):
+        # A scalar replaced by a later map (in a file, or for placements.default) dropped the
+        # built-in placements, or the built-in default's fields: merge them back beneath.
+        data["placements"] = merge(copy.deepcopy(DEFAULTS["placements"]), data["placements"])
 
     _check_unicode(data)
     _check_pre_hooks(data)
@@ -654,4 +693,5 @@ def load(environ: Mapping[str, str], explicit: str | None = None) -> Config:
         raise _key_error(*_first_error(exc)) from None
     cfg = cfg.model_copy(update=_from_environment(environ))
     _check_rules(cfg)
+    cfg._configured_default_fields = _configured_default_fields(files)  # pyright: ignore[reportPrivateUsage]
     return cfg

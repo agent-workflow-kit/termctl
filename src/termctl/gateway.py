@@ -2,20 +2,35 @@
 
 Every call to an external program goes through a ``Gateway`` so that tests can substitute
 fakes (see design guide §14); time comes from an injectable ``Clock``. Commands are always
-run with an argv list, never through a shell.
+run with an argv list; the gateway never adds a shell (a hook's ``sh -c`` is in its argv).
 """
 
 from __future__ import annotations
 
 import os
 import pwd
+import select
 import selectors
+import signal
+import socket
+import struct
 import subprocess
+import sys
+import tempfile
+import threading
 import time
-from collections.abc import Mapping
+from collections.abc import Callable, Iterator, Mapping
+from contextlib import contextmanager
 from dataclasses import dataclass
 from datetime import UTC, datetime
-from typing import NamedTuple, Protocol
+from types import FrameType
+from typing import Any, NamedTuple, Protocol
+
+from . import hookwatch
+from .hookwatch import kill_unreaped
+
+# How long connecting to a Unix socket may block (a listener with a full backlog).
+SOCKET_TIMEOUT = 10.0
 
 
 class BoundedOutput(NamedTuple):
@@ -38,8 +53,61 @@ class FileInfo:
     uid: int
 
 
+_CHUNK = 65536
+# How long run_group keeps reading after the program exited while something it left behind
+# holds its output open (interface.md "Hooks").
+LEADER_EXIT_GRACE_S = 1.0
+# How often run_group looks for the program's exit while its output is still open.
+_EXIT_POLL_S = 0.05
+# How long a killed program may take to be reaped before GroupNotStopped.
+STOP_WAIT_S = 5.0
+# The watchdog runs by file path, so it works where the interpreter cannot import termctl (a
+# user-site install, PYTHONPATH); it imports only the standard library.
+WATCHDOG_PATH = os.path.abspath(hookwatch.__file__)
+
+
+class Terminated(BaseException):
+    """termctl got SIGTERM or SIGHUP (``_hook_signals``, ``stop_signals``); a hook that was
+    running had its group killed first. termctl exits ``128 + signum``."""
+
+    def __init__(self, signum: int) -> None:
+        super().__init__(f"terminated by signal {signum}")
+        self.signum = signum
+
+
+class GroupNotStopped(Exception):
+    """A program to be killed (timed out or interrupted) was still not reaped after SIGKILL
+    to its group and to itself, for example a set-user-ID program termctl may not signal."""
+
+    def __init__(self, pgid: int) -> None:
+        super().__init__(f"process group {pgid} could not be stopped")
+        self.pgid = pgid
+
+
+class GroupRun(NamedTuple):
+    """The result of ``Gateway.run_group``.
+
+    ``pgid`` is the process group the gateway created for the program (its PID).
+    ``returncode`` is None when the program timed out (its group was killed), else its exit
+    status, or the negative signal number that ended it. ``stdout`` and ``stderr`` hold at most
+    the requested limits; ``*_truncated`` says the program wrote more (the rest was read and
+    discarded, so a verbose program is never blocked or killed for it).
+    """
+
+    pgid: int
+    returncode: int | None
+    stdout: bytes
+    stderr: bytes
+    stdout_truncated: bool
+    stderr_truncated: bool
+
+    @property
+    def timed_out(self) -> bool:
+        return self.returncode is None
+
+
 class Gateway(Protocol):
-    """External effects termctl needs. Later stages add `/proc`, `stat` and tty writes here."""
+    """External effects termctl needs. Later stages add tty writes here."""
 
     def run(
         self,
@@ -64,6 +132,59 @@ class Gateway(Protocol):
         ``subprocess.TimeoutExpired`` (after killing it) if it has not finished, and closed
         both streams, within ``timeout`` seconds, and ``OSError`` if it cannot be started.
         """
+        ...
+
+    def run_group(
+        self,
+        argv: list[str],
+        *,
+        stdin: bytes,
+        env: Mapping[str, str],
+        timeout: float,
+        stdout_limit: int,
+        stderr_limit: int,
+        record: Callable[[GroupRun], None] | None = None,
+    ) -> GroupRun:
+        """Run ``argv`` in a new process group with exactly ``env``, write ``stdin`` to it, and
+        keep at most ``stdout_limit`` and ``stderr_limit`` bytes of its output.
+
+        The run ends when the program has exited and closed both output streams, or
+        ``LEADER_EXIT_GRACE_S`` after the program (the group's leader) exited while something
+        it left behind still holds a stream open; then the leader's exit status counts and the
+        rest of its group is left alone. If the leader has not exited within ``timeout``
+        seconds, the gateway sends SIGKILL to the group it created and to the leader (and to
+        nothing else) and returns ``returncode=None``.
+
+        While the program runs, SIGTERM and SIGHUP (unless ignored) raise ``Terminated`` and
+        SIGINT raises ``KeyboardInterrupt``; the group is killed the same way first, and the
+        exception carries its group (``started_pgid``). ``record``, if given, is called with
+        the result before it is returned, with stop signals held, so a stop that comes after
+        the program ended is raised only once the caller has recorded the run (and then
+        carries no group; without ``record`` it carries the group). Raises ``OSError`` or
+        ``ValueError`` if the program cannot be started and ``GroupNotStopped`` if it was to
+        be killed but could not be (a stop that came meanwhile is raised instead, carrying
+        the group).
+        """
+        ...
+
+    def spawn_watched(
+        self,
+        argv: list[str],
+        *,
+        stdin: bytes,
+        env: Mapping[str, str],
+        timeout: float,
+        record: Callable[[int], None] | None = None,
+    ) -> int:
+        """Start ``argv`` detached under a watchdog (``hookwatch.py``, run by its file path) in a
+        new session,
+        with exactly ``env``, ``stdin`` as its input and no output, and return the watchdog's
+        PID (also its process group and session id) without waiting. The watchdog runs
+        ``argv`` in a process group of its own and kills that group after ``timeout`` seconds.
+        Stop signals are held while it starts and while ``record`` (if given) is called with
+        the PID; a stop that came meanwhile is raised afterwards, carrying the PID
+        (``started_pgid``) unless ``record`` took it. The watchdog is not stopped then.
+        Raises ``OSError`` or ``ValueError`` if the watchdog cannot be started."""
         ...
 
     def current_dir(self) -> str:
@@ -103,6 +224,27 @@ class Gateway(Protocol):
         """The target of the symlink ``path``, as stored; raises ``OSError``."""
         ...
 
+    def make_dir(self, path: str, mode: int) -> None:
+        """``mkdir`` of ``path`` with ``mode`` (less the umask); never creates parents. Raises
+        ``FileExistsError`` if ``path`` exists (a symlink included) and ``OSError`` otherwise."""
+        ...
+
+    def platform(self) -> str:
+        """``sys.platform``: ``darwin`` on macOS, ``linux`` on Linux and WSL."""
+        ...
+
+    def read_proc_stat(self, pid: int) -> str | None:
+        """The contents of ``/proc/<pid>/stat`` (Linux and WSL), decoded as UTF-8 with
+        surrogateescape, or None when no such process exists (the file is missing, or the
+        process went away while reading it). Raises ``OSError`` for any other failure."""
+        ...
+
+    def socket_peer_pid(self, path: str) -> int:
+        """Linux: connect to the Unix socket ``path`` and return the listener's PID from
+        ``SO_PEERCRED``, as the kernel translates it into termctl's PID namespace (0 when the
+        listener is not visible there). Sends nothing. Raises ``OSError`` if it cannot."""
+        ...
+
 
 class Clock(Protocol):
     def now(self) -> datetime:
@@ -133,15 +275,35 @@ class SystemGateway:
         kept as a lone surrogate), with no newline translation, so a ``\r`` in tmux's output
         reads back as ``\r`` and no byte makes the call fail. ``stdin`` is encoded with
         ``.encode("utf-8", "surrogateescape")``.
+
+        The program runs in a process group of its own, so a signal sent to termctl's group
+        or by its terminal (``timeout``, ``kill -TERM -<pgid>``, a hangup) reaches termctl
+        only: a tmux client killed halfway through a command chain exits 0 with the rest of
+        the chain dropped. Being in a background group, it must never use the terminal (that
+        would stop it with SIGTTIN or SIGTTOU), so its stdin is ``/dev/null`` (or the
+        ``stdin`` pipe) and its output is captured: the tmux commands and ``ps`` run here
+        never attach a client or otherwise need a terminal.
         """
-        completed = subprocess.run(
-            argv,
-            input=None if stdin is None else stdin.encode("utf-8", "surrogateescape"),
-            capture_output=True,
-            timeout=timeout,
-            env=None if env is None else dict(env),
-            check=False,
-        )
+        if stdin is None:
+            completed = subprocess.run(
+                argv,
+                stdin=subprocess.DEVNULL,
+                capture_output=True,
+                timeout=timeout,
+                env=None if env is None else dict(env),
+                check=False,
+                process_group=0,
+            )
+        else:
+            completed = subprocess.run(
+                argv,
+                input=stdin.encode("utf-8", "surrogateescape"),
+                capture_output=True,
+                timeout=timeout,
+                env=None if env is None else dict(env),
+                check=False,
+                process_group=0,
+            )
         return subprocess.CompletedProcess(
             completed.args,
             completed.returncode,
@@ -183,6 +345,72 @@ class SystemGateway:
                     stream.close()
         return BoundedOutput(proc.returncode, stdout, stderr, truncated)
 
+    def run_group(
+        self,
+        argv: list[str],
+        *,
+        stdin: bytes,
+        env: Mapping[str, str],
+        timeout: float,
+        stdout_limit: int,
+        stderr_limit: int,
+        record: Callable[[GroupRun], None] | None = None,
+    ) -> GroupRun:
+        with _hook_signals() as stops:
+            try:
+                # Returns with stop signals held (``_run_group``).
+                run = _run_group(argv, stdin, env, timeout, stdout_limit, stderr_limit, stops)
+            except GroupNotStopped as exc:
+                _release_with_pgid(stops, exc.pgid)
+                raise
+            try:
+                if record is not None:
+                    record(run)
+            except BaseException:
+                stops.release()
+                raise
+            _release_with_pgid(stops, None if record is not None else run.pgid)
+            return run
+
+    def spawn_watched(
+        self,
+        argv: list[str],
+        *,
+        stdin: bytes,
+        env: Mapping[str, str],
+        timeout: float,
+        record: Callable[[int], None] | None = None,
+    ) -> int:
+        with _hook_signals() as stops:
+            # A stop signal before proc is assigned would leave a watchdog nobody lists.
+            stops.hold()
+            try:
+                # A file, not a pipe, holds the input, so writing it never blocks on a program
+                # that reads slowly or not at all. It is unlinked; only the watchdog's
+                # descriptor (which it hands to the hook unread) keeps it.
+                with tempfile.TemporaryFile() as data:
+                    data.write(stdin)
+                    data.seek(0)
+                    proc = subprocess.Popen(
+                        [sys.executable, "-I", WATCHDOG_PATH, str(timeout), *argv],
+                        stdin=data,
+                        stdout=subprocess.DEVNULL,
+                        stderr=subprocess.DEVNULL,
+                        env=dict(env),
+                        start_new_session=True,
+                    )
+            except BaseException:
+                stops.release()  # a stop signal that came meanwhile is what the caller must see
+                raise
+            try:
+                if record is not None:
+                    record(proc.pid)
+            except BaseException:
+                stops.release()
+                raise
+            _release_with_pgid(stops, None if record is not None else proc.pid)
+            return proc.pid
+
     def current_dir(self) -> str:
         return os.getcwd()
 
@@ -217,6 +445,27 @@ class SystemGateway:
 
     def read_link(self, path: str) -> str:
         return os.readlink(path)
+
+    def make_dir(self, path: str, mode: int) -> None:
+        os.mkdir(path, mode)
+
+    def platform(self) -> str:
+        return sys.platform
+
+    def read_proc_stat(self, pid: int) -> str | None:
+        try:
+            with open(f"/proc/{int(pid)}/stat", "rb") as stat_file:
+                return stat_file.read().decode("utf-8", "surrogateescape")
+        except (FileNotFoundError, ProcessLookupError):
+            return None
+
+    def socket_peer_pid(self, path: str) -> int:
+        with socket.socket(socket.AF_UNIX, socket.SOCK_STREAM) as sock:
+            sock.settimeout(SOCKET_TIMEOUT)
+            sock.connect(path)
+            creds = sock.getsockopt(socket.SOL_SOCKET, socket.SO_PEERCRED, struct.calcsize("3i"))
+        pid, _uid, _gid = struct.unpack("3i", creds)
+        return pid
 
 
 def _kill(proc: subprocess.Popen[bytes]) -> None:
@@ -254,6 +503,406 @@ def _read_bounded(
                     return out, err, True
     out, err = (bytes(b) for b in buffers.values())
     return out, err, False
+
+
+class _Capture:
+    """At most ``limit`` bytes of one output stream; whether there were more."""
+
+    def __init__(self, limit: int) -> None:
+        self.limit = limit
+        self.data = bytearray()
+        self.truncated = False
+
+    def add(self, chunk: bytes) -> None:
+        room = self.limit - len(self.data)
+        if len(chunk) > room:
+            self.truncated = True
+        self.data += chunk[: max(room, 0)]
+
+
+def _default_sigchld() -> None:
+    """Undo an inherited ``SIGCHLD = SIG_IGN``: with it the kernel reaps children at once, so
+    an exit status reads as 0 and a PID could be reused before its group is signaled."""
+    if threading.current_thread() is not threading.main_thread():
+        return  # termctl is single-threaded; only the main thread may change handlers
+    if signal.getsignal(signal.SIGCHLD) == signal.SIG_IGN:
+        signal.signal(signal.SIGCHLD, signal.SIG_DFL)
+
+
+def _stop_exception(signum: int) -> BaseException:
+    """What a stop signal raises: ``KeyboardInterrupt`` for SIGINT, else ``Terminated``."""
+    if signum == signal.SIGINT:
+        return KeyboardInterrupt()
+    return Terminated(signum)
+
+
+# The attribute run_group sets on an exception that interrupted a program it had started.
+_PGID_ATTRIBUTE = "termctl_pgid"
+
+
+def with_pgid[E: BaseException](exc: E, pgid: int) -> E:
+    """``exc``, marked as having interrupted ``run_group`` after it created group ``pgid``."""
+    setattr(exc, _PGID_ATTRIBUTE, pgid)
+    return exc
+
+
+def started_pgid(exc: BaseException) -> int | None:
+    """The process group ``run_group`` had created (and killed) when ``exc`` interrupted it, so
+    that a caller can list the interrupted program; None if it had started none."""
+    value = getattr(exc, _PGID_ATTRIBUTE, None)
+    return value if isinstance(value, int) else None
+
+
+class _StopSignals:
+    """A handler for stop signals: the first signal raises ``Terminated`` (``KeyboardInterrupt``
+    for SIGINT), unless it is held, in which case ``release`` raises it.
+
+    ``_hook_signals`` installs one for SIGTERM and SIGHUP while a hook runs, held while the hook
+    starts and from its end until the caller recorded it, so the signal cannot come between
+    the fork and the moment the caller has the process to kill, nor lose a hook that ended.
+    ``stop_signals`` installs one for a whole run; a hook's handler has the run's as its
+    ``parent``: holding it holds the parent too (SIGINT stays with the run's handler), and
+    only the first signal of either raises. Not blocked with ``pthread_sigmask``: the hook
+    (or tmux and the pane) would inherit the blocked mask.
+    """
+
+    def __init__(self, parent: _StopSignals | None = None) -> None:
+        self._parent = parent
+        self._raised = False
+        self._held = False
+        self._holding_parent = False
+        self._pending: int | None = None
+
+    def _done(self) -> bool:
+        return self._raised or (self._parent is not None and self._parent._raised)
+
+    def handle(self, signum: int, frame: FrameType | None) -> None:
+        # Only the first signal raises, so a second one cannot interrupt the cleanup; the run's
+        # handler, restored after a hook, must not raise again either (review round 2, R2-3).
+        if self._done():
+            return
+        self._raised = True
+        if self._parent is not None:
+            self._parent._raised = True
+        if self._held:
+            self._pending = signum
+            return
+        raise _stop_exception(signum)
+
+    def hold(self) -> None:
+        self._held = True
+        parent = self._parent
+        if parent is not None and not parent._held and not self._holding_parent:
+            parent._held = self._holding_parent = True
+
+    def release(self) -> None:
+        """Stop holding (and the parent, if this held it); raise the stop of a signal that
+        came while held. At most one of the two has one."""
+        self._held = False
+        if self._holding_parent:
+            assert self._parent is not None
+            self._holding_parent = False
+            self._parent.release()
+        if self._pending is not None:
+            signum, self._pending = self._pending, None
+            raise _stop_exception(signum)
+
+    def ignore_later(self) -> None:
+        """Stop holding, drop a signal that came while held and ignore any later one."""
+        self._raised = True
+        self._held, self._pending = False, None
+
+
+def _is_stop_handler(handler: Any) -> bool:
+    """Whether ``handler`` is a ``_StopSignals`` handler (``stop_signals``'), which a hook's
+    own handler may replace for as long as the hook runs."""
+    return isinstance(getattr(handler, "__self__", None), _StopSignals)
+
+
+def _run_stops() -> _StopSignals | None:
+    """The run's handler (``stop_signals``), if one handles a stop signal now."""
+    for signum in (signal.SIGINT, signal.SIGTERM, signal.SIGHUP):
+        owner = getattr(signal.getsignal(signum), "__self__", None)
+        if isinstance(owner, _StopSignals):
+            return owner
+    return None
+
+
+class RunSignals:
+    """The stop-signal handling of a whole run (``stop_signals``)."""
+
+    def __init__(self, stops: _StopSignals) -> None:
+        self._stops = stops
+
+    @contextmanager
+    def deferred(self) -> Iterator[None]:
+        """Within the block, a stop signal is only recorded; when the block ends normally its
+        stop (``KeyboardInterrupt`` or ``Terminated``) is raised. A block that ends with an
+        exception ends the run anyway: that exception is what the caller sees, and later stop
+        signals are ignored, as after ``finish``."""
+        self._stops.hold()
+        try:
+            yield
+        except BaseException:
+            self._stops.ignore_later()
+            raise
+        self._stops.release()
+
+    def finish(self) -> None:
+        """The run is ending (its last record is being written): ignore later stop signals."""
+        self._stops.ignore_later()
+
+
+@contextmanager
+def stop_signals() -> Iterator[RunSignals]:
+    """For a whole run: SIGINT (when Python's own handler is installed), SIGTERM and SIGHUP
+    (unless ignored or handled already) raise ``KeyboardInterrupt`` or ``Terminated`` through a
+    handler that ``RunSignals.deferred`` can hold, and that a running hook's handler replaces
+    for as long as the hook runs (``_hook_signals``). The previous handlers are restored
+    afterwards."""
+    stops = _StopSignals()
+    if threading.current_thread() is not threading.main_thread():
+        yield RunSignals(stops)
+        return
+    previous: dict[int, Any] = {}
+    defaults = {
+        signal.SIGINT: signal.default_int_handler,
+        signal.SIGTERM: signal.SIG_DFL,
+        signal.SIGHUP: signal.SIG_DFL,
+    }
+    try:
+        for signum, default in defaults.items():
+            if signal.getsignal(signum) == default:
+                previous[signum] = signal.signal(signum, stops.handle)
+        yield RunSignals(stops)
+    finally:
+        for signum, handler in previous.items():
+            signal.signal(signum, handler)
+
+
+@contextmanager
+def _hook_signals() -> Iterator[_StopSignals]:
+    """While a hook runs: ``SIGCHLD`` at its default, and ``SIGTERM`` and ``SIGHUP`` (unless
+    ignored or handled already, other than by ``stop_signals``) raise ``Terminated`` (see
+    ``_StopSignals``), so the hook's group is killed before termctl exits. The run's handler
+    (``stop_signals``), if any, is its parent: holding holds both, and once either has raised
+    neither raises again. The previous handlers are restored afterwards."""
+    stops = _StopSignals()
+    if threading.current_thread() is not threading.main_thread():
+        yield stops
+        return
+    _default_sigchld()
+    stops = _StopSignals(parent=_run_stops())
+    previous: dict[int, Any] = {}
+    for signum in (signal.SIGTERM, signal.SIGHUP):
+        current = signal.getsignal(signum)
+        if current == signal.SIG_DFL or _is_stop_handler(current):
+            previous[signum] = signal.signal(signum, stops.handle)
+    try:
+        yield stops
+    finally:
+        for signum, handler in previous.items():
+            signal.signal(signum, handler)
+
+
+def _release_with_pgid(stops: _StopSignals, pgid: int | None) -> None:
+    """``stops.release()``; the stop it raises carries ``pgid`` when given (``with_pgid``)."""
+    try:
+        stops.release()
+    except BaseException as exc:
+        if pgid is not None:
+            with_pgid(exc, pgid)
+        raise
+
+
+def _run_group(
+    argv: list[str],
+    stdin: bytes,
+    env: Mapping[str, str],
+    timeout: float,
+    stdout_limit: int,
+    stderr_limit: int,
+    stops: _StopSignals,
+) -> GroupRun:
+    deadline = time.monotonic() + timeout
+    # A stop signal before proc is assigned would leave the group with nobody to kill it.
+    stops.hold()
+    try:
+        proc = subprocess.Popen(
+            argv,
+            stdin=subprocess.PIPE,
+            stdout=subprocess.PIPE,
+            stderr=subprocess.PIPE,
+            env=dict(env),
+            process_group=0,  # setpgid(0, 0) in the child: the group id is proc.pid
+        )
+    except BaseException:
+        stops.release()  # a stop signal that came meanwhile is what the caller must see
+        raise
+    out = _Capture(stdout_limit)
+    err = _Capture(stderr_limit)
+    leader = _LeaderExit(proc.pid)
+    try:
+        stops.release()
+        finished = _exchange(proc, stdin, out, err, deadline, leader)
+        if finished:
+            try:
+                proc.wait(timeout=max(deadline - time.monotonic(), 0))
+            except subprocess.TimeoutExpired:
+                finished = False
+        # Held from here until the caller recorded the run (``SystemGateway.run_group``).
+        stops.hold()
+    except BaseException as exc:
+        try:
+            _stop(proc)
+        except GroupNotStopped:
+            pass  # the interruption is what the caller must see
+        with_pgid(exc, proc.pid)
+        raise
+    finally:
+        leader.close()
+        for stream in (proc.stdin, proc.stdout, proc.stderr):
+            if stream is not None:
+                try:
+                    stream.close()
+                except OSError:
+                    pass
+    if not finished:
+        _stop(proc)
+    return GroupRun(
+        pgid=proc.pid,
+        returncode=proc.returncode if finished else None,
+        stdout=bytes(out.data),
+        stderr=bytes(err.data),
+        stdout_truncated=out.truncated,
+        stderr_truncated=err.truncated,
+    )
+
+
+class _LeaderExit:
+    """Whether a child has exited, found out without reaping it, so its PID (the id of the
+    group it leads) stays reserved until the caller reaps it.
+
+    ``os.waitid`` with ``WNOWAIT`` where Python has it (Linux, and macOS from Python 3.13);
+    else a kqueue ``NOTE_EXIT`` filter (macOS before Python 3.13). Where neither works, or
+    setting it up fails, ``available`` is False and the exit is only seen when the streams
+    close. Never raises.
+    """
+
+    def __init__(self, pid: int) -> None:
+        self._pid = pid
+        self._exited = False
+        self._kqueue: Any = None
+        self.available = False
+        try:
+            self._watch()
+        except OSError:
+            self.close()
+            self.available = False
+
+    def _watch(self) -> None:
+        self.available = hasattr(os, "waitid") and hasattr(os, "WNOWAIT")
+        if not self.available and sys.platform == "darwin":  # pragma: no cover - macOS only
+            self._kqueue = select.kqueue()
+            event = select.kevent(
+                self._pid,
+                filter=select.KQ_FILTER_PROC,
+                flags=select.KQ_EV_ADD | select.KQ_EV_ONESHOT,
+                fflags=select.KQ_NOTE_EXIT,
+            )
+            try:
+                self._kqueue.control([event], 0, 0)
+                self.available = True
+            except ProcessLookupError:  # already a zombie
+                self._exited = self.available = True
+
+    def exited(self) -> bool:
+        if self._exited or not self.available:
+            return self._exited
+        if self._kqueue is not None:  # pragma: no cover - macOS only
+            self._exited = bool(self._kqueue.control(None, 1, 0))
+            return self._exited
+        try:
+            result = os.waitid(os.P_PID, self._pid, os.WEXITED | os.WNOHANG | os.WNOWAIT)
+        except ChildProcessError:
+            return False  # reaped by someone else: the exit cannot be seen; wait for timeout
+        self._exited = result is not None
+        return self._exited
+
+    def close(self) -> None:
+        if self._kqueue is not None:  # pragma: no cover - macOS only
+            self._kqueue.close()
+            self._kqueue = None
+
+
+def _exchange(
+    proc: subprocess.Popen[bytes],
+    stdin: bytes,
+    out: _Capture,
+    err: _Capture,
+    deadline: float,
+    leader: _LeaderExit,
+) -> bool:
+    """Write ``stdin`` to ``proc`` and read its output until both output streams close, or
+    until ``LEADER_EXIT_GRACE_S`` (but not past ``deadline``) after ``proc`` exited.
+
+    Returns False if ``deadline`` passed while ``proc`` was still running. A program that exits
+    (or closes its input) without reading all of ``stdin`` is not an error. Never reaps
+    ``proc``, so its PID stays its group's id until the caller waits for it.
+    """
+    assert proc.stdin is not None and proc.stdout is not None and proc.stderr is not None
+    captures = {proc.stdout.fileno(): out, proc.stderr.fileno(): err}
+    view = memoryview(stdin)
+    end = deadline
+    exited = False
+    with selectors.DefaultSelector() as selector:
+        for fd in captures:
+            selector.register(fd, selectors.EVENT_READ)
+        stdin_fd = proc.stdin.fileno()
+        if view:
+            os.set_blocking(stdin_fd, False)
+            selector.register(stdin_fd, selectors.EVENT_WRITE)
+        else:
+            proc.stdin.close()
+        while selector.get_map():
+            now = time.monotonic()
+            if not exited and leader.exited():
+                exited = True
+                end = min(deadline, now + LEADER_EXIT_GRACE_S)
+            remaining = end - now
+            if remaining <= 0:
+                return exited
+            if not exited and leader.available:
+                remaining = min(remaining, _EXIT_POLL_S)
+            for key, _ in selector.select(remaining):
+                if key.fd == stdin_fd:
+                    try:
+                        view = view[os.write(stdin_fd, view[:_CHUNK]) :]
+                    except BlockingIOError:
+                        continue
+                    except BrokenPipeError:
+                        view = view[:0]
+                    if not view:
+                        selector.unregister(stdin_fd)
+                        proc.stdin.close()
+                    continue
+                chunk = os.read(key.fd, _CHUNK)
+                if chunk:
+                    captures[key.fd].add(chunk)
+                else:
+                    selector.unregister(key.fd)
+    return True
+
+
+def _stop(proc: subprocess.Popen[bytes]) -> None:
+    """SIGKILL the process group ``run_group`` created for ``proc`` and ``proc`` itself
+    (``hookwatch.kill_unreaped``), then reap ``proc``; raise ``GroupNotStopped`` if it is
+    still not reaped after ``STOP_WAIT_S``."""
+    kill_unreaped(proc)
+    try:
+        proc.wait(timeout=STOP_WAIT_S)
+    except subprocess.TimeoutExpired:
+        raise GroupNotStopped(proc.pid) from None
 
 
 class SystemClock:

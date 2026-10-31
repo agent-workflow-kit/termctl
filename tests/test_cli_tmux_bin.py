@@ -4,6 +4,7 @@ from __future__ import annotations
 
 import io
 import json
+import os
 from pathlib import Path
 from typing import Any
 
@@ -14,6 +15,7 @@ from termctl.cli import Context, Output, Result
 from termctl.errors import TermctlError
 from termctl.tmux_bin import TmuxBinary, TmuxVersion
 
+from .conftest import private_environ
 from .fakes import TMUX, FakeClock, FakeGateway, completed
 from .schemas import validate
 from .test_cli import ENVIRON, ID, MINIMAL, NO_CONFIG, Run
@@ -96,7 +98,7 @@ def test_resolved_and_kept_on_the_context(monkeypatch: pytest.MonkeyPatch) -> No
 def test_check_tmux_probes_only_once() -> None:
     gateway = FakeGateway()
     out = Output(stdout=io.StringIO(), stderr=io.StringIO())
-    ctx = Context(gateway=gateway, clock=FakeClock(), environ=ENVIRON, out=out)
+    ctx = Context(gateway=gateway, clock=FakeClock(), environ=private_environ(ENVIRON), out=out)
     args = cli.parse_args(["show", ID])
     cli.resolve_server(args, ctx)
     cli.check_tmux(args, ctx)
@@ -125,11 +127,22 @@ def test_earlier_resolution_is_reused_and_the_version_still_checked() -> None:
     assert ctx.tmux is None
 
 
-def test_version_query_gets_the_callers_locale_only(monkeypatch: pytest.MonkeyPatch) -> None:
+def test_version_query_gets_the_filtered_environment(monkeypatch: pytest.MonkeyPatch) -> None:
+    # interface.md "Environment": every tmux command, `tmux -V` included, runs with the
+    # caller's environment filtered by server_env_allow; the default keeps the locale.
     capture(monkeypatch)
     environ = {**ENVIRON, "LANG": "de_DE.UTF-8", "LC_ALL": "de_DE.UTF-8", "SECRET": "x"}
     run = Run(["list"], environ=environ)
-    assert run.gateway.envs == [{"LANG": "de_DE.UTF-8", "LC_ALL": "de_DE.UTF-8"}]
+    state_home = os.environ["XDG_STATE_HOME"]  # the test's private one (conftest)
+    assert run.gateway.envs == [
+        {
+            **NO_CONFIG,
+            "PATH": "/usr/bin",
+            "LANG": "de_DE.UTF-8",
+            "LC_ALL": "de_DE.UTF-8",
+            "XDG_STATE_HOME": state_home,
+        }
+    ]
 
 
 def test_failed_version_query_escapes_tmux_stderr() -> None:

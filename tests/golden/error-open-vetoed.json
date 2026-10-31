@@ -1,0 +1,1 @@
+{"error": {"code": "vetoed", "message": "pre-open hook vetoed (exit 1): gate", "hook": "gate", "hook_stderr": "no\n", "decision_ids": ["d-1", "gate-7"]}}

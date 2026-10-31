@@ -2,6 +2,7 @@ from __future__ import annotations
 
 import io
 import json
+import signal
 import subprocess
 import sys
 import tomllib
@@ -13,8 +14,9 @@ import pytest
 from termctl import __version__, cli
 from termctl.cli import Context, Result, main, parse_args
 from termctl.errors import TermctlError, UsageError
+from termctl.gateway import Terminated
 
-from .conftest import STATE_HOME
+from .conftest import private_environ
 from .fakes import TMUX, FakeClock, FakeGateway, is_list_panes, pane_row
 from .schemas import validate
 
@@ -22,7 +24,7 @@ GOLDEN = Path(__file__).parent / "golden"
 # A config directory that does not exist, so tests never read the user's own config.
 NO_CONFIG = {"XDG_CONFIG_HOME": str(Path(__file__).parent / "no-config")}
 # The environment of a ``Run``: no config, and a PATH on which the fake gateway finds tmux.
-ENVIRON = {**NO_CONFIG, "PATH": "/usr/bin", "XDG_STATE_HOME": STATE_HOME}
+ENVIRON = {**NO_CONFIG, "PATH": "/usr/bin"}
 ID = "tc-abcdefgh"
 
 # The shortest valid invocation of every command in interface.md "Commands".
@@ -69,7 +71,7 @@ class Run:
             argv,
             gateway=self.gateway,
             clock=FakeClock(),
-            environ=ENVIRON if environ is None else environ,
+            environ=private_environ(ENVIRON if environ is None else environ),
             stdout=stdout,
             stderr=stderr,
         )
@@ -611,12 +613,21 @@ def steps(monkeypatch: pytest.MonkeyPatch) -> list[str]:
     seen: list[str] = []
 
     def recorder(step: str):
-        def record(args: Any, ctx: Context) -> None:
+        def record(*_: Any) -> None:
             seen.append(step)
 
         return record
 
-    for step in ("load_config", "resolve_server", "check_tmux", "resolve_id"):
+    for step in (
+        "load_config",
+        "resolve_server",
+        "resolve_tmux_bin",
+        "resolve_placement",
+        "resolve_command",
+        "check_tmux",
+        "check_id_collision",
+        "resolve_id",
+    ):
         monkeypatch.setattr(cli, step, recorder(step))
 
     def handler(args: Any, ctx: Context) -> Result:
@@ -633,10 +644,25 @@ def test_check_order_for_commands_with_an_id(command: str, steps: list[str]) -> 
     assert steps == ["load_config", "resolve_server", "check_tmux", "resolve_id", f"run {command}"]
 
 
-@pytest.mark.parametrize("command", ["open", "list"])
-def test_check_order_for_tmux_commands_without_an_id(command: str, steps: list[str]) -> None:
-    assert Run(MINIMAL[command]).code == 0
-    assert steps == ["load_config", "resolve_server", "check_tmux", f"run {command}"]
+def test_check_order_for_list(steps: list[str]) -> None:
+    assert Run(MINIMAL["list"]).code == 0
+    assert steps == ["load_config", "resolve_server", "check_tmux", "run list"]
+
+
+def test_check_order_for_open(steps: list[str]) -> None:
+    # Open order: resolve (server, tmux_bin, placement, command and size), then the tmux
+    # checks and the id-collision check, then the command's own steps.
+    assert Run(MINIMAL["open"]).code == 0
+    assert steps == [
+        "load_config",
+        "resolve_server",
+        "resolve_tmux_bin",
+        "resolve_placement",
+        "resolve_command",
+        "check_tmux",
+        "check_id_collision",
+        "run open",
+    ]
 
 
 def test_placements_needs_no_tmux(steps: list[str]) -> None:
@@ -760,6 +786,25 @@ def test_unexpected_exception_is_internal(monkeypatch: pytest.MonkeyPatch) -> No
     }
 
 
+@pytest.mark.parametrize(
+    ("stop", "code", "message"),
+    [
+        (KeyboardInterrupt(), 130, "termctl: interrupted\n"),
+        (Terminated(signal.SIGTERM), 143, "termctl: terminated by signal 15\n"),
+        (Terminated(signal.SIGHUP), 129, "termctl: terminated by signal 1\n"),
+    ],
+)
+def test_a_stop_signal_exits_128_plus_its_number_without_a_traceback(
+    monkeypatch: pytest.MonkeyPatch, stop: BaseException, code: int, message: str
+) -> None:
+    def stopped(args: Any, ctx: Context) -> Result:
+        raise stop
+
+    monkeypatch.setattr(cli, "run_command", stopped)
+    run = Run(["--json", "--quiet", "placements"])
+    assert (run.code, run.stdout, run.stderr) == (code, "", message)
+
+
 def test_quiet_suppresses_warnings_but_not_errors(monkeypatch: pytest.MonkeyPatch) -> None:
     def warn_then_fail(args: Any, ctx: Context) -> Result:
         ctx.out.warn("careful")
@@ -807,7 +852,7 @@ def test_context_carries_injected_gateway_and_clock(monkeypatch: pytest.MonkeyPa
 # --- unimplemented commands ---------------------------------------------------------------------
 
 
-IMPLEMENTED = {"show", "exists", "list", "rename"}
+IMPLEMENTED = {"show", "exists", "list", "placements", "open", "rename"}
 UNIMPLEMENTED = sorted(set(MINIMAL) - IMPLEMENTED)
 
 
@@ -856,7 +901,7 @@ def run_with(argv: list[str], *, stdout: io.StringIO, stderr: io.StringIO) -> in
         argv,
         gateway=FakeGateway(),
         clock=FakeClock(),
-        environ=ENVIRON,
+        environ=private_environ(ENVIRON),
         stdout=stdout,
         stderr=stderr,
     )
@@ -1119,6 +1164,8 @@ def test_standard_streams_use_backslashreplace(monkeypatch: pytest.MonkeyPatch) 
     stdout, stderr = strict_stream(), strict_stream()
     monkeypatch.setattr(sys, "stdout", stdout)
     monkeypatch.setattr(sys, "stderr", stderr)
-    code = main(["placements"], gateway=FakeGateway(), clock=FakeClock(), environ={})
+    code = main(
+        ["placements"], gateway=FakeGateway(), clock=FakeClock(), environ=private_environ({})
+    )
     assert code == 0
     assert stdout.buffer.getvalue() == b"\\xe9\n"  # type: ignore[attr-defined]
