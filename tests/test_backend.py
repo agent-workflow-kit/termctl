@@ -231,17 +231,10 @@ def test_write_pane_of_a_pane_no_longer_the_one_resolved_is_not_found() -> None:
     assert (caught.value.code, caught.value.exit_code) == ("not_found", 10)
 
 
-def test_write_pane_without_options_checks_the_pane_with_a_guarded_display() -> None:
-    combined = _with_window(_rename("n"))
-    probe = command("display").flag("-p").target(tb.pane(PANE.pane_id))
-    alone = _options_only(probe.format_arg(tb.fields("pane_id")).build())
-    backend = _backend({combined: NOMATCH, alone: completed(PANE.pane_id + "\n")})
-    assert backend.write_pane(PANE, {}, "n") is False
-
-
-def test_write_pane_needs_something_to_write() -> None:
+@pytest.mark.parametrize("window_name", [None, "n"])
+def test_write_pane_needs_options(window_name: str | None) -> None:
     with pytest.raises(ValueError):
-        _backend({}).write_pane(PANE, {}, None)
+        _backend({}).write_pane(PANE, {}, window_name)
 
 
 @pytest.mark.parametrize(
@@ -271,28 +264,49 @@ def test_write_pane_failure_of_the_options_only_guard() -> None:
 
 def _lengths_argv(*names: str) -> tuple[str, ...]:
     probe = command("display").flag("-p").target(tb.pane(PANE.pane_id))
-    return _argv(probe.format_arg(tb.byte_lengths(*names)).build())
+    return _argv(probe.format_arg(tb.length_probe(*names)).build())
+
+
+IDENTITY = f"{PANE.pane_id} {PANE.window_id} {PANE.pane_id} {ID}"
 
 
 def test_byte_lengths_reads_each_field() -> None:
+    argv = _lengths_argv("@termctl_name", "@termctl_marker_text")
+    backend = _backend({argv: completed(f"{IDENTITY} 3 12\n")})
+    assert backend.byte_lengths(PANE, ["@termctl_name", "@termctl_marker_text"]) == (3, 12)
+
+
+def test_byte_lengths_of_a_window_name_without_a_tab_or_newline() -> None:
     argv = _lengths_argv("@termctl_name", "window_name")
-    backend = _backend({argv: completed("3 12\n")})
-    assert backend.byte_lengths(PANE.pane_id, ["@termctl_name", "window_name"]) == (3, 12)
+    backend = _backend({argv: completed(f"{IDENTITY} 3 12 0\n")})
+    assert backend.byte_lengths(PANE, ["@termctl_name", "window_name"]) == (3, 12)
 
 
 @pytest.mark.parametrize(
     "result",
     [
-        completed("3\n"),
-        completed("3 x\n"),
+        completed(f"{IDENTITY} 3\n"),
+        completed(f"{IDENTITY} 3 x 0\n"),
         completed(""),
-        completed("3 4 5\n"),
-        completed("-1 2\n"),
-        completed("3 4\n", returncode=1),
+        completed(f"{IDENTITY} 3 4 5 0\n"),
+        completed(f"{IDENTITY} -1 2 0\n"),
+        completed(f"{IDENTITY} 3 4 0\n", returncode=1),
         completed(stderr="can't find pane: %3\n", returncode=1),
+        # The window name holds a tab or newline, which the reader showed as a space.
+        completed(f"{IDENTITY} 3 4 1\n"),
+        completed(f"{IDENTITY} 3 4 x\n"),
+        # Another pane answered (a server restarted and reused %3, or the pane moved).
+        completed(f"%4 {PANE.window_id} {PANE.pane_id} {ID} 3 4 0\n"),
+        completed(f"{PANE.pane_id} @99 {PANE.pane_id} {ID} 3 4 0\n"),
+        completed(f"{PANE.pane_id} {PANE.window_id} %4 {ID} 3 4 0\n"),
+        completed(f"{PANE.pane_id} {PANE.window_id} {PANE.pane_id} tc-zzzzzzzz 3 4 0\n"),
+        completed(f"{PANE.pane_id} {PANE.window_id}  {ID} 3 4 0\n"),
+        completed(f"{IDENTITY} 3 4 0\nextra\n"),
     ],
 )
-def test_byte_lengths_is_none_when_unreadable(result: subprocess.CompletedProcess[str]) -> None:
+def test_byte_lengths_is_none_when_unreadable_or_another_pane(
+    result: subprocess.CompletedProcess[str],
+) -> None:
     argv = _lengths_argv("@termctl_name", "window_name")
     backend = _backend({argv: result})
-    assert backend.byte_lengths(PANE.pane_id, ["@termctl_name", "window_name"]) is None
+    assert backend.byte_lengths(PANE, ["@termctl_name", "window_name"]) is None

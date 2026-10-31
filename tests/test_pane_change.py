@@ -59,13 +59,13 @@ class FakeBackend:
         self.writes.append((pane.pane_id, dict(options), window_name))
         return window_name is not None and self.window_renamed
 
-    def byte_lengths(self, pane_id: str, names: Sequence[str]) -> tuple[int, ...] | None:
-        self.length_queries.append((pane_id, tuple(names)))
+    def byte_lengths(self, pane: ManagedPane, names: Sequence[str]) -> tuple[int, ...] | None:
+        self.length_queries.append((pane.pane_id, tuple(names)))
         return self.lengths
 
 
-def read(*found: ManagedPane) -> PaneRead:
-    return PaneRead(server_running=True, panes=found, warnings=())
+def read(*found: ManagedPane, warnings: tuple[str, ...] = ()) -> PaneRead:
+    return PaneRead(server_running=True, panes=found, warnings=warnings)
 
 
 @pytest.fixture
@@ -78,10 +78,14 @@ def change(
     plan: Change,
     environ: Mapping[str, str],
     version: TmuxVersion | None = V35,
+    warned: list[str] | None = None,
+    seen: Sequence[str] = (),
 ) -> pane_change.Outcome:
+    sink = [] if warned is None else warned
     return pane_change.change_pane(
-        backend, ID, lambda pane: plan, version=version, environ=environ, clock=FakeClock()
-    )
+        backend, ID, lambda pane: plan, version=version, environ=environ, clock=FakeClock(),
+        warn=sink.append, seen=seen,
+    )  # fmt: skip
 
 
 def renamed(name: str) -> Change:
@@ -111,7 +115,9 @@ def test_the_plan_sees_the_pane_as_read_under_the_lock(environ: dict[str, str]) 
         return renamed("x")
 
     backend = FakeBackend([read(fresh)])
-    pane_change.change_pane(backend, ID, plan, version=V35, environ=environ, clock=FakeClock())
+    pane_change.change_pane(
+        backend, ID, plan, version=V35, environ=environ, clock=FakeClock(), warn=print
+    )
     assert seen == [fresh]
 
 
@@ -167,6 +173,27 @@ def test_a_pane_gone_before_the_lock_is_not_found(environ: dict[str, str]) -> No
         change(backend, renamed("new"), environ)
     assert caught.value.exit_code == 10
     assert backend.writes == []
+
+
+def test_warnings_of_the_read_under_the_lock_are_reported(environ: dict[str, str]) -> None:
+    # The pane turned invalid while termctl waited for the lock: it is gone, with the reason.
+    backend = FakeBackend([read(warnings=("ignoring managed pane %3: bad",))])
+    warned: list[str] = []
+    with pytest.raises(TermctlError) as caught:
+        change(backend, renamed("new"), environ, warned=warned)
+    assert caught.value.exit_code == 10
+    assert warned == ["ignoring managed pane %3: bad"]
+
+
+def test_warnings_are_reported_once(environ: dict[str, str]) -> None:
+    pane = managed()
+    after = replace(pane, name="new", display_name="new")
+    backend = FakeBackend(
+        [read(pane, warnings=("old", "w1")), read(after, warnings=("w1", "w2", "old"))]
+    )
+    warned: list[str] = []
+    change(backend, renamed("new"), environ, warned=warned, seen=("old",))
+    assert warned == ["w1", "w2"]
 
 
 def test_a_server_gone_before_the_lock_is_not_found(environ: dict[str, str]) -> None:
@@ -266,6 +293,31 @@ def test_multibyte_text_is_measured_in_bytes(environ: dict[str, str]) -> None:
     assert change(backend, renamed(name), environ).changed is False
 
 
+def test_a_window_name_holding_a_space_is_measured(environ: dict[str, str]) -> None:
+    # The reader shows a tab or newline in a window name as a space: the probe must prove
+    # there is none (TmuxBackend.byte_lengths) before "a b" counts as unchanged.
+    pane = managed(**{"@termctl_name": "a b", "window_name": "a b"})
+    backend = FakeBackend([read(pane)], lengths=(3,))
+    assert change(backend, renamed("a b"), environ).changed is False
+    assert backend.length_queries == [("%3", ("window_name",))]
+
+
+def test_a_window_name_with_a_space_that_cannot_be_proven_is_rewritten(
+    environ: dict[str, str],
+) -> None:
+    pane = managed(**{"@termctl_name": "a b", "window_name": "a b"})
+    backend = FakeBackend([read(pane)], lengths=None)
+    assert change(backend, renamed("a b"), environ).changed is True
+    assert backend.writes == [("%3", {"@termctl_name": "a b"}, "a b")]
+
+
+def test_an_option_holding_a_space_is_not_measured(environ: dict[str, str]) -> None:
+    pane = managed(**{"@termctl_name": "a b", "window_name": "user's", "window_panes": "2"})
+    backend = FakeBackend([read(pane)])
+    assert change(backend, renamed("a b"), environ).changed is False
+    assert backend.length_queries == []
+
+
 def test_tmux_3_2_dollar_escaping_is_a_no_op(environ: dict[str, str]) -> None:
     pane = managed(**{"@termctl_name": "a$b", "window_name": "a\\$b"})
     backend = FakeBackend([read(pane)], lengths=(4,))
@@ -324,7 +376,7 @@ def test_a_held_lock_times_out_as_locked_without_touching_tmux(
     with pytest.raises(TermctlError) as caught:
         pane_change.change_pane(
             backend, ID, lambda pane: renamed("x"), version=V35, environ=environ,
-            clock=SteppingClock(),
+            clock=SteppingClock(), warn=print,
         )  # fmt: skip
     assert (caught.value.code, caught.value.exit_code) == ("locked", 12)
     assert caught.value.details is not None and caught.value.details["cause"] == "timeout"

@@ -316,18 +316,28 @@ def test_fields_refuses_anything_but_field_names(name: str) -> None:
         tb.fields()
 
 
-def test_byte_lengths_builds_a_format_of_n_modifiers() -> None:
-    assert tb.byte_lengths("@termctl_name", "window_name").text == (
-        "#{n:@termctl_name} #{n:window_name}"
+IDENTITY_FIELDS = "#{pane_id} #{window_id} #{@termctl_pane} #{@termctl_id}"
+
+
+def test_length_probe_reads_the_identity_then_n_modifiers() -> None:
+    assert tb.length_probe("@termctl_name", "@termctl_marker_text").text == (
+        f"{IDENTITY_FIELDS} #{{n:@termctl_name}} #{{n:@termctl_marker_text}}"
+    )
+
+
+def test_length_probe_of_a_window_name_also_matches_a_tab_or_newline() -> None:
+    assert tb.length_probe("@termctl_name", "window_name").text == (
+        f"{IDENTITY_FIELDS} #{{n:@termctl_name}} #{{n:window_name}}"
+        " #{m/r:[\t\n],#{window_name}}"
     )
 
 
 @pytest.mark.parametrize("name", ["", "#(x)", "a}", "a,b", "a b", "n:x", "Pane", "@", "a\n"])
-def test_byte_lengths_refuses_anything_but_field_names(name: str) -> None:
+def test_length_probe_refuses_anything_but_field_names(name: str) -> None:
     with pytest.raises(ValueError):
-        tb.byte_lengths(name)
+        tb.length_probe(name)
     with pytest.raises(ValueError):
-        tb.byte_lengths()
+        tb.length_probe()
 
 
 @pytest.mark.parametrize("value", ["\ud800", "a\udbff", "\udfff", "\udc7f"])
