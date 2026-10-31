@@ -13,8 +13,9 @@ from dataclasses import dataclass
 from typing import Any, Literal
 
 from .config import DEFAULTS, Config, Placement, Rule
-from .errors import TermctlError
+from .errors import TermctlError, UsageError
 from .output import Result
+from .validate import show
 
 DEFAULT = "default"
 
@@ -80,42 +81,82 @@ def match_rule(rules: Iterable[Rule], labels: Iterable[str]) -> int | None:
     return None
 
 
-def check_supported(name: str, fields: dict[str, Any]) -> None:
+def check_supported(name: str, fields: dict[str, Any], *, target_from_flag: bool = False) -> None:
     """Exit 2 (``not_supported``) when the placement uses ``target: pane`` or its fields
-    (present at all, an explicit null included)."""
-    used = (["target"] if fields.get("target") == "pane" else []) + [
-        field for field in PANE_FIELDS if field in fields
-    ]
+    (present at all, an explicit null included). ``target_from_flag`` says the target came
+    from ``--target``, so the message names the flag rather than the placement for it."""
+    pane_target = fields.get("target") == "pane"
+    pane_fields = [field for field in PANE_FIELDS if field in fields]
+    used = (["target"] if pane_target else []) + pane_fields
     if not used:
         return
-    shown = ", ".join("target: pane" if field == "target" else field for field in used)
-    raise TermctlError(
-        "not_supported",
-        f"placement {name!r} uses {shown}, which this version does not support"
-        " (only target: window)",
-        details={"placement": name, "fields": used},
-    )
+    if pane_target and target_from_flag:
+        if pane_fields:
+            message = (
+                f"--target pane is not supported, and placement {name!r} uses"
+                f" {', '.join(pane_fields)}, which this version does not support"
+                " (only target: window)"
+            )
+        else:
+            message = f"--target pane is not supported (placement {name!r}; only target: window)"
+    else:
+        shown = ", ".join("target: pane" if field == "target" else field for field in used)
+        message = (
+            f"placement {name!r} uses {shown}, which this version does not support"
+            " (only target: window)"
+        )
+    raise TermctlError("not_supported", message, details={"placement": name, "fields": used})
 
 
 @dataclass(frozen=True)
 class Selection:
-    """The placement ``open`` would use: the matching rule's index (None for none), the
-    placement's name and its effective fields."""
+    """The placement ``open`` would use: the matching rule's index (None when no rule matched or
+    ``--placement`` named it), the placement's name and its effective fields after the
+    ``--session``/``--target`` overrides."""
 
     rule: int | None
     name: str
     fields: dict[str, Any]
 
+    @property
+    def session(self) -> str:
+        return self.fields["session"]
 
-def select(cfg: Config, labels: Iterable[str]) -> Selection:
-    """The first matching rule's placement, else ``default``; ``not_supported`` when it uses
-    ``target: pane`` or its fields."""
-    # TODO(#13): `open --placement NAME` (skips the rules) and the `--session`/`--target`
-    # overrides; this resolves the rules only.
-    rule = match_rule(cfg.rules, labels)
-    name = DEFAULT if rule is None else cfg.rules[rule].placement
-    fields = effective(cfg)[name]
-    check_supported(name, fields)
+    @property
+    def target(self) -> str:
+        return self.fields["target"]
+
+
+def select(
+    cfg: Config,
+    labels: Iterable[str],
+    *,
+    placement: str | None = None,
+    session: str | None = None,
+    target: str | None = None,
+) -> Selection:
+    """Resolve the placement for ``open`` (interface.md "Placement", resolution steps 1-3).
+
+    ``placement`` (``--placement``) names the placement and skips the rules; otherwise the
+    first matching rule's placement, else ``default``. An undefined name exits 2 (``usage``).
+    ``session`` and ``target`` (``--session``, ``--target``; None when not given) then
+    override its fields, and the result is checked for ``not_supported``. The arguments are
+    assumed to have passed their step-1 grammar checks.
+    """
+    placements = effective(cfg)
+    if placement is not None:
+        if placement not in placements:
+            raise UsageError(f"undefined placement {show(placement)}")
+        rule, name = None, placement
+    else:
+        rule = match_rule(cfg.rules, labels)
+        name = DEFAULT if rule is None else cfg.rules[rule].placement
+    fields = placements[name]
+    if session is not None:
+        fields["session"] = session
+    if target is not None:
+        fields["target"] = target
+    check_supported(name, fields, target_from_flag=target is not None)
     return Selection(rule=rule, name=name, fields=fields)
 
 
