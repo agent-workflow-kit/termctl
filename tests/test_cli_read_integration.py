@@ -12,20 +12,17 @@ import json
 import os
 import socket
 from dataclasses import dataclass
-from pathlib import Path
 from typing import Any
 
 import pytest
 
 from termctl.cli import main
 
-from .conftest import TMUX_PRINTS_RAW, TMUX_VERSION, TmuxServer, wait_for
+from .conftest import NO_CONFIG, TMUX_PRINTS_RAW, TMUX_VERSION, TmuxServer, wait_for
 from .schemas import validate
 from .test_panes_integration import ID, OTHER_ID, new_window, tag
 
 pytestmark = pytest.mark.tmux
-
-NO_CONFIG = str(Path(__file__).parent / "no-config")
 
 
 @dataclass

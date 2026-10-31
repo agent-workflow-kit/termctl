@@ -5,10 +5,11 @@ from __future__ import annotations
 
 import subprocess
 from collections.abc import Callable, Mapping
+from datetime import UTC, datetime, timedelta, timezone
 
 import pytest
 
-from termctl import open_cmd, tmux_socket
+from termctl import config, open_cmd, panes, tmux_socket
 from termctl import tmux_backend as tb
 from termctl.backend import Created, TmuxBackend
 from termctl.errors import TermctlError
@@ -156,30 +157,31 @@ def size(invocation: tb.Invocation) -> int:
 
 
 def test_size_check_passes_at_the_limit() -> None:
-    base = size(tb.new_session("work", spec("/"), start_server=True))
+    base = size(tb.new_session("work", spec("/"), start_server=True, env={}))
     cwd = "/" + "d" * (open_cmd.SIZE_LIMIT - base)
-    invocation = tb.new_session("work", spec(cwd), start_server=True)
+    invocation = tb.new_session("work", spec(cwd), start_server=True, env={})
     assert size(invocation) == open_cmd.SIZE_LIMIT
     open_cmd.check_size([invocation], TMUX, SOCK)
 
 
 def test_size_check_fails_one_byte_over() -> None:
-    base = size(tb.new_session("work", spec("/"), start_server=True))
+    base = size(tb.new_session("work", spec("/"), start_server=True, env={}))
     cwd = "/" + "d" * (open_cmd.SIZE_LIMIT - base + 1)
     with pytest.raises(TermctlError) as caught:
-        open_cmd.check_size([tb.new_session("work", spec(cwd), start_server=True)], TMUX, SOCK)
+        invocation = tb.new_session("work", spec(cwd), start_server=True, env={})
+        open_cmd.check_size([invocation], TMUX, SOCK)
     assert (caught.value.code, caught.value.exit_code) == ("usage", 2)
     assert "12288" in caught.value.message
 
 
 def test_size_check_counts_utf8_bytes_and_escapes() -> None:
     # 4 bytes per character, and the final ';' escape adds one: counted as tmux gets them.
-    base = size(tb.new_session("work", spec("/"), start_server=True))
+    base = size(tb.new_session("work", spec("/"), start_server=True, env={}))
     room = open_cmd.SIZE_LIMIT - base
     cwd = "/" + "\U0001f514" * (room // 4)
-    invocation = tb.new_session("work", spec(cwd), start_server=True)
+    invocation = tb.new_session("work", spec(cwd), start_server=True, env={})
     open_cmd.check_size([invocation], TMUX, SOCK)
-    over = tb.new_session("work", spec(cwd + "\U0001f514"), start_server=True)
+    over = tb.new_session("work", spec(cwd + "\U0001f514"), start_server=True, env={})
     with pytest.raises(TermctlError):
         open_cmd.check_size([over], TMUX, SOCK)
 
@@ -191,11 +193,316 @@ def test_size_check_judges_the_largest_invocation() -> None:
         open_cmd.check_size([small, big], TMUX, SOCK)
 
 
-def test_window_spec_is_the_placeholder_until_the_pane_step_lands() -> None:
-    # TODO(#15) changes this: the no-argv path gets the default shell and the -e variables.
-    assert open_cmd.window_spec("n", "/w") == WindowSpec(
-        "n", "/w", ("/usr/bin/env", "--", "sleep", "30")
+def plan(
+    argv: tuple[str, ...] = ("vim",),
+    env: tuple[tuple[str, str], ...] = (),
+    *,
+    cwd: str = "/w",
+    keep: str = "never",
+    labels: tuple[str, ...] = ("a=b", "k=v"),
+) -> open_cmd.Plan:
+    return open_cmd.Plan(
+        name="n",
+        cwd=cwd,
+        argv=argv,
+        env=env,
+        labels=labels,
+        placement="default",
+        keep_on_exit=keep,
     )
+
+
+def test_with_argv_the_window_runs_the_placeholder_without_env() -> None:
+    # Open order step 6: the placeholder gets no -e variables; the real command does.
+    assert plan(env=(("A", "1"),)).window == WindowSpec("n", "/w", open_cmd.PLACEHOLDER)
+    # Review round 1, R1-3: sleep is looked up on a fixed PATH, never the caller's.
+    assert open_cmd.PLACEHOLDER == ("/usr/bin/env", "--", "PATH=/usr/bin:/bin", "sleep", "30")
+
+
+def test_without_argv_the_window_runs_the_default_shell_with_env() -> None:
+    # Spike E2: no command, so tmux starts its default shell as a login shell; the --env
+    # variables go to new-window or new-session as -e (spike G3c).
+    assert plan((), (("A", "1"),)).window == WindowSpec("n", "/w", None, (("A", "1"),))
+
+
+def test_respawn_carries_argv_and_env_but_path_through_usr_bin_env() -> None:
+    respawn = plan(("tool", "-x"), (("A", "1"), ("PATH", "/opt/bin"), ("B", ""))).respawn
+    assert respawn == tb.Respawn(
+        cwd="/w", argv=("tool", "-x"), env=(("A", "1"), ("B", "")), path="/opt/bin"
+    )
+
+
+def test_no_respawn_without_argv() -> None:
+    assert plan(()).respawn is None
+
+
+def test_options_are_every_pane_option_with_the_ownership_marker_last() -> None:
+    options = plan(labels=("a=b", "k=v")).options(
+        "tc-abcdefgh", Created("%5", "@3"), "2026-10-30T00:00:00.000Z"
+    )
+    assert options == [
+        ("@termctl_v", "1"),
+        ("@termctl_window", "@3"),
+        ("@termctl_id", "tc-abcdefgh"),
+        ("@termctl_name", "n"),
+        ("@termctl_marker", ""),
+        ("@termctl_marker_text", ""),
+        ("@termctl_labels", "a=b k=v"),
+        ("@termctl_placement", "default"),
+        ("@termctl_keep", "never"),
+        ("@termctl_created", "2026-10-30T00:00:00.000Z"),
+        ("@termctl_pid", ""),
+        ("@termctl_pid_start", ""),
+        ("@termctl_pane", "%5"),
+    ]
+    # Every option the pane reader reads, and nothing else.
+    assert sorted(name for name, _ in options) == sorted(panes.OPTION_FIELDS)
+
+
+@pytest.mark.parametrize(
+    ("keep", "remain"), [("never", "off"), ("failed", "failed"), ("always", "on")]
+)
+def test_keep_on_exit_becomes_remain_on_exit(keep: str, remain: str) -> None:
+    created = Created("%5", "@3")
+    argv = plan(keep=keep).tag_invocation(ID, created, "2026-10-30T00:00:00.000Z").argv(TMUX, SOCK)
+    assert f"'remain-on-exit' '{remain}'" in argv[-2]
+    assert f"'@termctl_keep' '{keep}'" in argv[-2]
+
+
+@pytest.mark.parametrize(
+    ("now", "text"),
+    [
+        (datetime(2026, 10, 30, 12, 0, 0, 0, tzinfo=UTC), "2026-10-30T12:00:00.000Z"),
+        (datetime(2026, 10, 30, 12, 0, 0, 999999, tzinfo=UTC), "2026-10-30T12:00:00.999Z"),
+        (
+            datetime(2026, 10, 30, 14, 0, 0, 1000, tzinfo=timezone(timedelta(hours=2))),
+            "2026-10-30T12:00:00.001Z",
+        ),
+    ],
+)
+def test_timestamp_is_utc_with_milliseconds(now: datetime, text: str) -> None:
+    assert open_cmd.timestamp(now) == text
+
+
+def test_size_check_counts_the_tagging_invocation() -> None:
+    # A long argv fits the new-session invocation (it gets the placeholder) but not step 6's.
+    big = plan(("x" * 13000,))
+    invocations = open_cmd.size_invocations("work", big, ID, {})
+    assert size(invocations[0]) < open_cmd.SIZE_LIMIT
+    with pytest.raises(TermctlError) as caught:
+        open_cmd.check_size(invocations, TMUX, SOCK)
+    assert (caught.value.code, caught.value.exit_code) == ("usage", 2)
+
+
+def test_size_check_counts_env_values_once_quoted() -> None:
+    # Inside the guard each byte 0xff is written \377 outside the quotes, so a run of them
+    # costs six bytes each (''\377), not one: the check counts what tmux gets.
+    invocations = open_cmd.size_invocations("work", plan(), ID, {})
+    room = open_cmd.SIZE_LIMIT - max(size(i) for i in invocations)
+    fits = plan(env=(("A", "\udcff" * ((room - 20) // 6)),))
+    open_cmd.check_size(open_cmd.size_invocations("work", fits, ID, {}), TMUX, SOCK)
+    over = plan(env=(("A", "\udcff" * (room // 6 + 1)),))
+    with pytest.raises(TermctlError):
+        open_cmd.check_size(open_cmd.size_invocations("work", over, ID, {}), TMUX, SOCK)
+
+
+def test_size_check_without_argv_counts_env_on_new_session() -> None:
+    no_argv = plan((), (("A", "v" * 13000),))
+    new_session = open_cmd.size_invocations("work", no_argv, ID, {})[0]
+    assert size(new_session) > open_cmd.SIZE_LIMIT
+
+
+def test_size_check_counts_the_filtered_values_set_back_on_new_session() -> None:
+    # Review round 1, R1-2: the new-session chain carries the filtered value of each --env
+    # variable the filtered environment has.
+    no_argv = plan((), (("LANG", "x"),))
+    filtered = {"LANG": "v" * 13000}
+    new_session = open_cmd.size_invocations("work", no_argv, ID, filtered)[0]
+    assert size(new_session) > open_cmd.SIZE_LIMIT
+    assert size(open_cmd.size_invocations("work", no_argv, ID, {})[0]) < open_cmd.SIZE_LIMIT
+
+
+def test_size_check_assumes_the_largest_ids() -> None:
+    tagging = open_cmd.size_invocations("work", plan(), ID, {})[1]
+    assert "%4294967295" in tagging.argv(TMUX, SOCK)
+
+
+# --- step 1: argv ---------------------------------------------------------------------------------
+
+
+@pytest.mark.parametrize("argv0", ["a=b", "=", "=x", "x=", "/usr/bin/a=b", "PATH=/x"])
+def test_argv0_with_an_equals_sign_is_a_usage_error(argv0: str) -> None:
+    with pytest.raises(TermctlError) as caught:
+        open_cmd.check_argv([argv0, "y"], {})
+    assert (caught.value.code, caught.value.exit_code) == ("usage", 2)
+
+
+def test_equals_signs_after_argv0_are_fine() -> None:
+    open_cmd.check_argv(["env", "A=b", "="], {})
+
+
+def test_env_path_without_argv_is_a_usage_error() -> None:
+    with pytest.raises(TermctlError) as caught:
+        open_cmd.check_argv([], {"PATH": "/opt/secret-dir-value"})
+    assert (caught.value.code, caught.value.exit_code) == ("usage", 2)
+    assert "secret-dir-value" not in caught.value.message
+
+
+def test_env_path_with_argv_and_other_env_without_argv_are_fine() -> None:
+    open_cmd.check_argv(["x"], {"PATH": "/opt"})
+    open_cmd.check_argv([], {"PATHX": "/opt", "A": "1"})
+
+
+# --- the filtered environment ---------------------------------------------------------------------
+
+
+def test_filtered_env_keeps_only_allowed_names() -> None:
+    environ = {
+        "PATH": "/usr/bin",
+        "HOME": "/h",
+        "LC_ALL": "C.UTF-8",
+        "LANG": "C.UTF-8",
+        "SSH_AUTH_SOCK": "/s",
+        "AWS_SECRET_ACCESS_KEY": "k",
+        "TMUX": "/tmp/tmux-1000/default,1,0",
+    }
+    assert open_cmd.filtered_env(environ, ALLOW) == {
+        "PATH": "/usr/bin",
+        "HOME": "/h",
+        "LC_ALL": "C.UTF-8",
+    }
+
+
+def test_filtered_env_with_the_default_allowlist_keeps_a_utf8_locale() -> None:
+    # #10: tmux checks the locale before anything else; the default keeps LANG and LC_*.
+    allow = config.defaults().server_env_allow
+    environ = {"LANG": "de_DE.UTF-8", "LC_CTYPE": "de_DE.UTF-8", "SECRET": "x"}
+    assert open_cmd.filtered_env(environ, allow) == {
+        "LANG": "de_DE.UTF-8",
+        "LC_CTYPE": "de_DE.UTF-8",
+    }
+
+
+def test_filtered_env_with_an_empty_allowlist_is_empty() -> None:
+    assert open_cmd.filtered_env({"PATH": "/usr/bin"}, []) == {}
+
+
+# --- step 6: tagging and cleanup ------------------------------------------------------------------
+
+ID = "tc-abcdefgh"
+AT = "2026-10-30T00:00:00.000Z"
+PANE = Created("%5", "@3")
+
+
+def tag_key(p: open_cmd.Plan) -> tuple[str, ...]:
+    return tuple(p.tag_invocation(ID, PANE, AT).argv(TMUX, SOCK))
+
+
+CLEANUP = tuple(tb.cleanup_kill("%5", "@3").argv(TMUX, SOCK))
+NOMATCH = completed("termctl-nomatch\n")
+
+
+def tag(gateway: FakeGateway, p: open_cmd.Plan, warnings: list[str] | None = None) -> None:
+    backend = TmuxBackend(Tmux(gateway, TMUX, SOCK, env={}))
+    open_cmd.tag(backend, PANE, ID, p, AT, (warnings if warnings is not None else []).append)
+
+
+def test_tag_runs_one_guarded_invocation() -> None:
+    p = plan()
+    gateway = FakeGateway({tag_key(p): completed()})
+    tag(gateway, p)
+    assert gateway.calls == [list(tag_key(p))]
+
+
+@pytest.mark.parametrize(
+    "result",
+    [
+        NOMATCH,
+        completed(stderr="can't find pane: %5\n", returncode=1),
+        completed(stderr="no server running on x\n", returncode=1),
+        subprocess.TimeoutExpired(["tmux"], 30),
+        OSError("gone"),
+    ],
+    ids=["nomatch", "failed", "other-socket-no-server", "timeout", "oserror"],
+)
+def test_a_failed_tagging_kills_the_pane_and_exits_tag_failed(result: object) -> None:
+    p = plan()
+    gateway = FakeGateway({tag_key(p): result, CLEANUP: completed()})  # type: ignore[dict-item]
+    warnings: list[str] = []
+    with pytest.raises(TermctlError) as caught:
+        tag(gateway, p, warnings)
+    assert (caught.value.code, caught.value.exit_code) == ("tag_failed", 12)
+    assert gateway.calls[-1] == list(CLEANUP)
+    assert warnings == []
+
+
+@pytest.mark.parametrize(
+    "stderr",
+    [f"no server running on {SOCK}\n", f"error connecting to {SOCK} (No such file or directory)\n"],
+)
+def test_a_tagging_that_found_no_server_connects_no_more(stderr: str) -> None:
+    # Review round 1, R1-6: a no-server result is never followed by a connect without the
+    # socket checks, so there is no cleanup kill (and nothing to kill).
+    p = plan()
+    gateway = FakeGateway({tag_key(p): completed(stderr=stderr, returncode=1)})
+    warnings: list[str] = []
+    with pytest.raises(TermctlError) as caught:
+        tag(gateway, p, warnings)
+    assert (caught.value.code, caught.value.exit_code) == ("tag_failed", 12)
+    assert caught.value.details is None
+    assert gateway.calls == [list(tag_key(p))]
+    assert warnings == []
+
+
+@pytest.mark.parametrize(
+    "cleanup",
+    [NOMATCH, completed(stderr="boom\n", returncode=1), subprocess.TimeoutExpired(["t"], 30)],
+    ids=["nomatch", "failed", "timeout"],
+)
+def test_a_cleanup_that_kills_nothing_warns_and_still_reports_tag_failed(cleanup: object) -> None:
+    # Review round 1, R1-7: a forged @termctl_pane, say, leaves an unmanaged window behind.
+    p = plan()
+    gateway = FakeGateway({tag_key(p): NOMATCH, CLEANUP: cleanup})  # type: ignore[dict-item]
+    warnings: list[str] = []
+    with pytest.raises(TermctlError) as caught:
+        tag(gateway, p, warnings)
+    assert caught.value.code == "tag_failed"
+    assert len(warnings) == 1
+    assert "%5" in warnings[0] and "@3" in warnings[0]
+
+
+@pytest.mark.parametrize(
+    "stderr", ["can't find pane: %5\n", "can't find window: @3\n"], ids=["pane", "window"]
+)
+def test_a_cleanup_that_finds_the_pane_gone_does_not_warn(stderr: str) -> None:
+    # Review round 2, R2-2: the pane is already gone (a no-argv shell that exited at once,
+    # another client's kill), so nothing is left running.
+    p = plan()
+    gateway = FakeGateway({tag_key(p): NOMATCH, CLEANUP: completed(stderr=stderr, returncode=1)})
+    warnings: list[str] = []
+    with pytest.raises(TermctlError) as caught:
+        tag(gateway, p, warnings)
+    assert caught.value.code == "tag_failed"
+    assert gateway.calls[-1] == list(CLEANUP)
+    assert warnings == []
+
+
+def test_a_cleanup_whose_failure_only_starts_like_a_gone_message_warns() -> None:
+    p = plan()
+    stderr = "boom\ncan't find pane: %5\n"
+    gateway = FakeGateway({tag_key(p): NOMATCH, CLEANUP: completed(stderr=stderr, returncode=1)})
+    warnings: list[str] = []
+    with pytest.raises(TermctlError):
+        tag(gateway, p, warnings)
+    assert len(warnings) == 1
+
+
+def test_tag_failed_never_echoes_env_values() -> None:
+    p = plan(env=(("TOKENISH", "value-not-to-print"),))
+    gateway = FakeGateway({tag_key(p): completed(returncode=1), CLEANUP: completed()})
+    with pytest.raises(TermctlError) as caught:
+        tag(gateway, p)
+    assert "value-not-to-print" not in caught.value.message
 
 
 # --- step 5: server and session -----------------------------------------------------------------
@@ -208,8 +515,8 @@ def key(invocation: tb.Invocation) -> tuple[str, ...]:
 
 
 HAS = key(tb.has_session("work"))
-START = key(tb.new_session("work", SPEC, start_server=True))
-NEW_SESSION = key(tb.new_session("work", SPEC, start_server=False))
+START = key(tb.new_session("work", SPEC, start_server=True, env={}))
+NEW_SESSION = key(tb.new_session("work", SPEC, start_server=False, env={}))
 NEW_WINDOW = key(tb.new_window("work", SPEC))
 
 NO_SERVER = completed(stderr=f"no server running on {SOCK}\n", returncode=1)

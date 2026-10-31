@@ -24,7 +24,7 @@ from .fakes import (
     safe_default_server,
 )
 from .schemas import validate
-from .test_cli import ENVIRON, Run
+from .test_cli import ENVIRON, NO_CONFIG, Run
 
 GOLDEN = Path(__file__).parent / "golden"
 SOCK = f"/tmp/tmux-{UID}/default"
@@ -377,12 +377,18 @@ def test_verbose_traces_the_list_panes_command() -> None:
     assert len(lines) == 2
 
 
-def test_tmux_runs_with_the_callers_locale_only() -> None:
+def test_tmux_runs_with_the_filtered_environment() -> None:
     environ = {"LANG": "C.UTF-8", "LC_CTYPE": "C.UTF-8", "SECRET": "x", "HOME": "/h"}
     result = run(["list"], environ=environ)
     calls = result.gateway.calls
     index = next(i for i, call in enumerate(calls) if is_list_panes(call))
-    assert result.gateway.envs[index] == {"LANG": "C.UTF-8", "LC_CTYPE": "C.UTF-8"}
+    assert result.gateway.envs[index] == {
+        **NO_CONFIG,
+        "PATH": "/usr/bin",
+        "LANG": "C.UTF-8",
+        "LC_CTYPE": "C.UTF-8",
+        "HOME": "/h",
+    }
 
 
 # --- the socket checks run again right before connecting ----------------------------------------

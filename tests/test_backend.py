@@ -41,8 +41,8 @@ def argv(invocation: tmux_backend.Invocation) -> tuple[str, ...]:
 
 
 HAS = argv(tmux_backend.has_session("work"))
-NEW_SESSION = argv(tmux_backend.new_session("work", SPEC, start_server=False))
-START = argv(tmux_backend.new_session("work", SPEC, start_server=True))
+NEW_SESSION = argv(tmux_backend.new_session("work", SPEC, start_server=False, env={}))
+START = argv(tmux_backend.new_session("work", SPEC, start_server=True, env={}))
 NEW_WINDOW = argv(tmux_backend.new_window("work", SPEC))
 
 
@@ -88,6 +88,18 @@ def test_create_session_returns_the_new_ids(start_server: bool) -> None:
     key = START if start_server else NEW_SESSION
     backend = backend_for({key: completed("%7 @4\n")})
     assert backend.create_session("work", SPEC, start_server=start_server) == Created("%7", "@4")
+
+
+def test_create_session_restores_env_from_the_environment_tmux_runs_with() -> None:
+    # Review round 1, R1-2: the set-environment values come from the filtered environment the
+    # Tmux runs with, never from the -e values.
+    spec = tmux_backend.WindowSpec(name="shell", cwd="/", command=None, env=(("LANG", "x"),))
+    filtered = {"LANG": "C.UTF-8"}
+    invocation = tmux_backend.new_session("work", spec, start_server=False, env=filtered)
+    gateway = FakeGateway({argv(invocation): completed("%7 @4\n")})
+    backend = TmuxBackend(Tmux(gateway, TMUX, SOCK, env=filtered))
+    assert backend.create_session("work", spec, start_server=False) == Created("%7", "@4")
+    assert gateway.calls[-1][-6:] == ["set-environment", "-t", "=work:", "--", "LANG", "C.UTF-8"]
 
 
 def test_create_session_duplicate_is_none() -> None:

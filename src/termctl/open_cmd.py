@@ -1,5 +1,6 @@
-"""``open``'s own steps: the command and size checks of the resolve step, and the server and
-session (interface.md "Open order" steps 2 and 5, "Command", "Server selection").
+"""``open``'s own steps: the argv checks of the usage step, the command and size checks of the
+resolve step, the server and session, and the pane (interface.md "Open order" steps 1, 2, 5
+and 6, "Command", "Command exit", "Environment", "Server selection").
 
 ``cli.py`` runs them in the check order. Every tmux command is built by ``tmux_backend`` and
 run through a ``Backend``; every filesystem access goes through the gateway.
@@ -9,20 +10,59 @@ from __future__ import annotations
 
 import os
 import posixpath
-from collections.abc import Iterable, Mapping, Sequence
+from collections.abc import Callable, Iterable, Mapping, Sequence
+from dataclasses import dataclass
+from datetime import UTC, datetime
 
+from . import tmux_backend as tb
 from . import tmux_socket, validate
-from .backend import Backend, Created, SessionState
+from .backend import Backend, Created, NoServerTagFailure, SessionState
 from .errors import TermctlError, UsageError
 from .gateway import Gateway
 from .tmux_backend import Invocation, WindowSpec
 
 # The placeholder a window runs until its real command replaces it (Open order step 6); it
-# ends on its own if termctl dies.
-PLACEHOLDER = ("/usr/bin/env", "--", "sleep", "30")
+# ends on its own if termctl dies. ``sleep`` is looked up on a fixed PATH, never the caller's
+# (review round 1, R1-3).
+PLACEHOLDER = (*tb.COMMAND_PREFIX, "PATH=/usr/bin:/bin", "sleep", "30")
+# --keep-on-exit as tmux's remain-on-exit (interface.md "Command exit").
+REMAIN_ON_EXIT = {"never": "off", "failed": "failed", "always": "on"}
+# The pane options' schema version (interface.md "Pane options").
+SCHEMA_VERSION = "1"
+# The largest pane and window ids tmux can assign (unsigned 32-bit), for the size check.
+_LARGEST_PANE_ID = "%4294967295"
+_LARGEST_WINDOW_ID = "@4294967295"
 # The most UTF-8 bytes in one tmux invocation's argv: tmux rejects commands near 16 KB.
 SIZE_LIMIT = 12288
 _NAME_SHOWN = 200
+
+
+# --- step 1: the command line -------------------------------------------------------------------
+
+
+def check_argv(argv: Sequence[str], env: Mapping[str, str]) -> None:
+    """The step-1 checks of argv (exit 2): an argv[0] containing ``=``, which ``/usr/bin/env``
+    would take as a variable assignment, and ``--env PATH`` without argv, which only
+    ``/usr/bin/env`` in the command can apply (interface.md "Command")."""
+    if argv and "=" in argv[0]:
+        raise UsageError(
+            f"the command {validate.show(argv[0], _NAME_SHOWN)} contains '=', which"
+            " /usr/bin/env would take as a variable assignment"
+        )
+    if not argv and "PATH" in env:
+        raise UsageError("--env PATH needs a command to run (after --)")
+
+
+# --- the environment tmux runs with --------------------------------------------------------------
+
+
+def filtered_env(environ: Mapping[str, str], allow: Iterable[str]) -> dict[str, str]:
+    """The caller's environment filtered by ``server_env_allow`` (interface.md "Environment"):
+    every tmux command runs with exactly this, so it decides the server's global environment
+    when the command starts the server, the variables a new session imports and the new pane's
+    ``PATH``. The default allowlist keeps ``LANG`` and ``LC_*``: tmux needs a UTF-8 locale."""
+    allow = list(allow)
+    return {name: value for name, value in environ.items() if allowed(name, allow)}
 
 
 # --- step 2: the name, the command and the size -------------------------------------------------
@@ -90,14 +130,88 @@ def check_command(argv0: str, cwd: str, path: str | None, gateway: Gateway) -> N
     )
 
 
-def window_spec(name: str, cwd: str) -> WindowSpec:
-    """The window step 5 creates: with argv, the placeholder and no ``-e`` variables.
+@dataclass(frozen=True)
+class Plan:
+    """What ``open`` creates, from its arguments and config (steps 1 and 2): the name, the
+    resolved cwd, argv, the ``--env`` variables, the labels (sorted pairs), the placement's
+    name and the keep-on-exit value."""
 
-    TODO(#15): without argv the window gets tmux's default shell (``command=None``) and the
-    ``--env`` variables as ``-e`` (take argv and the variables here); until the pane step
-    lands, every window runs the placeholder, so a window that is never tagged ends on its own.
-    """
-    return WindowSpec(name=name, cwd=cwd, command=PLACEHOLDER)
+    name: str
+    cwd: str
+    argv: tuple[str, ...]
+    env: tuple[tuple[str, str], ...]
+    labels: tuple[str, ...]
+    placement: str
+    keep_on_exit: str
+
+    @property
+    def window(self) -> WindowSpec:
+        """The window step 5 creates. With argv: the placeholder, without ``-e`` variables
+        (the real command gets them, step 6). Without argv: tmux's default shell as a login
+        shell (``command=None``) with the ``--env`` variables as ``-e`` (spike E2, G3)."""
+        if self.argv:
+            return WindowSpec(name=self.name, cwd=self.cwd, command=PLACEHOLDER)
+        return WindowSpec(name=self.name, cwd=self.cwd, command=None, env=self.env)
+
+    @property
+    def respawn(self) -> tb.Respawn | None:
+        """The real command of step 6 (None without argv): ``--env PATH`` goes through
+        ``/usr/bin/env`` (spike G4), every other variable as ``-e``."""
+        if not self.argv:
+            return None
+        env = dict(self.env)
+        path = env.pop("PATH", None)
+        return tb.Respawn(cwd=self.cwd, argv=self.argv, env=tuple(env.items()), path=path)
+
+    def options(self, termctl_id: str, created: Created, created_at: str) -> list[tuple[str, str]]:
+        """The pane options of step 6 (interface.md "Pane options"), the ownership marker
+        ``@termctl_pane`` last, so a chain that stops early never leaves a managed pane with
+        some options missing. No marker yet; the PID options stay empty (TODO(#16) records
+        the process)."""
+        return [
+            ("@termctl_v", SCHEMA_VERSION),
+            ("@termctl_window", created.window_id),
+            ("@termctl_id", termctl_id),
+            ("@termctl_name", self.name),
+            ("@termctl_marker", ""),
+            ("@termctl_marker_text", ""),
+            ("@termctl_labels", " ".join(self.labels)),
+            ("@termctl_placement", self.placement),
+            ("@termctl_keep", self.keep_on_exit),
+            ("@termctl_created", created_at),
+            ("@termctl_pid", ""),
+            ("@termctl_pid_start", ""),
+            ("@termctl_pane", created.pane_id),
+        ]
+
+    def tag_invocation(self, termctl_id: str, created: Created, created_at: str) -> Invocation:
+        return tb.tag_pane(
+            created.pane_id,
+            created.window_id,
+            self.options(termctl_id, created, created_at),
+            REMAIN_ON_EXIT[self.keep_on_exit],
+            self.respawn,
+        )
+
+
+def timestamp(now: datetime) -> str:
+    """``@termctl_created``: RFC 3339 UTC with millisecond precision."""
+    utc = now.astimezone(UTC)
+    return utc.strftime("%Y-%m-%dT%H:%M:%S.") + f"{utc.microsecond // 1000:03d}Z"
+
+
+def size_invocations(
+    session: str, plan: Plan, termctl_id: str, env: Mapping[str, str]
+) -> list[Invocation]:
+    """The invocations the size check judges: step 5's in the new-session case (it starts the
+    server, so it carries the most, including the ``set-environment`` values from ``env``, the
+    filtered environment) and step 6's tagging invocation, with the largest ids tmux can
+    assign."""
+    largest = Created(_LARGEST_PANE_ID, _LARGEST_WINDOW_ID)
+    return [
+        tb.new_session(session, plan.window, start_server=True, env=env),
+        plan.tag_invocation(termctl_id, largest, timestamp(datetime(2000, 1, 1, tzinfo=UTC))),
+    ]
 
 
 def _size(invocation: Invocation, tmux_bin: str, socket_path: str) -> int:
@@ -193,3 +307,47 @@ def create_window(
             raise _gone(server, session)
         retried = True
         state = _probe(backend, server, gateway, session)
+
+
+# --- step 6: the pane ---------------------------------------------------------------------------
+
+
+def tag(
+    backend: Backend,
+    created: Created,
+    termctl_id: str,
+    plan: Plan,
+    created_at: str,
+    warn: Callable[[str], None],
+) -> None:
+    """Open order step 6: tag the pane step 5 created and, with argv, respawn it with the real
+    command, in one guarded invocation.
+
+    If tmux fails or the guard does not match, the pane is killed by its exact id, guarded by
+    its being in the window step 5 reported with an empty or its own ``@termctl_pane``, and
+    ``open`` exits 12 (``tag_failed``). When the tagging found no server, there is no cleanup:
+    a no-server result is never followed by a connect without the socket checks. When the
+    cleanup kill does not run (its guard did not match, a forged ``@termctl_pane`` say, or
+    it failed with anything but tmux reporting the pane gone), ``warn`` names the window
+    that may be left behind (interface.md "Residual risks", forged options).
+    TODO(#16): the ``tag_failed`` log record (``result: error``) and the step 7 query.
+    """
+    try:
+        backend.tag_pane(
+            created,
+            plan.options(termctl_id, created, created_at),
+            REMAIN_ON_EXIT[plan.keep_on_exit],
+            plan.respawn,
+        )
+    except NoServerTagFailure:
+        raise
+    except TermctlError as err:
+        if not backend.cleanup_pane(created):
+            warn(
+                f"could not remove pane {created.pane_id} (window {created.window_id}) after"
+                " its tagging failed; it is left running unmanaged"
+            )
+        if err.code == "tag_failed":
+            raise
+        message = f"tagging pane {created.pane_id} failed: {err.message}"
+        raise TermctlError("tag_failed", message) from None

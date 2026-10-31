@@ -86,12 +86,6 @@ def _quote(output: bytes) -> str:
     return "'" + output.decode("utf-8", errors="replace").strip()[:_QUOTED] + "'"
 
 
-def locale_env(environ: Mapping[str, str]) -> dict[str, str]:
-    """The caller's ``LANG`` and ``LC_*`` variables: tmux exits at once without a UTF-8
-    locale, and the default filtered environment passes these."""
-    return {k: v for k, v in environ.items() if k == "LANG" or k.startswith("LC_")}
-
-
 def resolve(tmux_bin: str, environ: Mapping[str, str], gateway: Gateway) -> str:
     """The absolute path of ``tmux_bin``: kept if absolute, else searched on the caller's
     ``PATH``. Raises ``tmux_missing`` (exit 12) if there is no executable regular file.
@@ -121,11 +115,14 @@ def resolve(tmux_bin: str, environ: Mapping[str, str], gateway: Gateway) -> str:
 def check_version(
     tmux_bin: str,
     path: str,
-    environ: Mapping[str, str],
+    env: Mapping[str, str],
     gateway: Gateway,
     trace: Callable[[str], None] | None = None,
 ) -> tuple[TmuxVersion | None, str | None]:
-    """Run ``<path> -V`` (``path`` is ``tmux_bin`` resolved) and enforce the 3.2 floor.
+    """Run ``<path> -V`` (``path`` is ``tmux_bin`` resolved) with exactly the environment
+    ``env``, the caller's filtered by ``server_env_allow`` (interface.md "Environment"), and
+    enforce the 3.2 floor. tmux checks the locale before it parses ``-V`` and exits 1 without a
+    usable UTF-8 one; the default ``server_env_allow`` keeps ``LANG`` and ``LC_*``.
 
     Returns the version and a warning: output with no version is assumed new enough, with a
     warning. Raises ``tmux_too_old`` below the floor and ``tmux_missing`` when the binary
@@ -135,10 +132,7 @@ def check_version(
     if trace is not None:
         trace("tmux: " + shlex.join(argv))
     try:
-        # TODO(#15): run with the full filtered environment; until then only the locale.
-        result = gateway.run_bounded(
-            argv, env=locale_env(environ), timeout=VERSION_TIMEOUT, limit=OUTPUT_LIMIT
-        )
+        result = gateway.run_bounded(argv, env=env, timeout=VERSION_TIMEOUT, limit=OUTPUT_LIMIT)
     except subprocess.TimeoutExpired:
         raise _missing(tmux_bin, f"cannot run {path} -V: timed out", path) from None
     except OSError as exc:
@@ -171,13 +165,15 @@ def probe(
     warn: Callable[[str], None],
     trace: Callable[[str], None] | None = None,
     *,
+    env: Mapping[str, str],
     path: str | None = None,
 ) -> TmuxBinary:
-    """Resolve ``tmux_bin``, unless ``path`` already holds its resolution, and check its
-    version (the first two tmux checks of step 3)."""
+    """Resolve ``tmux_bin`` on the caller's ``PATH`` in ``environ``, unless ``path`` already
+    holds its resolution, and check its version with ``tmux -V`` run in ``env``, the filtered
+    environment (the first two tmux checks of step 3)."""
     if path is None:
         path = resolve(tmux_bin, environ, gateway)
-    version, warning = check_version(tmux_bin, path, environ, gateway, trace)
+    version, warning = check_version(tmux_bin, path, env, gateway, trace)
     if warning is not None:
         warn(warning)
     return TmuxBinary(path, version)

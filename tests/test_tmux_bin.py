@@ -345,29 +345,27 @@ def test_check_version_runs_bounded_with_a_timeout() -> None:
     assert seen == {"timeout": tmux_bin.VERSION_TIMEOUT, "limit": tmux_bin.OUTPUT_LIMIT}
 
 
-def test_check_version_passes_only_the_locale_variables() -> None:
+def test_check_version_runs_with_exactly_the_given_environment() -> None:
+    # The caller passes the environment filtered by server_env_allow (cli.server_env).
     gateway = FakeGateway()
-    environ = {
-        "LANG": "de_DE.UTF-8",
-        "LC_ALL": "de_DE.UTF-8",
-        "LC_CTYPE": "de_DE.UTF-8",
-        "HOME": "/home/u",
-        "TMUX": "/tmp/tmux-1000/default,1,0",
-        "SECRET": "s3cret",
-        "PATH": "/usr/bin",
-        "XLANG": "x",
-        "lc_all": "x",
-    }
-    check(gateway, environ)
-    assert gateway.envs == [
-        {"LANG": "de_DE.UTF-8", "LC_ALL": "de_DE.UTF-8", "LC_CTYPE": "de_DE.UTF-8"}
-    ]
+    env = {"LANG": "de_DE.UTF-8", "HOME": "/home/u"}
+    check(gateway, env)
+    assert gateway.envs == [env]
 
 
-def test_check_version_with_no_locale_variables_passes_an_empty_environment() -> None:
+def test_check_version_with_an_empty_environment_passes_an_empty_one() -> None:
     gateway = FakeGateway()
-    check(gateway, {"HOME": "/home/u"})
+    check(gateway, {})
     assert gateway.envs == [{}]
+
+
+def test_probe_resolves_on_the_callers_path_but_runs_in_env() -> None:
+    gateway = FakeGateway(executables={"/opt/tmux/tmux"})
+    gateway.responses[("/opt/tmux/tmux", "-V")] = completed("tmux 3.5a\n")
+    env = {"LANG": "C.UTF-8"}
+    tmux_bin.probe("tmux", {"PATH": "/opt/tmux", "SECRET": "x"}, gateway, lambda _: None, env=env)
+    assert gateway.calls == [["/opt/tmux/tmux", "-V"]]
+    assert gateway.envs == [env]
 
 
 # --- probe: resolution, then the version, once --------------------------------------------------
@@ -376,7 +374,7 @@ def test_check_version_with_no_locale_variables_passes_an_empty_environment() ->
 def test_probe_resolves_then_checks_the_version() -> None:
     gateway = FakeGateway({(TMUX, "-V"): completed("tmux 3.5a\n")})
     warnings: list[str] = []
-    result = tmux_bin.probe("tmux", {"PATH": "/usr/bin"}, gateway, warnings.append)
+    result = tmux_bin.probe("tmux", {"PATH": "/usr/bin"}, gateway, warnings.append, env={})
     assert result == TmuxBinary(TMUX, TmuxVersion(3, 5, "3.5"))
     assert result.version_text == "3.5"
     assert warnings == []
@@ -386,7 +384,7 @@ def test_probe_resolves_then_checks_the_version() -> None:
 def test_probe_reports_the_warning() -> None:
     gateway = FakeGateway({(TMUX, "-V"): completed("tmux master\n")})
     warnings: list[str] = []
-    result = tmux_bin.probe("tmux", {"PATH": "/usr/bin"}, gateway, warnings.append)
+    result = tmux_bin.probe("tmux", {"PATH": "/usr/bin"}, gateway, warnings.append, env={})
     assert result == TmuxBinary(TMUX, None)
     assert result.version_text is None
     assert len(warnings) == 1
@@ -395,7 +393,7 @@ def test_probe_reports_the_warning() -> None:
 def test_probe_with_a_resolved_path_skips_resolution_but_not_the_version() -> None:
     gateway = FakeGateway({(TMUX, "-V"): completed("tmux 3.1\n")})
     with pytest.raises(TermctlError) as caught:
-        tmux_bin.probe("tmux", {}, gateway, lambda _: None, path=TMUX)
+        tmux_bin.probe("tmux", {}, gateway, lambda _: None, path=TMUX, env={})
     assert caught.value.code == "tmux_too_old"
     assert gateway.executable_checks == []
     assert gateway.calls == [[TMUX, "-V"]]
@@ -404,7 +402,7 @@ def test_probe_with_a_resolved_path_skips_resolution_but_not_the_version() -> No
 def test_probe_missing_binary_never_runs_anything() -> None:
     gateway = FakeGateway(executables=set())
     with pytest.raises(TermctlError) as caught:
-        tmux_bin.probe("tmux", {"PATH": "/usr/bin"}, gateway, lambda _: None)
+        tmux_bin.probe("tmux", {"PATH": "/usr/bin"}, gateway, lambda _: None, env={})
     assert caught.value.code == "tmux_missing"
     assert gateway.calls == []
 
@@ -439,7 +437,7 @@ def test_probe_with_the_system_gateway_and_a_script(tmp_path: Path) -> None:
     (tmp_path / "first").mkdir()
     make_file(tmp_path / "first" / "tmux", 0o644)
     environ = {"PATH": f"{tmp_path / 'nope'}:{tmp_path / 'first'}:{tmp_path}"}
-    result = tmux_bin.probe("tmux", environ, SystemGateway(), lambda _: None)
+    result = tmux_bin.probe("tmux", environ, SystemGateway(), lambda _: None, env={})
     assert result == TmuxBinary(str(tmp_path / "tmux"), TmuxVersion(3, 4, "3.4"))
 
 
@@ -455,7 +453,7 @@ def test_probe_real_tmux() -> None:
             pytest.fail("tmux is not installed, and TERMCTL_REQUIRE_TMUX requires the tmux tests")
         pytest.skip("tmux is not installed")
     environ = {"PATH": os.path.dirname(REAL_TMUX)}
-    result = tmux_bin.probe("tmux", environ, SystemGateway(), lambda _: None)
+    result = tmux_bin.probe("tmux", environ, SystemGateway(), lambda _: None, env={})
     assert result.path == REAL_TMUX
     assert os.path.isabs(result.path)
     assert result.version is not None and result.version >= tmux_bin.FLOOR

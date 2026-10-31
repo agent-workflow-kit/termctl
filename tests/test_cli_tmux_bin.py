@@ -125,11 +125,15 @@ def test_earlier_resolution_is_reused_and_the_version_still_checked() -> None:
     assert ctx.tmux is None
 
 
-def test_version_query_gets_the_callers_locale_only(monkeypatch: pytest.MonkeyPatch) -> None:
+def test_version_query_gets_the_filtered_environment(monkeypatch: pytest.MonkeyPatch) -> None:
+    # interface.md "Environment": every tmux command, `tmux -V` included, runs with the
+    # caller's environment filtered by server_env_allow; the default keeps the locale.
     capture(monkeypatch)
     environ = {**ENVIRON, "LANG": "de_DE.UTF-8", "LC_ALL": "de_DE.UTF-8", "SECRET": "x"}
     run = Run(["list"], environ=environ)
-    assert run.gateway.envs == [{"LANG": "de_DE.UTF-8", "LC_ALL": "de_DE.UTF-8"}]
+    assert run.gateway.envs == [
+        {**NO_CONFIG, "PATH": "/usr/bin", "LANG": "de_DE.UTF-8", "LC_ALL": "de_DE.UTF-8"}
+    ]
 
 
 def test_failed_version_query_escapes_tmux_stderr() -> None:
