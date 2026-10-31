@@ -310,3 +310,53 @@ def test_byte_lengths_is_none_when_unreadable_or_another_pane(
     argv = _lengths_argv("@termctl_name", "window_name")
     backend = _backend({argv: result})
     assert backend.byte_lengths(PANE, ["@termctl_name", "window_name"]) is None
+
+
+# --- the bell's terminal (#20) ------------------------------------------------------------------
+
+TTY_ARGV = tuple(tb.tty_query(PANE.pane_id).argv(TMUX, SOCK, utf8=True))
+
+
+def test_tty_query_reads_identity_state_and_tty_of_the_pane() -> None:
+    # Read-only and unguarded: a display that prints only tmux's ids, flags and device path.
+    assert "display" in TTY_ARGV and "if-shell" not in TTY_ARGV
+    assert TTY_ARGV[TTY_ARGV.index("-t") + 1] == PANE.pane_id
+    assert TTY_ARGV[-1] == "#{pane_id} #{@termctl_pane} #{@termctl_id} #{pane_dead} #{pane_tty}"
+
+
+@pytest.mark.parametrize("tty", ["/dev/pts/0", "/dev/pts/17", "/dev/ttys003"])
+def test_pane_tty_of_a_running_managed_pane(tty: str) -> None:
+    answer = completed(f"{PANE.pane_id} {PANE.pane_id} {ID} 0 {tty}\n")
+    assert _backend({TTY_ARGV: answer}).pane_tty(PANE) == tty
+
+
+@pytest.mark.parametrize("tty", ["/dev/sda", "/dev/pts/../sda", "/tmp/x"])
+def test_pane_tty_reports_a_path_that_is_not_a_pty_as_it_is(tty: str) -> None:
+    # The bell checks the path (display.ring_bell), so it can name the cause in its warning.
+    answer = completed(f"{PANE.pane_id} {PANE.pane_id} {ID} 0 {tty}\n")
+    assert _backend({TTY_ARGV: answer}).pane_tty(PANE) == tty
+
+
+@pytest.mark.parametrize(
+    "result",
+    [
+        # Dead, gone (display of a missing pane prints empty fields), another pane or id.
+        completed(f"{PANE.pane_id} {PANE.pane_id} {ID} 1 /dev/pts/3\n"),
+        completed("    \n"),
+        completed(""),
+        completed(f"{PANE.pane_id}  {ID} 0 /dev/pts/3\n"),
+        completed(f"{PANE.pane_id} %9 {ID} 0 /dev/pts/3\n"),
+        completed(f"{PANE.pane_id} {PANE.pane_id} tc-zzzzzzzz 0 /dev/pts/3\n"),
+        completed(f"%9 {PANE.pane_id} {ID} 0 /dev/pts/3\n"),
+        # No terminal path at all.
+        completed(f"{PANE.pane_id} {PANE.pane_id} {ID} 0 \n"),
+        completed(f"{PANE.pane_id} {PANE.pane_id} {ID} 0 /dev/pts/3 extra\n"),
+        completed(f"{PANE.pane_id} {PANE.pane_id} {ID} 0 /dev/pts/3\nsecond line\n"),
+        completed(f"{PANE.pane_id} {PANE.pane_id} {ID} 0 /dev/pts/3\n", returncode=1),
+        completed(stderr=f"can't find pane: {PANE.pane_id}\n", returncode=1),
+    ],
+)
+def test_pane_tty_is_none_unless_the_pane_is_still_ours_and_running(
+    result: subprocess.CompletedProcess[str],
+) -> None:
+    assert _backend({TTY_ARGV: result}).pane_tty(PANE) is None

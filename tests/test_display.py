@@ -118,3 +118,79 @@ def test_other_characters_are_compared_exactly() -> None:
     for name in ('a"b', "a`b", "a'b", "é中\U0001f514", "#", "##", "a b"):
         assert display.shows(name, name, V32)
         assert not display.shows("\\" + name, name, V32)
+
+
+# --- the bell (#20) -----------------------------------------------------------------------------
+
+
+class _Terminals:
+    """A backend that reports ``tty`` as the pane's terminal and a gateway that writes to it
+    (or raises ``error``)."""
+
+    def __init__(self, tty: str | None, error: OSError | None = None) -> None:
+        self.tty, self.error = tty, error
+        self.queried: list[str] = []
+        self.written: list[tuple[str, bytes]] = []
+
+    def pane_tty(self, pane: panes.ManagedPane) -> str | None:
+        self.queried.append(pane.pane_id)
+        return self.tty
+
+    def write_tty(self, path: str, data: bytes) -> None:
+        if self.error is not None:
+            raise self.error
+        self.written.append((path, data))
+
+
+def test_ring_bell_writes_one_bel_to_the_pane_terminal() -> None:
+    terminals = _Terminals("/dev/pts/7")
+    assert display.ring_bell(terminals, terminals, pane()) is None
+    assert terminals.written == [("/dev/pts/7", b"\a")]
+    assert terminals.queried == ["%3"]
+
+
+def test_ring_bell_without_a_terminal_warns_and_writes_nothing() -> None:
+    terminals = _Terminals(None)
+    warning = display.ring_bell(terminals, terminals, pane())
+    assert warning is not None and "tc-abcdefgh" in warning and "bell" in warning
+    assert terminals.written == []
+
+
+@pytest.mark.parametrize("tty", ["/dev/sda", "/dev/pts/../sda", "/tmp/x", "/dev/pts/", "/dev/tty1"])
+def test_ring_bell_never_writes_to_a_terminal_that_is_not_a_pseudo_terminal(tty: str) -> None:
+    terminals = _Terminals(tty)
+    warning = display.ring_bell(terminals, terminals, pane())
+    assert warning == (
+        f"bell not written: terminal {tty} of managed pane tc-abcdefgh is not a pseudo-terminal"
+    )
+    assert terminals.written == []
+
+
+@pytest.mark.parametrize("tty", ["/dev/pts/0", "/dev/pts/17", "/dev/ttys003"])
+def test_ring_bell_writes_to_a_pseudo_terminal(tty: str) -> None:
+    terminals = _Terminals(tty)
+    assert display.ring_bell(terminals, terminals, pane()) is None
+    assert terminals.written == [(tty, b"\a")]
+
+
+@pytest.mark.parametrize(
+    "error",
+    [
+        OSError(6, "No such device or address"),
+        OSError(25, "not a character device"),
+        PermissionError(13, "Permission denied"),
+        BlockingIOError(11, "Resource temporarily unavailable"),
+        OSError("short write"),
+    ],
+)
+def test_ring_bell_failure_is_a_warning(error: OSError) -> None:
+    warning = display.ring_bell(_Terminals("/dev/pts/7"), _Terminals(None, error), pane())
+    assert warning is not None
+    assert "/dev/pts/7" in warning and "bell" in warning
+
+
+def test_ring_bell_never_rings_a_dead_pane() -> None:
+    terminals = _Terminals("/dev/pts/7")
+    warning = display.ring_bell(terminals, terminals, pane(pane_dead="1"))
+    assert warning is None
+    assert terminals.queried == [] and terminals.written == []

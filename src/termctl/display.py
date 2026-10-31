@@ -4,21 +4,27 @@ The displayed name is the tmux window name of a managed pane: the stored marker 
 by the name while a marker is set and ``marker_display`` is ``name``, else the name. termctl
 renames the window only while the pane is still in the window it was opened in and that window
 has exactly one pane (``may_rename_window``); otherwise the pane-changing commands (``rename``,
-TODO(#20) ``mark`` and ``unmark``) update the pane options only and report
-``display_updated: false``.
+``mark`` and ``unmark``) update the pane options only and report ``display_updated: false``.
 
 The "nothing changed" rules compare the window name tmux reports with the recomputed one
 (``shows``). tmux does not always report a window name as it was given: ``rename-window``
 stores it escaped, so a ``\\`` reads back as ``\\\\`` (3.5a), and before 3.3 a ``$`` reads back
 as ``\\$`` (3.2a); ``new-window -n`` keeps the name as given (design.md spikes A and E). Every
 form tmux may produce from the recomputed name counts as showing it.
+
+A marker with ``bell: true`` writes one BEL to the terminal of a running pane when ``mark``
+changed something (``ring_bell``); a failure is only a warning (interface.md "Markers").
 """
 
 from __future__ import annotations
 
-from typing import Protocol
+import re
+from typing import TYPE_CHECKING, Protocol
 
 from .tmux_bin import TmuxVersion
+
+if TYPE_CHECKING:
+    from .panes import ManagedPane
 
 MARKER_DISPLAYS = ("name", "option")
 
@@ -69,3 +75,44 @@ def shows(reported: str, computed: str, version: TmuxVersion | None) -> bool:
     new). Only exact forms count, so a difference is never taken for a match; a form tmux
     produces that is not listed here only makes a no-op a rewrite."""
     return reported in _tmux_forms(computed, version)
+
+
+# --- the bell -----------------------------------------------------------------------------------
+
+BEL = b"\a"
+# The pseudo-terminal device paths the bell is written to: Linux, WSL and the BSDs (/dev/pts/N)
+# and macOS (/dev/ttysN). Anything else is never opened.
+_PSEUDO_TERMINAL = re.compile(r"/dev/(?:pts/[0-9]{1,10}|ttys[0-9]{1,10})")
+
+
+class _TtyReader(Protocol):
+    def pane_tty(self, pane: ManagedPane) -> str | None: ...
+
+
+class _TtyWriter(Protocol):
+    def write_tty(self, path: str, data: bytes) -> None: ...
+
+
+def ring_bell(backend: _TtyReader, gateway: _TtyWriter, pane: ManagedPane) -> str | None:
+    """Write one BEL to the terminal of ``pane`` if it is running; returns the warning to give
+    when that fails, or None. The terminal is read again right before the write, so a pane
+    that died, vanished or is no longer the one resolved gets nothing (``Backend.pane_tty``);
+    only a pseudo-terminal path is opened, and the gateway writes only to a character device
+    (``Gateway.write_tty``)."""
+    if pane.dead:
+        return None
+    tty = backend.pane_tty(pane)
+    if tty is None:
+        return (
+            f"bell not written: cannot read the terminal of managed pane {pane.id} "
+            "(it is gone, dead or no longer the pane resolved)"
+        )
+    if not _PSEUDO_TERMINAL.fullmatch(tty):
+        return (
+            f"bell not written: terminal {tty} of managed pane {pane.id} is not a pseudo-terminal"
+        )
+    try:
+        gateway.write_tty(tty, BEL)
+    except OSError as exc:
+        return f"bell not written to {tty}: {exc.strerror or exc}"
+    return None

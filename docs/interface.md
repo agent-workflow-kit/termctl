@@ -55,7 +55,7 @@ termctl stores the marker's name and its text at the time it was set (`@termctl_
 | `name` (default) | marker text + name |
 | `option` | name only; a user shows the marker through their own tmux status format ([Status format](#status-format)) |
 
-A marker with `bell: true` also writes one BEL character to the pane's terminal (`#{pane_tty}`) when `mark` changes something on a running pane, which sets tmux's bell flag on the window. A failed write is a warning only. tmux ignores the bell on the window a client is currently viewing and may also ring the user's terminal, so `bell` defaults to `false`.
+A marker with `bell: true` also writes one BEL character to the pane's terminal (`#{pane_tty}`) when `mark` changes something on a running pane, which sets tmux's bell flag on the window. The BEL is written only to a pseudo-terminal path (`/dev/pts/N`, or `/dev/ttysN` on macOS) that opens as a character device, and only while the pane is still the managed pane resolved and running; anything else is not written to. A failed or skipped write (including a socket check that fails before it) is a warning only. tmux ignores the bell on the window a client is currently viewing and may also ring the user's terminal, so `bell` defaults to `false`.
 
 ### Status format
 
@@ -269,7 +269,7 @@ Exit codes: 0; 1; 2; 11; 12 (`tmux_missing`, `tmux_too_old`, `server_unavailable
 
 ### `mark`
 
-`termctl mark <id> <marker> [--dry-run]`: sets the marker by the rules in [Markers](#markers) (a marker name not in config exits 2) and recomputes the displayed name, renaming the window only under the condition in [Names](#names); a marker with `bell: true` writes BEL when something changed on a running pane. Human output: the displayed name. `--json`: the pane object with `changed`, `display_updated` and `dry_run` (`schemas/cli/mark.json`, which is `schemas/cli/pane-change.json`). Exit 0, 1, 2, 10, 12 (`locked` too), 21.
+`termctl mark <id> <marker> [--dry-run]`: sets the marker by the rules in [Markers](#markers) (a marker name not in config is a `usage` error, exit 2, found in [Check order](#check-order) step 1 once the config loads, so it is not logged) and recomputes the displayed name, renaming the window only under the condition in [Names](#names); a marker with `bell: true` writes BEL when something changed on a running pane. Human output: the displayed name. `--json`: the pane object with `changed`, `display_updated` and `dry_run` (`schemas/cli/mark.json`, which is `schemas/cli/pane-change.json`). Exit 0, 1, 2, 10, 12 (`locked` too), 21.
 
 ### `unmark`
 
@@ -486,6 +486,7 @@ termctl has no per-repo overrides (it has no notion of a repository).
 - **Clients import their environment.** A user's plain `tmux attach` or `switch-client` imports variables such as `SSH_AUTH_SOCK` into a session termctl created, and later panes there get them ([Environment](#environment)).
 - **`exit-unattached` on servers termctl starts.** termctl turns `exit-unattached` off on a server it starts, overriding a user's `exit-unattached on` for that server; it never changes a server it did not start, except in the short race where another server starts between `open`'s last socket check and its server start ([Open order](#open-order) step 5).
 - **Socket path races.** A component of the socket path may change between termctl's checks and tmux's connect. After the checks only the real uid or root can replace a checked component, so the window is not exploitable by other users; a *no server* result is never followed by a connect without re-running the checks.
+- **Bell terminal reuse.** The bell's terminal is read from tmux just before it is opened ([Markers](#markers)). If the pane exits in between and its pseudo-terminal is reassigned, the one BEL can reach another terminal; other users' terminals refuse the open, so the worst case is one BEL on another terminal of the same user. Closing this would need tmux to pass an open descriptor.
 - **Orphans after `close --force`.** Only the recorded process is signaled, by PID, never a process group; its children get only the kernel's SIGHUP. Children that ignore SIGHUP, or that the command moved into another session or process group, survive.
 - **`--env` values are visible** to local process listings while the tmux client runs.
 - **The command check searches fewer `PATH` entries than `env`.** The command check searches only the absolute entries of the command's `PATH` ([Open order](#open-order) step 2), while `/usr/bin/env` looks the program up on the whole `PATH`. With an empty or relative entry before the matching absolute one, a different executable (for example one in the pane's working directory) can run than the one the check found.
