@@ -635,6 +635,54 @@ def test_the_signal_dispositions_are_restored_before_the_attach_exec() -> None:
     assert at_exec == [before]
 
 
+def _sigterm_after_the_ok_record(monkeypatch: pytest.MonkeyPatch) -> None:
+    log = cli.Context.log
+
+    def log_then_stop(self: cli.Context, record: dict[str, Any]) -> None:
+        log(self, record)
+        if record["event"] == "focus" and record["result"] == "ok":
+            os.kill(os.getpid(), signal.SIGTERM)
+
+    monkeypatch.setattr(cli.Context, "log", log_then_stop)
+
+
+def test_a_signal_right_after_the_switch_record_is_ignored(
+    private_state_home: Path, monkeypatch: pytest.MonkeyPatch
+) -> None:
+    _sigterm_after_the_ok_record(monkeypatch)
+    result = run_json([], gateway(["/dev/pts/2 300 $1 @5"], switched=["/dev/pts/2"]))
+    assert result.code == 0
+    [record] = records(private_state_home)
+    assert (record["result"], record["exit_code"]) == ("ok", 0)
+
+
+def test_a_signal_right_after_the_attach_record_is_ignored(
+    private_state_home: Path, monkeypatch: pytest.MonkeyPatch
+) -> None:
+    _sigterm_after_the_ok_record(monkeypatch)
+    gw = gateway(tty=True)
+    with pytest.raises(Execed):
+        run([], gw)
+    [record] = records(private_state_home)
+    assert (record["result"], record["action"]) == ("ok", "attach")
+    assert "exit_code" not in record
+    assert [argv for argv, _ in gw.execs] == [ATTACH]
+
+
+def test_an_unexpected_exec_failure_is_internal_and_logged(private_state_home: Path) -> None:
+    gw = gateway(tty=True, exec_error=RuntimeError("boom"))
+    result = run([], gw)
+    assert result.code == 1
+    ok, failed = records(private_state_home)
+    assert (ok["result"], ok["action"]) == ("ok", "attach")
+    assert "exit_code" not in ok
+    del failed["ts"]
+    assert failed == {
+        "level": "error", "event": "focus", "result": "error", "id": ID, "socket_path": SOCK,
+        "exit_code": 1, "message": "internal error: RuntimeError: boom", "action": "attach",
+    }  # fmt: skip
+
+
 # --- golden output ------------------------------------------------------------------------------
 
 

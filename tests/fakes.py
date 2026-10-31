@@ -249,7 +249,7 @@ class FakeGateway:
         processes: Sequence[FakeProcess] = (),
         clock: FakeClock | None = None,
         stderr_tty: bool | None = None,
-        exec_error: OSError | None = None,
+        exec_error: Exception | None = None,
     ) -> None:
         # ``open_process`` and ``read_proc_stat`` answer from ``processes`` (by PID; a later
         # one replaces an earlier one, as a reused PID would), whose timed exits follow
