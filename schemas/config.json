@@ -160,10 +160,11 @@
       "pattern": "^[a-z0-9][a-z0-9_-]{0,31}$"
     },
     "marker_text": {
+      "$comment": "Lookaheads use [\\s\\S], not '.', so that U+2028 and U+2029 cannot hide text from ECMA-262 engines. The surrogate-pair alternative lets engines without the u flag accept characters outside the BMP while lone surrogates are rejected.",
       "type": "string",
       "minLength": 1,
       "maxLength": 16,
-      "pattern": "^(?!.*#\\[)(?!.*#$)[^\\u0000-\\u001f\\u007f-\\u009f]+$",
+      "pattern": "^(?![\\s\\S]*#\\[)(?![\\s\\S]*#$)(?:[^\\u0000-\\u001f\\u007f-\\u009f\\ud800-\\udfff]|[\\ud800-\\udbff][\\udc00-\\udfff])+$",
       "description": "1-16 code points, the name rules, and not ending in '#'."
     },
     "placement": {
@@ -266,17 +267,18 @@
       "description": "A session name termctl creates or targets (config, open --session, pre-open payload)."
     },
     "socket": {
+      "$comment": "Lookaheads use [\\s\\S], not '.', so that U+2028 and U+2029 cannot hide text from ECMA-262 engines. The surrogate-pair alternative lets engines without the u flag accept characters outside the BMP while lone surrogates are rejected.",
       "oneOf": [
         {
           "type": "string",
-          "pattern": "^((?!\\.\\.?$)[A-Za-z0-9._-]{1,64}|(?!.*/$)/(?!.*;$)[^\\u0000-\\u001f\\u007f-\\u009f]*)$",
+          "pattern": "^(?:(?!\\.\\.?$)[A-Za-z0-9._-]{1,64}|(?![\\s\\S]*[;/]$)(?![\\s\\S]*/\\.\\.?$)/(?:[^\\u0000-\\u001f\\u007f-\\u009f,\\ud800-\\udfff]|[\\ud800-\\udbff][\\udc00-\\udfff])*)$",
           "maxLength": 100
         },
         {
           "type": "null"
         }
       ],
-      "description": "A socket name (not '.' or '..') or an absolute socket path (no control characters, not ending in ';' or '/'; '/' itself is rejected)."
+      "description": "A socket name (not '.' or '..') or an absolute socket path (the socket_path rules; '/' itself is rejected). The path limit is 100 bytes; maxLength counts code points and is an approximation."
     },
     "target": {
       "enum": [

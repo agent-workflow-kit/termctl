@@ -10,11 +10,12 @@
       "description": "termctl id"
     },
     "name": {
+      "$comment": "Lookaheads use [\\s\\S], not '.', so that U+2028 and U+2029 cannot hide text from ECMA-262 engines. The surrogate-pair alternative lets engines without the u flag accept characters outside the BMP while lone surrogates are rejected.",
       "type": "string",
       "minLength": 1,
       "maxLength": 64,
-      "pattern": "^(?!.*#\\[)[^\\u0000-\\u001f\\u007f-\\u009f]+$",
-      "description": "A name: 1-64 code points, no control characters, not containing '#['; displayed literally. Trusted input: callers never build it from third-party text."
+      "pattern": "^(?![\\s\\S]*#\\[)(?:[^\\u0000-\\u001f\\u007f-\\u009f\\ud800-\\udfff]|[\\ud800-\\udbff][\\udc00-\\udfff])+$",
+      "description": "A name: 1-64 code points of valid Unicode text (no lone surrogates), no control characters, not containing '#['; displayed literally. Trusted input: callers never build it from third-party text."
     },
     "display_name": {
       "type": "string",
@@ -27,10 +28,11 @@
       "pattern": "^[a-z0-9][a-z0-9_-]{0,31}$"
     },
     "marker_text": {
+      "$comment": "Lookaheads use [\\s\\S], not '.', so that U+2028 and U+2029 cannot hide text from ECMA-262 engines. The surrogate-pair alternative lets engines without the u flag accept characters outside the BMP while lone surrogates are rejected.",
       "type": "string",
       "minLength": 1,
       "maxLength": 16,
-      "pattern": "^(?!.*#\\[)(?!.*#$)[^\\u0000-\\u001f\\u007f-\\u009f]+$",
+      "pattern": "^(?![\\s\\S]*#\\[)(?![\\s\\S]*#$)(?:[^\\u0000-\\u001f\\u007f-\\u009f\\ud800-\\udfff]|[\\ud800-\\udbff][\\udc00-\\udfff])+$",
       "description": "1-16 code points, the name rules, and not ending in '#'."
     },
     "session_name": {
@@ -90,24 +92,26 @@
       "pattern": "^[A-Za-z_][A-Za-z0-9_]*$"
     },
     "socket_path": {
+      "$comment": "Lookaheads use [\\s\\S], not '.', so that U+2028 and U+2029 cannot hide text from ECMA-262 engines. The surrogate-pair alternative lets engines without the u flag accept characters outside the BMP while lone surrogates are rejected.",
       "type": "string",
       "minLength": 2,
       "maxLength": 100,
-      "pattern": "^(?!.*/$)/(?!.*;$)[^\\u0000-\\u001f\\u007f-\\u009f]*$",
-      "description": "Canonical absolute socket path: the realpath of the deepest existing ancestor of the parent directory, joined with the remaining components and the basename. No control characters, not ending in ';' or '/'. The limit is 100 bytes; maxLength counts code points and is an approximation."
+      "pattern": "^(?![\\s\\S]*[;/]$)(?![\\s\\S]*/\\.\\.?$)/(?:[^\\u0000-\\u001f\\u007f-\\u009f,\\ud800-\\udfff]|[\\ud800-\\udbff][\\udc00-\\udfff])*$",
+      "description": "Canonical absolute socket path: the realpath of the deepest existing ancestor of the parent directory, joined with the remaining components and the basename. Valid Unicode text with no control characters and no ','; not ending in ';' or '/'; a basename other than '.' and '..'. The limit is 100 bytes; maxLength counts code points and is an approximation."
     },
     "socket": {
+      "$comment": "Lookaheads use [\\s\\S], not '.', so that U+2028 and U+2029 cannot hide text from ECMA-262 engines. The surrogate-pair alternative lets engines without the u flag accept characters outside the BMP while lone surrogates are rejected.",
       "oneOf": [
         {
           "type": "string",
-          "pattern": "^((?!\\.\\.?$)[A-Za-z0-9._-]{1,64}|(?!.*/$)/(?!.*;$)[^\\u0000-\\u001f\\u007f-\\u009f]*)$",
+          "pattern": "^(?:(?!\\.\\.?$)[A-Za-z0-9._-]{1,64}|(?![\\s\\S]*[;/]$)(?![\\s\\S]*/\\.\\.?$)/(?:[^\\u0000-\\u001f\\u007f-\\u009f,\\ud800-\\udfff]|[\\ud800-\\udbff][\\udc00-\\udfff])*)$",
           "maxLength": 100
         },
         {
           "type": "null"
         }
       ],
-      "description": "A socket name (not '.' or '..') or an absolute socket path (no control characters, not ending in ';' or '/'; '/' itself is rejected)."
+      "description": "A socket name (not '.' or '..') or an absolute socket path (the socket_path rules; '/' itself is rejected). The path limit is 100 bytes; maxLength counts code points and is an approximation."
     },
     "decision_ids": {
       "type": "array",
