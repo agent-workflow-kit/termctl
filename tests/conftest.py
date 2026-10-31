@@ -67,20 +67,44 @@ def _reads_no_config(argv: list[str]) -> bool:
     return False
 
 
-def tmux_home_problem(argv: object, env: Mapping[str, str] | None) -> str | None:
+def _under_real_home(path: str) -> bool:
+    real = os.path.realpath(path)
+    return any(real == home or real.startswith(home.rstrip("/") + "/") for home in REAL_HOMES)
+
+
+def tmux_home_problem(
+    argv: object, env: Mapping[str, str] | None, executable: object = None
+) -> str | None:
     """Why running ``argv`` with ``env`` (``None``: this process's) could make tmux read the
-    real user's config: ``argv`` runs a binary named ``tmux`` without ``-f`` or ``-V``, and
-    ``HOME`` is absent or a real home directory. None when it cannot."""
+    real user's config, or None when it cannot.
+
+    Checked: a list or tuple ``argv`` whose ``argv[0]``, or the ``executable`` Popen argument
+    when given, has the basename ``tmux``, and whose tmux client options include neither
+    ``-f`` nor ``-V``. Such a run is refused when ``HOME`` is absent or a real home directory,
+    or when ``XDG_CONFIG_HOME`` is set and its realpath is a real home or under one (tmux >=
+    3.2 reads ``$XDG_CONFIG_HOME/tmux/tmux.conf``; an absent one falls back to the private
+    ``HOME``). Not checked: a string ``argv`` (``shell=True`` command strings included) and
+    tmux run by another program (``/usr/bin/env tmux``).
+    """
     if isinstance(argv, (str, bytes, os.PathLike)) or not isinstance(argv, (list, tuple)):
         return None
     elements = [os.fsdecode(element) for element in argv]  # pyright: ignore[reportUnknownVariableType, reportUnknownArgumentType]
-    if not elements or os.path.basename(elements[0]) != "tmux" or _reads_no_config(elements):
+    if not elements or _reads_no_config(elements):
         return None
-    home = (os.environ if env is None else env).get("HOME")
+    names = {os.path.basename(elements[0])}
+    if isinstance(executable, (str, bytes, os.PathLike)):
+        names.add(os.path.basename(os.fsdecode(executable)))  # pyright: ignore[reportUnknownArgumentType]
+    if "tmux" not in names:
+        return None
+    environ = os.environ if env is None else env
+    home = environ.get("HOME")
     if not home:
         return "HOME is not set, so tmux would read the passwd home's config"
     if os.path.realpath(home) in REAL_HOMES:
         return f"HOME is the real home {home}, so tmux would read its config"
+    xdg = environ.get("XDG_CONFIG_HOME")
+    if xdg and _under_real_home(xdg):
+        return f"XDG_CONFIG_HOME {xdg} is under a real home, so tmux would read its config"
     return None
 
 
@@ -88,10 +112,14 @@ class _GuardedPopen(subprocess.Popen):  # type: ignore[type-arg]  # pyright: ign
     """``subprocess.Popen`` that refuses a tmux run that could read the real config."""
 
     def __init__(self, args: Any, *rest: Any, **kwargs: Any) -> None:
+        # Popen's positional order: bufsize, executable, ..., cwd, env.
         env = kwargs.get("env")
         if env is None and len(rest) >= 10:
-            env = rest[9]  # Popen's positional order: bufsize, executable, ..., cwd, env
-        problem = tmux_home_problem(args, env)
+            env = rest[9]
+        executable = kwargs.get("executable")
+        if executable is None and len(rest) >= 2:
+            executable = rest[1]
+        problem = tmux_home_problem(args, env, executable)
         if problem is not None:
             raise AssertionError(f"test guard: refusing to run {args[0]!r}: {problem}")
         super().__init__(args, *rest, **kwargs)

@@ -919,6 +919,12 @@ def _is_gone(result: subprocess.CompletedProcess[str]) -> bool:
     return bool(lines) and _GONE.fullmatch(lines[0]) is not None
 
 
+def is_gone(result: subprocess.CompletedProcess[str]) -> bool:
+    """Whether a tmux call failed because its target pane, window or session is gone (only
+    stderr's first line counts, as for ``_is_gone``)."""
+    return result.returncode > 0 and _is_gone(result)
+
+
 def tmux_message(result: subprocess.CompletedProcess[str]) -> str:
     """tmux's first stderr line, bounded, for an error message (escaped when printed)."""
     lines = [line.strip() for line in _stderr_lines(result) if line.strip()]
@@ -1011,11 +1017,13 @@ def new_session(
     name: str, spec: WindowSpec, *, start_server: bool, env: Mapping[str, str]
 ) -> Invocation:
     """The session ``name`` with its first window, chained with ``destroy-unattached off``
-    (spike C2) and, for each ``-e`` variable ``K``, a ``set-environment`` that puts back what
-    the session would hold without ``-e``, so that only the first pane keeps the ``-e`` value:
-    ``K`` with its value in ``env``, the filtered environment the invocation runs with, or,
-    when ``env`` lacks ``K``, a removal marker (``-r``). A plain removal (``-u``) would let
-    later windows inherit the server's global ``K`` (review round 1, R1-2). ``start_server``
+    (spike C2) and, for each ``-e`` variable ``K``, a ``set-environment`` that replaces the
+    ``-e`` value in the session environment, so that only the first pane keeps it: ``K`` with
+    its value in ``env``, the filtered environment the invocation runs with, or, when ``env``
+    lacks ``K``, a removal marker (``-r``). A plain removal (``-u``) would let later windows
+    inherit the server's global ``K`` (review round 1, R1-2). The entry takes precedence for
+    later windows, also for a ``K`` outside ``update-environment`` (review round 2, R2-1:
+    documented, not restored exactly). ``start_server``
     prefixes ``set -s exit-unattached off``, for a server this invocation starts (spike F2);
     never for a server termctl did not start."""
     target = session(name)

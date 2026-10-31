@@ -231,6 +231,24 @@ def test_r1_2_a_new_sessions_env_variable_in_the_filter_gets_the_filtered_value(
     assert environ_of(tmux_server, later)["TZ"] == "Filtered/Zone"
 
 
+@needs_proc
+def test_r2_1_the_session_entry_outside_update_environment_takes_precedence_over_the_global(
+    tmux_server: TmuxServer,
+) -> None:
+    # Review round 2, R2-1 (documented fallback, interface.md "--env scope"): TZ is not in
+    # update-environment, so without --env later windows would get the server's global TZ;
+    # the removal marker termctl chains leaves them without TZ instead.
+    tmux_server.env["TZ"] = "Server/Zone"
+    tmux_server.start()
+    del tmux_server.env["TZ"]
+    assert "TZ=Server/Zone" in global_env(tmux_server)
+    first = opened(tmux_server, "--session", "s2", "--env", "TZ=Mine/Option")
+    assert environ_of(tmux_server, first["pane_id"])["TZ"] == "Mine/Option"
+    assert "-TZ" in session_env(tmux_server, "s2")
+    later = later_window(tmux_server, "s2")
+    assert "TZ" not in environ_of(tmux_server, later)
+
+
 # --- --env with argv ----------------------------------------------------------------------------
 
 

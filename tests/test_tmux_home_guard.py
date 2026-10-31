@@ -52,3 +52,25 @@ def test_the_guard_reads_only_tmux_client_options() -> None:
     assert tmux_home_problem([MISSING_TMUX, "list-panes", "-f", "x"], {}) is not None
     assert tmux_home_problem([MISSING_TMUX, "-S", "-f", "ls"], {}) is not None
     assert tmux_home_problem(["/usr/bin/env", "tmux"], {}) is None
+
+
+def test_the_guard_refuses_an_xdg_config_home_under_a_real_home(tmp_path: Path) -> None:
+    # Review round 2, R2-3: tmux >= 3.2 also reads $XDG_CONFIG_HOME/tmux/tmux.conf.
+    real = next(iter(REAL_HOMES))
+    env = {"HOME": str(tmp_path), "XDG_CONFIG_HOME": os.path.join(real, ".config")}
+    assert tmux_home_problem([MISSING_TMUX, "new-session"], env) is not None
+    with pytest.raises(AssertionError, match="test guard"):
+        subprocess.Popen([MISSING_TMUX, "new-session"], env=env)
+    assert tmux_home_problem([MISSING_TMUX, "new-session"], {"HOME": str(tmp_path)}) is None
+    private = {"HOME": str(tmp_path), "XDG_CONFIG_HOME": str(tmp_path / "config")}
+    assert tmux_home_problem([MISSING_TMUX, "new-session"], private) is None
+
+
+def test_the_guard_checks_the_executable_argument() -> None:
+    # Review round 2, R2-3: executable= runs tmux whatever args[0] says.
+    with pytest.raises(AssertionError, match="test guard"):
+        subprocess.Popen(["anything", "new-session"], executable=MISSING_TMUX, env={})
+    with pytest.raises(AssertionError, match="test guard"):
+        subprocess.Popen(["anything", "new-session"], -1, MISSING_TMUX, env={})
+    with pytest.raises(FileNotFoundError):
+        subprocess.Popen(["tmux", "-V"], executable=MISSING_TMUX, env={})

@@ -471,6 +471,32 @@ def test_a_cleanup_that_kills_nothing_warns_and_still_reports_tag_failed(cleanup
     assert "%5" in warnings[0] and "@3" in warnings[0]
 
 
+@pytest.mark.parametrize(
+    "stderr", ["can't find pane: %5\n", "can't find window: @3\n"], ids=["pane", "window"]
+)
+def test_a_cleanup_that_finds_the_pane_gone_does_not_warn(stderr: str) -> None:
+    # Review round 2, R2-2: the pane is already gone (a no-argv shell that exited at once,
+    # another client's kill), so nothing is left running.
+    p = plan()
+    gateway = FakeGateway({tag_key(p): NOMATCH, CLEANUP: completed(stderr=stderr, returncode=1)})
+    warnings: list[str] = []
+    with pytest.raises(TermctlError) as caught:
+        tag(gateway, p, warnings)
+    assert caught.value.code == "tag_failed"
+    assert gateway.calls[-1] == list(CLEANUP)
+    assert warnings == []
+
+
+def test_a_cleanup_whose_failure_only_starts_like_a_gone_message_warns() -> None:
+    p = plan()
+    stderr = "boom\ncan't find pane: %5\n"
+    gateway = FakeGateway({tag_key(p): NOMATCH, CLEANUP: completed(stderr=stderr, returncode=1)})
+    warnings: list[str] = []
+    with pytest.raises(TermctlError):
+        tag(gateway, p, warnings)
+    assert len(warnings) == 1
+
+
 def test_tag_failed_never_echoes_env_values() -> None:
     p = plan(env=(("TOKENISH", "value-not-to-print"),))
     gateway = FakeGateway({tag_key(p): completed(returncode=1), CLEANUP: completed()})

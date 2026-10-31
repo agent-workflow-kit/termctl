@@ -327,8 +327,9 @@ def tag(
     its being in the window step 5 reported with an empty or its own ``@termctl_pane``, and
     ``open`` exits 12 (``tag_failed``). When the tagging found no server, there is no cleanup:
     a no-server result is never followed by a connect without the socket checks. When the
-    cleanup kill does not run (its guard did not match, a forged ``@termctl_pane`` say),
-    ``warn`` names the window left behind (interface.md "Residual risks", forged options).
+    cleanup kill does not run (its guard did not match, a forged ``@termctl_pane`` say, or
+    it failed with anything but tmux reporting the pane gone), ``warn`` names the window
+    that may be left behind (interface.md "Residual risks", forged options).
     TODO(#16): the ``tag_failed`` log record (``result: error``) and the step 7 query.
     """
     try:

@@ -99,7 +99,9 @@ class Backend(Protocol):
 
     def cleanup_pane(self, created: Created) -> bool:
         """Kill the pane after a failed tagging, guarded (``tmux_backend.cleanup_kill``);
-        whether the guarded kill ran. Never raises for a tmux failure."""
+        whether the pane is gone: the guarded kill ran, or tmux reported the pane or its
+        window gone. False when it may still exist: the guard did not match, or the kill
+        failed otherwise (review round 2, R2-2). Never raises for a tmux failure."""
         ...
 
 
@@ -172,7 +174,7 @@ class TmuxBackend:
             result = self.tmux.run(tb.cleanup_kill(created.pane_id, created.window_id))
         except TermctlError:
             return False
-        return tb.guard_outcome(result) is tb.GuardOutcome.MATCHED
+        return tb.guard_outcome(result) is tb.GuardOutcome.MATCHED or tb.is_gone(result)
 
     def _created(self, result: subprocess.CompletedProcess[str]) -> Created:
         """The ids a successful creation printed. A failed chain is never taken as created,
