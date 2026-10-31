@@ -466,7 +466,9 @@ def resolve_command(args: argparse.Namespace, ctx: Context) -> None:
     ctx.window = ctx.plan.window
     # The id; step 3 checks it against the managed panes (a replacement has the same length).
     ctx.open_id = ids.generate()
-    invocations = open_cmd.size_invocations(ctx.selection.session, ctx.plan, ctx.open_id)
+    invocations = open_cmd.size_invocations(
+        ctx.selection.session, ctx.plan, ctx.open_id, server_env(ctx)
+    )
     open_cmd.check_size(invocations, ctx.tmux_path, ctx.server.socket_path)
 
 
@@ -631,15 +633,34 @@ def open_pane(args: argparse.Namespace, ctx: Context) -> Result:
         raise TermctlError("internal", f"{PROG} open --dry-run is not implemented yet")
     assert ctx.plan is not None and ctx.open_id is not None
     # TODO(#17): step 4, the pre-open hooks (veto 11, escalation 13; nothing created).
+    _refuse_open_hooks(args, ctx)
     backend = unchecked_backend(ctx)
     created = open_cmd.create_window(
         backend, ctx.server, ctx.gateway, ctx.selection.session, ctx.window
     )
     created_at = open_cmd.timestamp(ctx.clock.now())
-    open_cmd.tag(backend, created, ctx.open_id, ctx.plan, created_at)
+    open_cmd.tag(backend, created, ctx.open_id, ctx.plan, created_at, ctx.out.warn)
     # TODO(#16): step 7 records the process; TODO(#24): step 8, --focus;
     # TODO(#17): post-open hooks, the log record and the final output.
     return _opened(args, ctx, backend, created, created_at)
+
+
+_OPEN_HOOKS = ("pre-open", "post-open")
+
+
+def _refuse_open_hooks(args: argparse.Namespace, ctx: Context) -> None:
+    """Refuse (exit 1, ``internal``) before anything is created when a ``pre-open`` or
+    ``post-open`` hook would run, from config or ``--hook``: hooks do not run yet, and a veto
+    must never fail open (review round 1, R1-1).
+    TODO(#17): remove this refusal when hooks run."""
+    configured = ctx.config.hooks.pre_open or ctx.config.hooks.post_open
+    given = any(hook.split("=", 1)[0] in _OPEN_HOOKS for hook in args.hooks)
+    if configured or given:
+        raise TermctlError(
+            "internal",
+            f"{PROG} open with pre-open or post-open hooks is not implemented yet: hooks do"
+            " not run yet, so open refuses rather than skip them",
+        )
 
 
 def _opened(

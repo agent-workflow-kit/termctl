@@ -84,13 +84,13 @@ Status: planned, 2026-10-30. Implements [interface.md](interface.md) (normative)
 - placement: rules (first match, empty match), `--placement`, `--session`/`--target` overrides, inheritance from `default`, `not_supported` for `target: pane` and related fields.
 - session creation: exact `=S:` targets; duplicate-session race (two concurrent opens, one server, both panes created); `destroy-unattached off` chained (spike C2); `exit-unattached off` only when the re-probe found no server (spike F2); `has-session` confirmation; the vanished-session retry, never exit 10; re-run socket checks and `mkdir`/`EEXIST`/`lstat` before starting a server.
 - placeholder + respawn (spike C1, E5): options set before a fast-exiting command (`true`, `false`); keep `never|failed|always`; no leftover placeholder; `state: gone` output; `-d` always; PID recorded only when not dead and parented by the server (spike E6).
-- no-argv path: login shell (spike E2); `-e` via `new-window` or `new-session` + `set-environment -u` (spike G3c).
+- no-argv path: login shell (spike E2); `-e` via `new-window`, or `new-session` + `set-environment` putting back the filtered value, or `-r` when the filtered environment lacks the variable (spike G3c; later windows never inherit the server's global value).
 - environment: every tmux invocation runs with the filtered environment (spike C7, D3); `--env` never in the session environment (spike G1–G3); `--env PATH=X` via `/usr/bin/env -- PATH=X` (spike G4); `--env PATH` without argv → 2; repeated names → 2; values redacted under `--verbose`.
 - failure handling: `tag_failed` with the guarded cleanup kill; no post-open hooks; log `result: error`.
 - hooks: pre-open payload fields (env names only), veto/escalate/override, decision ids in output, log and audit (override runs).
 - `--dry-run`: read-only tmux queries only, tmux checks, `%NEW`/`@NEW` tokens, no hooks, nothing created.
 
-Interim state: the CLI `open` runs steps 1 to 3, 5 and 6 (no hooks yet), then reads the pane back for its output, with `pid: null` until the process is recorded (#16), `focused: false` until focus-on-open lands (#24) and only the `--decision-id` values (#17). `open --dry-run` still refuses (exit 1, `internal`) until #18.
+Interim state: the CLI `open` runs steps 1 to 3, 5 and 6 (no hooks yet; until #17 it refuses, exit 1 `internal`, before anything is created whenever a `pre-open` or `post-open` hook is configured or given with `--hook`), then reads the pane back for its output, with `pid: null` until the process is recorded (#16), `focused: false` until focus-on-open lands (#24) and only the `--decision-id` values (#17). `open --dry-run` still refuses (exit 1, `internal`) until #18.
 
 **Status**: Not Started
 

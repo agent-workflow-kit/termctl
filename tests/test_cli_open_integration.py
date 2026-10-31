@@ -110,9 +110,11 @@ def test_c1_keep_never_closes_the_window_and_reports_gone(tmux_server: TmuxServe
     tmux_server.start()
     out = opened(tmux_server, "--", "true")
     # `true` has normally exited and taken its window before the read after tagging (always
-    # "gone" on 3.5a); a slow host may still read it running.
-    assert out["state"] in ("gone", "running")
-    if out["state"] == "gone":
+    # "gone" on 3.5a); a slow host may still read it running, and tmux 3.2 may briefly show it
+    # dead with neither exit field set (interface.md "Command exit", spike D; review round 1,
+    # R1-10). Any other dead state is wrong.
+    assert out["state"] in ("gone", "running", "dead")
+    if out["state"] in ("gone", "dead"):
         assert (out["pid"], out["exit_status"], out["exit_signal"]) == (None, None, None)
     assert wait_for(lambda: not pane_exists(tmux_server, out["pane_id"]))
     assert termctl(tmux_server, "exists", out["id"]).code == 10
@@ -186,6 +188,47 @@ def test_g1_g3_without_argv_env_reaches_only_the_first_pane(
     assert not [line for line in session_env(tmux_server) if line.startswith("FOO=")]
     later = opened(tmux_server)
     assert "FOO" not in environ_of(tmux_server, later["pane_id"])
+
+
+def later_window(server: TmuxServer, session: str) -> str:
+    """A window another tmux user opens later in ``session``; its pane id."""
+    result = server.raw(
+        "new-window", "-d", "-P", "-F", "#{pane_id}", "-t", f"={session}:",
+        "--", "/usr/bin/env", "--", "sleep", "60",
+    )  # fmt: skip
+    assert result.returncode == 0, result.stderr
+    return result.stdout.strip()
+
+
+@needs_proc
+def test_r1_2_a_new_sessions_env_variable_missing_from_the_filter_stays_removed(
+    tmux_server: TmuxServer,
+) -> None:
+    # Review round 1, R1-2: with set-environment -u, later windows inherited the server's
+    # global SSH_AUTH_SOCK; the removal marker keeps it out of them.
+    tmux_server.env["SSH_AUTH_SOCK"] = "/global/agent"
+    tmux_server.start()
+    del tmux_server.env["SSH_AUTH_SOCK"]
+    assert "SSH_AUTH_SOCK=/global/agent" in global_env(tmux_server)
+    first = opened(tmux_server, "--session", "s2", "--env", "SSH_AUTH_SOCK=/mine")
+    assert environ_of(tmux_server, first["pane_id"])["SSH_AUTH_SOCK"] == "/mine"
+    assert "-SSH_AUTH_SOCK" in session_env(tmux_server, "s2")
+    later = later_window(tmux_server, "s2")
+    assert "SSH_AUTH_SOCK" not in environ_of(tmux_server, later)
+
+
+@needs_proc
+def test_r1_2_a_new_sessions_env_variable_in_the_filter_gets_the_filtered_value(
+    tmux_server: TmuxServer,
+) -> None:
+    tmux_server.start()
+    first = opened(
+        tmux_server, "--session", "s2", "--env", "TZ=Mine/Option", environ={"TZ": "Filtered/Zone"}
+    )
+    assert environ_of(tmux_server, first["pane_id"])["TZ"] == "Mine/Option"
+    assert "TZ=Filtered/Zone" in session_env(tmux_server, "s2")
+    later = later_window(tmux_server, "s2")
+    assert environ_of(tmux_server, later)["TZ"] == "Filtered/Zone"
 
 
 # --- --env with argv ----------------------------------------------------------------------------
@@ -320,6 +363,42 @@ def test_a_forged_global_ownership_marker_fails_the_tagging(tmux_server: TmuxSer
     validate(error, "termctl/cli/error.json")
     assert error["error"]["code"] == "tag_failed"
     assert termctl(tmux_server, "--json", "list").json()["panes"] == []
+    # Review round 1, R1-7: the cleanup guard cannot match either, so the window stays (its
+    # placeholder ends within 30 s) and a warning names it.
+    assert "warning:" in result.stderr and "unmanaged" in result.stderr
+
+
+def test_r1_4_a_failing_inner_command_of_the_tagging_removes_the_pane(
+    tmux_server: TmuxServer,
+) -> None:
+    # A real failure inside the guarded chain: a command alias makes respawn-pane, the last
+    # inner command, fail. @termctl_pane is already set to the pane's own id, so the cleanup
+    # guard matches and the pane is killed.
+    base = tmux_server.start(SESSION)
+    alias = tmux_server.raw("set", "-s", "command-alias[100]", "respawn-pane=display -t %999 x")
+    assert alias.returncode == 0, alias.stderr
+    result = termctl(tmux_server, "--json", "open", "--", "sleep", "60")
+    assert result.code == 12, result.stdout + result.stderr
+    error = result.json()
+    validate(error, "termctl/cli/error.json")
+    assert error["error"]["code"] == "tag_failed"
+    assert "warning:" not in result.stderr
+    panes = tmux_server.raw("list-panes", "-a", "-F", "#{pane_id}").stdout.split()
+    assert panes == [base]
+
+
+def test_r1_3_the_placeholder_needs_no_sleep_on_the_callers_path(tmux_server: TmuxServer) -> None:
+    # Review round 1, R1-3: a caller PATH with only tmux and the command; the placeholder
+    # finds sleep on its own fixed PATH.
+    bin_dir = tmux_server.root / "bin"
+    bin_dir.mkdir()
+    (bin_dir / "tmux").symlink_to(tmux_server.tmux_bin)
+    tool = bin_dir / "only-tool"
+    tool.write_text("#!/bin/sh\nexec /bin/sleep 60\n")
+    tool.chmod(0o755)
+    for session_exists in (False, True):
+        out = opened(tmux_server, "--", "only-tool", environ={"PATH": str(bin_dir)})
+        assert out["state"] == "running", session_exists
 
 
 def test_usage_errors_start_nothing(tmux_server: TmuxServer) -> None:

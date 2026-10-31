@@ -1007,11 +1007,17 @@ def new_window(name: str, spec: WindowSpec) -> Invocation:
     return Invocation.of(_create(_created("new-window").target(session(name)), spec))
 
 
-def new_session(name: str, spec: WindowSpec, *, start_server: bool) -> Invocation:
+def new_session(
+    name: str, spec: WindowSpec, *, start_server: bool, env: Mapping[str, str]
+) -> Invocation:
     """The session ``name`` with its first window, chained with ``destroy-unattached off``
-    (spike C2) and, for each ``-e`` variable, ``set-environment -u`` so that only the first
-    pane keeps it (spike G3c). ``start_server`` prefixes ``set -s exit-unattached off``, for a
-    server this invocation starts (spike F2); never for a server termctl did not start."""
+    (spike C2) and, for each ``-e`` variable ``K``, a ``set-environment`` that puts back what
+    the session would hold without ``-e``, so that only the first pane keeps the ``-e`` value:
+    ``K`` with its value in ``env``, the filtered environment the invocation runs with, or,
+    when ``env`` lacks ``K``, a removal marker (``-r``). A plain removal (``-u``) would let
+    later windows inherit the server's global ``K`` (review round 1, R1-2). ``start_server``
+    prefixes ``set -s exit-unattached off``, for a server this invocation starts (spike F2);
+    never for a server termctl did not start."""
     target = session(name)
     commands: list[Command] = []
     if start_server:
@@ -1019,7 +1025,12 @@ def new_session(name: str, spec: WindowSpec, *, start_server: bool) -> Invocatio
     commands.append(_create(_created("new-session").session_name(name), spec))
     commands.append(command("set").target(target).arg("destroy-unattached").arg("off").build())
     for variable, _ in spec.env:
-        commands.append(command("set-environment").target(target).flag("-u").arg(variable).build())
+        restore = command("set-environment").target(target)
+        if variable in env:
+            restore.arg(variable).arg(env[variable])
+        else:
+            restore.flag("-r").arg(variable)
+        commands.append(restore.build())
     return Invocation.of(*commands)
 
 

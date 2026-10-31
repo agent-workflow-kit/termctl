@@ -12,6 +12,7 @@ image ships tmux (ubuntu-26.04 ships 3.6a) and skip otherwise.
 from __future__ import annotations
 
 import os
+import pwd
 import re
 import shutil
 import subprocess
@@ -20,6 +21,7 @@ import time
 from collections.abc import Callable, Iterator, Mapping
 from dataclasses import dataclass
 from pathlib import Path
+from typing import Any
 
 import pytest
 
@@ -39,6 +41,79 @@ def tmux_version(tmux_bin: str | None = TMUX_BIN) -> tuple[int, int] | None:
 
 
 TMUX_VERSION = tmux_version()
+
+
+# --- the guard against tmux reading the real user's config (review round 1, R1-11) -------------
+
+# The real home directories, recorded before the private-environment fixture replaces HOME:
+# a tmux server started with HOME absent takes the home directory from the passwd entry.
+REAL_HOMES = frozenset(
+    os.path.realpath(home)
+    for home in (os.environ.get("HOME"), pwd.getpwuid(os.getuid()).pw_dir)
+    if home
+)
+# tmux client options that take a value (tmux 3.2a to 3.6a).
+_TMUX_VALUE_OPTIONS = frozenset({"-S", "-L", "-f", "-c", "-T"})
+
+
+def _reads_no_config(argv: list[str]) -> bool:
+    """Whether the tmux client options of ``argv`` include ``-f`` (a server it starts reads
+    that file, never one under HOME) or ``-V`` (tmux prints its version and exits)."""
+    index = 1
+    while index < len(argv) and argv[index].startswith("-") and argv[index] != "--":
+        if argv[index] in ("-f", "-V"):
+            return True
+        index += 2 if argv[index] in _TMUX_VALUE_OPTIONS else 1
+    return False
+
+
+def tmux_home_problem(argv: object, env: Mapping[str, str] | None) -> str | None:
+    """Why running ``argv`` with ``env`` (``None``: this process's) could make tmux read the
+    real user's config: ``argv`` runs a binary named ``tmux`` without ``-f`` or ``-V``, and
+    ``HOME`` is absent or a real home directory. None when it cannot."""
+    if isinstance(argv, (str, bytes, os.PathLike)) or not isinstance(argv, (list, tuple)):
+        return None
+    elements = [os.fsdecode(element) for element in argv]  # pyright: ignore[reportUnknownVariableType, reportUnknownArgumentType]
+    if not elements or os.path.basename(elements[0]) != "tmux" or _reads_no_config(elements):
+        return None
+    home = (os.environ if env is None else env).get("HOME")
+    if not home:
+        return "HOME is not set, so tmux would read the passwd home's config"
+    if os.path.realpath(home) in REAL_HOMES:
+        return f"HOME is the real home {home}, so tmux would read its config"
+    return None
+
+
+class _GuardedPopen(subprocess.Popen):  # type: ignore[type-arg]  # pyright: ignore[reportMissingTypeArgument]
+    """``subprocess.Popen`` that refuses a tmux run that could read the real config."""
+
+    def __init__(self, args: Any, *rest: Any, **kwargs: Any) -> None:
+        env = kwargs.get("env")
+        if env is None and len(rest) >= 10:
+            env = rest[9]  # Popen's positional order: bufsize, executable, ..., cwd, env
+        problem = tmux_home_problem(args, env)
+        if problem is not None:
+            raise AssertionError(f"test guard: refusing to run {args[0]!r}: {problem}")
+        super().__init__(args, *rest, **kwargs)
+
+
+@pytest.fixture(scope="session", autouse=True)
+def private_home() -> Iterator[Path]:
+    """The whole run gets private HOME, XDG_CONFIG_HOME and TMUX_TMPDIR directories, and every
+    tmux run is checked by ``tmux_home_problem``: a test that would let tmux read the real
+    ~/.tmux.conf fails instead."""
+    root = Path(tempfile.mkdtemp(prefix="tc-home-"))
+    for name in ("home", "config", "tmux"):
+        (root / name).mkdir()
+    with pytest.MonkeyPatch.context() as patch:
+        patch.setenv("HOME", str(root / "home"))
+        patch.setenv("XDG_CONFIG_HOME", str(root / "config"))
+        patch.setenv("TMUX_TMPDIR", str(root / "tmux"))
+        patch.setattr(subprocess, "Popen", _GuardedPopen)
+        try:
+            yield root
+        finally:
+            shutil.rmtree(root, ignore_errors=True)
 
 
 @dataclass

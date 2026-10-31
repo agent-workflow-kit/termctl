@@ -1567,7 +1567,7 @@ def test_new_window_targets_the_session_exactly() -> None:
 def test_new_session_chains_destroy_unattached_off() -> None:
     # Spike C2: a user's destroy-unattached on would remove the session before a second
     # invocation could run.
-    assert tb.new_session("work", SPEC, start_server=False).argv(TMUX, SOCK) == [
+    assert tb.new_session("work", SPEC, start_server=False, env={}).argv(TMUX, SOCK) == [
         TMUX, "-S", SOCK, "new-session", *CREATED, "-s", "work", "-n", "KEY-12",
         "-c", "/home/u/src", "--", *PLACEHOLDER,
         ";", "set", "-t", "=work:", "--", "destroy-unattached", "off",
@@ -1576,9 +1576,9 @@ def test_new_session_chains_destroy_unattached_off() -> None:
 
 def test_new_session_starting_a_server_is_prefixed_with_exit_unattached_off() -> None:
     # Spike F2: the prefix runs after the user's config is loaded.
-    argv = tb.new_session("work", SPEC, start_server=True).argv(TMUX, SOCK)
+    argv = tb.new_session("work", SPEC, start_server=True, env={}).argv(TMUX, SOCK)
     assert argv[:9] == [TMUX, "-S", SOCK, "set", "-s", "--", "exit-unattached", "off", ";"]
-    assert argv[9:] == tb.new_session("work", SPEC, start_server=False).argv(TMUX, SOCK)[3:]
+    assert argv[9:] == tb.new_session("work", SPEC, start_server=False, env={}).argv(TMUX, SOCK)[3:]
 
 
 def test_new_session_without_a_command_runs_the_default_shell() -> None:
@@ -1588,17 +1588,26 @@ def test_new_session_without_a_command_runs_the_default_shell() -> None:
     assert "--" not in argv
 
 
-def test_new_session_env_is_removed_from_the_session_environment() -> None:
-    # Spike G3c: -e on new-session, then set-environment -u for each variable.
+def test_new_session_env_is_restored_or_marked_removed_in_the_session() -> None:
+    # Spike G3c, review round 1 R1-2: -e on new-session, then for each variable what the
+    # session would hold without -e: the filtered value if the filtered environment has it,
+    # else a removal marker (-r), never -u (later windows would get the server's global value).
     spec = tb.WindowSpec(name="shell", cwd="/", command=None, env=(("A", "1;"), ("B", "x")))
-    invocation = tb.new_session("work", spec, start_server=False)
+    invocation = tb.new_session("work", spec, start_server=False, env={"A": "-filtered;"})
     argv = invocation.argv(TMUX, SOCK)
     assert argv[argv.index("-e") : argv.index("-e") + 4] == ["-e", "A=1\\;", "-e", "B=x"]
     assert argv[-14:] == [
-        ";", "set-environment", "-t", "=work:", "-u", "--", "A",
-        ";", "set-environment", "-t", "=work:", "-u", "--", "B",
+        ";", "set-environment", "-t", "=work:", "--", "A", "-filtered\\;",
+        ";", "set-environment", "-t", "=work:", "-r", "--", "B",
     ]  # fmt: skip
+    assert "-u" not in argv
     assert "1;" not in " ".join(invocation.shown_argv(TMUX, SOCK))
+
+
+def test_new_session_without_env_sets_no_session_environment() -> None:
+    spec = tb.WindowSpec(name="shell", cwd="/", command=None)
+    argv = tb.new_session("work", spec, start_server=False, env={"A": "1"}).argv(TMUX, SOCK)
+    assert "set-environment" not in argv
 
 
 def test_new_window_env_is_for_that_pane_only() -> None:
@@ -1614,7 +1623,7 @@ def test_open_invocations_apply_the_argument_rules(value: str) -> None:
         pytest.skip("rejected as input earlier")
     spec = tb.WindowSpec(name=value or "x", cwd="/" + value, command=(value, value))
     for invocation in (
-        tb.new_session("work", spec, start_server=True),
+        tb.new_session("work", spec, start_server=True, env={}),
         tb.new_window("work", spec),
     ):
         argv = invocation.argv(TMUX, SOCK)
@@ -1626,7 +1635,7 @@ def test_open_invocations_apply_the_argument_rules(value: str) -> None:
 @pytest.mark.parametrize("name", ["", "a b", "=x", "x:", "a.b", "#", "x;", "x" * 65])
 def test_open_invocations_refuse_an_invalid_session_name(name: str) -> None:
     with pytest.raises(ValueError):
-        tb.new_session(name, SPEC, start_server=False)
+        tb.new_session(name, SPEC, start_server=False, env={})
     with pytest.raises(ValueError):
         tb.new_window(name, SPEC)
     with pytest.raises(ValueError):
@@ -1640,7 +1649,7 @@ def test_open_invocations_refuse_a_relative_cwd(cwd: str) -> None:
 
 
 def test_a_session_name_starting_with_a_dash_is_a_value() -> None:
-    argv = tb.new_session("-x", SPEC, start_server=False).argv(TMUX, SOCK)
+    argv = tb.new_session("-x", SPEC, start_server=False, env={}).argv(TMUX, SOCK)
     assert argv[argv.index("-s") + 1] == "-x"
 
 

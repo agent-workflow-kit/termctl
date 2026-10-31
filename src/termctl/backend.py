@@ -37,6 +37,15 @@ class SessionState(enum.Enum):
     MISSING = "missing"
 
 
+class NoServerTagFailure(TermctlError):
+    """``tag_failed`` because no server answered the tagging invocation: the caller must not
+    connect again for the cleanup without the socket checks (interface.md "Residual risks",
+    socket path races; review round 1, R1-6)."""
+
+    def __init__(self, message: str) -> None:
+        super().__init__("tag_failed", message)
+
+
 class Created(NamedTuple):
     """The ids of the pane and window ``open`` created."""
 
@@ -84,7 +93,8 @@ class Backend(Protocol):
     ) -> None:
         """Tag the pane step 5 created, guarded by its being untagged and in the window step 5
         reported, and, with ``respawn``, replace its placeholder with the real command. A guard
-        that does not match or a failing tmux call exits 12 (``tag_failed``)."""
+        that does not match or a failing tmux call exits 12 (``tag_failed``); a call that found
+        no server raises ``NoServerTagFailure``."""
         ...
 
     def cleanup_pane(self, created: Created) -> bool:
@@ -121,7 +131,8 @@ class TmuxBackend:
     def create_session(
         self, session: str, spec: WindowSpec, *, start_server: bool
     ) -> Created | None:
-        result = self.tmux.run(tb.new_session(session, spec, start_server=start_server))
+        invocation = tb.new_session(session, spec, start_server=start_server, env=self.tmux.env)
+        result = self.tmux.run(invocation)
         if tb.is_duplicate_session(result, session):
             return None
         return self._created(result)
@@ -145,10 +156,10 @@ class TmuxBackend:
         result = self.tmux.run(invocation)
         outcome = tb.guard_outcome(result)
         if outcome is tb.GuardOutcome.FAILED:
-            raise TermctlError(
-                "tag_failed",
-                f"tagging pane {created.pane_id} failed: {tb.tmux_message(result)}",
-            )
+            message = f"tagging pane {created.pane_id} failed: {tb.tmux_message(result)}"
+            if tb.is_no_server(result, self.socket_path):
+                raise NoServerTagFailure(message)
+            raise TermctlError("tag_failed", message)
         if outcome is tb.GuardOutcome.NOMATCH:
             raise TermctlError(
                 "tag_failed",

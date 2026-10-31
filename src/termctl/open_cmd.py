@@ -10,20 +10,21 @@ from __future__ import annotations
 
 import os
 import posixpath
-from collections.abc import Iterable, Mapping, Sequence
+from collections.abc import Callable, Iterable, Mapping, Sequence
 from dataclasses import dataclass
 from datetime import UTC, datetime
 
 from . import tmux_backend as tb
 from . import tmux_socket, validate
-from .backend import Backend, Created, SessionState
+from .backend import Backend, Created, NoServerTagFailure, SessionState
 from .errors import TermctlError, UsageError
 from .gateway import Gateway
 from .tmux_backend import Invocation, WindowSpec
 
 # The placeholder a window runs until its real command replaces it (Open order step 6); it
-# ends on its own if termctl dies.
-PLACEHOLDER = (*tb.COMMAND_PREFIX, "sleep", "30")
+# ends on its own if termctl dies. ``sleep`` is looked up on a fixed PATH, never the caller's
+# (review round 1, R1-3).
+PLACEHOLDER = (*tb.COMMAND_PREFIX, "PATH=/usr/bin:/bin", "sleep", "30")
 # --keep-on-exit as tmux's remain-on-exit (interface.md "Command exit").
 REMAIN_ON_EXIT = {"never": "off", "failed": "failed", "always": "on"}
 # The pane options' schema version (interface.md "Pane options").
@@ -199,13 +200,16 @@ def timestamp(now: datetime) -> str:
     return utc.strftime("%Y-%m-%dT%H:%M:%S.") + f"{utc.microsecond // 1000:03d}Z"
 
 
-def size_invocations(session: str, plan: Plan, termctl_id: str) -> list[Invocation]:
+def size_invocations(
+    session: str, plan: Plan, termctl_id: str, env: Mapping[str, str]
+) -> list[Invocation]:
     """The invocations the size check judges: step 5's in the new-session case (it starts the
-    server, so it carries the most) and step 6's tagging invocation, with the largest ids tmux
-    can assign."""
+    server, so it carries the most, including the ``set-environment`` values from ``env``, the
+    filtered environment) and step 6's tagging invocation, with the largest ids tmux can
+    assign."""
     largest = Created(_LARGEST_PANE_ID, _LARGEST_WINDOW_ID)
     return [
-        tb.new_session(session, plan.window, start_server=True),
+        tb.new_session(session, plan.window, start_server=True, env=env),
         plan.tag_invocation(termctl_id, largest, timestamp(datetime(2000, 1, 1, tzinfo=UTC))),
     ]
 
@@ -308,13 +312,23 @@ def create_window(
 # --- step 6: the pane ---------------------------------------------------------------------------
 
 
-def tag(backend: Backend, created: Created, termctl_id: str, plan: Plan, created_at: str) -> None:
+def tag(
+    backend: Backend,
+    created: Created,
+    termctl_id: str,
+    plan: Plan,
+    created_at: str,
+    warn: Callable[[str], None],
+) -> None:
     """Open order step 6: tag the pane step 5 created and, with argv, respawn it with the real
     command, in one guarded invocation.
 
     If tmux fails or the guard does not match, the pane is killed by its exact id, guarded by
     its being in the window step 5 reported with an empty or its own ``@termctl_pane``, and
-    ``open`` exits 12 (``tag_failed``).
+    ``open`` exits 12 (``tag_failed``). When the tagging found no server, there is no cleanup:
+    a no-server result is never followed by a connect without the socket checks. When the
+    cleanup kill does not run (its guard did not match, a forged ``@termctl_pane`` say),
+    ``warn`` names the window left behind (interface.md "Residual risks", forged options).
     TODO(#16): the ``tag_failed`` log record (``result: error``) and the step 7 query.
     """
     try:
@@ -324,8 +338,14 @@ def tag(backend: Backend, created: Created, termctl_id: str, plan: Plan, created
             REMAIN_ON_EXIT[plan.keep_on_exit],
             plan.respawn,
         )
+    except NoServerTagFailure:
+        raise
     except TermctlError as err:
-        backend.cleanup_pane(created)
+        if not backend.cleanup_pane(created):
+            warn(
+                f"could not remove pane {created.pane_id} (window {created.window_id}) after"
+                " its tagging failed; it is left running unmanaged"
+            )
         if err.code == "tag_failed":
             raise
         message = f"tagging pane {created.pane_id} failed: {err.message}"

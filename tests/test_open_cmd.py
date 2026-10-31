@@ -157,30 +157,31 @@ def size(invocation: tb.Invocation) -> int:
 
 
 def test_size_check_passes_at_the_limit() -> None:
-    base = size(tb.new_session("work", spec("/"), start_server=True))
+    base = size(tb.new_session("work", spec("/"), start_server=True, env={}))
     cwd = "/" + "d" * (open_cmd.SIZE_LIMIT - base)
-    invocation = tb.new_session("work", spec(cwd), start_server=True)
+    invocation = tb.new_session("work", spec(cwd), start_server=True, env={})
     assert size(invocation) == open_cmd.SIZE_LIMIT
     open_cmd.check_size([invocation], TMUX, SOCK)
 
 
 def test_size_check_fails_one_byte_over() -> None:
-    base = size(tb.new_session("work", spec("/"), start_server=True))
+    base = size(tb.new_session("work", spec("/"), start_server=True, env={}))
     cwd = "/" + "d" * (open_cmd.SIZE_LIMIT - base + 1)
     with pytest.raises(TermctlError) as caught:
-        open_cmd.check_size([tb.new_session("work", spec(cwd), start_server=True)], TMUX, SOCK)
+        invocation = tb.new_session("work", spec(cwd), start_server=True, env={})
+        open_cmd.check_size([invocation], TMUX, SOCK)
     assert (caught.value.code, caught.value.exit_code) == ("usage", 2)
     assert "12288" in caught.value.message
 
 
 def test_size_check_counts_utf8_bytes_and_escapes() -> None:
     # 4 bytes per character, and the final ';' escape adds one: counted as tmux gets them.
-    base = size(tb.new_session("work", spec("/"), start_server=True))
+    base = size(tb.new_session("work", spec("/"), start_server=True, env={}))
     room = open_cmd.SIZE_LIMIT - base
     cwd = "/" + "\U0001f514" * (room // 4)
-    invocation = tb.new_session("work", spec(cwd), start_server=True)
+    invocation = tb.new_session("work", spec(cwd), start_server=True, env={})
     open_cmd.check_size([invocation], TMUX, SOCK)
-    over = tb.new_session("work", spec(cwd + "\U0001f514"), start_server=True)
+    over = tb.new_session("work", spec(cwd + "\U0001f514"), start_server=True, env={})
     with pytest.raises(TermctlError):
         open_cmd.check_size([over], TMUX, SOCK)
 
@@ -214,7 +215,8 @@ def plan(
 def test_with_argv_the_window_runs_the_placeholder_without_env() -> None:
     # Open order step 6: the placeholder gets no -e variables; the real command does.
     assert plan(env=(("A", "1"),)).window == WindowSpec("n", "/w", open_cmd.PLACEHOLDER)
-    assert open_cmd.PLACEHOLDER == ("/usr/bin/env", "--", "sleep", "30")
+    # Review round 1, R1-3: sleep is looked up on a fixed PATH, never the caller's.
+    assert open_cmd.PLACEHOLDER == ("/usr/bin/env", "--", "PATH=/usr/bin:/bin", "sleep", "30")
 
 
 def test_without_argv_the_window_runs_the_default_shell_with_env() -> None:
@@ -285,7 +287,7 @@ def test_timestamp_is_utc_with_milliseconds(now: datetime, text: str) -> None:
 def test_size_check_counts_the_tagging_invocation() -> None:
     # A long argv fits the new-session invocation (it gets the placeholder) but not step 6's.
     big = plan(("x" * 13000,))
-    invocations = open_cmd.size_invocations("work", big, ID)
+    invocations = open_cmd.size_invocations("work", big, ID, {})
     assert size(invocations[0]) < open_cmd.SIZE_LIMIT
     with pytest.raises(TermctlError) as caught:
         open_cmd.check_size(invocations, TMUX, SOCK)
@@ -295,22 +297,33 @@ def test_size_check_counts_the_tagging_invocation() -> None:
 def test_size_check_counts_env_values_once_quoted() -> None:
     # Inside the guard each byte 0xff is written \377 outside the quotes, so a run of them
     # costs six bytes each (''\377), not one: the check counts what tmux gets.
-    room = open_cmd.SIZE_LIMIT - max(size(i) for i in open_cmd.size_invocations("work", plan(), ID))
+    invocations = open_cmd.size_invocations("work", plan(), ID, {})
+    room = open_cmd.SIZE_LIMIT - max(size(i) for i in invocations)
     fits = plan(env=(("A", "\udcff" * ((room - 20) // 6)),))
-    open_cmd.check_size(open_cmd.size_invocations("work", fits, ID), TMUX, SOCK)
+    open_cmd.check_size(open_cmd.size_invocations("work", fits, ID, {}), TMUX, SOCK)
     over = plan(env=(("A", "\udcff" * (room // 6 + 1)),))
     with pytest.raises(TermctlError):
-        open_cmd.check_size(open_cmd.size_invocations("work", over, ID), TMUX, SOCK)
+        open_cmd.check_size(open_cmd.size_invocations("work", over, ID, {}), TMUX, SOCK)
 
 
 def test_size_check_without_argv_counts_env_on_new_session() -> None:
     no_argv = plan((), (("A", "v" * 13000),))
-    new_session = open_cmd.size_invocations("work", no_argv, ID)[0]
+    new_session = open_cmd.size_invocations("work", no_argv, ID, {})[0]
     assert size(new_session) > open_cmd.SIZE_LIMIT
 
 
+def test_size_check_counts_the_filtered_values_set_back_on_new_session() -> None:
+    # Review round 1, R1-2: the new-session chain carries the filtered value of each --env
+    # variable the filtered environment has.
+    no_argv = plan((), (("LANG", "x"),))
+    filtered = {"LANG": "v" * 13000}
+    new_session = open_cmd.size_invocations("work", no_argv, ID, filtered)[0]
+    assert size(new_session) > open_cmd.SIZE_LIMIT
+    assert size(open_cmd.size_invocations("work", no_argv, ID, {})[0]) < open_cmd.SIZE_LIMIT
+
+
 def test_size_check_assumes_the_largest_ids() -> None:
-    tagging = open_cmd.size_invocations("work", plan(), ID)[1]
+    tagging = open_cmd.size_invocations("work", plan(), ID, {})[1]
     assert "%4294967295" in tagging.argv(TMUX, SOCK)
 
 
@@ -389,9 +402,9 @@ CLEANUP = tuple(tb.cleanup_kill("%5", "@3").argv(TMUX, SOCK))
 NOMATCH = completed("termctl-nomatch\n")
 
 
-def tag(gateway: FakeGateway, p: open_cmd.Plan) -> None:
+def tag(gateway: FakeGateway, p: open_cmd.Plan, warnings: list[str] | None = None) -> None:
     backend = TmuxBackend(Tmux(gateway, TMUX, SOCK, env={}))
-    open_cmd.tag(backend, PANE, ID, p, AT)
+    open_cmd.tag(backend, PANE, ID, p, AT, (warnings if warnings is not None else []).append)
 
 
 def test_tag_runs_one_guarded_invocation() -> None:
@@ -410,23 +423,52 @@ def test_tag_runs_one_guarded_invocation() -> None:
         subprocess.TimeoutExpired(["tmux"], 30),
         OSError("gone"),
     ],
-    ids=["nomatch", "failed", "no-server", "timeout", "oserror"],
+    ids=["nomatch", "failed", "other-socket-no-server", "timeout", "oserror"],
 )
 def test_a_failed_tagging_kills_the_pane_and_exits_tag_failed(result: object) -> None:
     p = plan()
     gateway = FakeGateway({tag_key(p): result, CLEANUP: completed()})  # type: ignore[dict-item]
+    warnings: list[str] = []
     with pytest.raises(TermctlError) as caught:
-        tag(gateway, p)
+        tag(gateway, p, warnings)
     assert (caught.value.code, caught.value.exit_code) == ("tag_failed", 12)
     assert gateway.calls[-1] == list(CLEANUP)
+    assert warnings == []
 
 
-def test_a_failing_cleanup_still_reports_tag_failed() -> None:
+@pytest.mark.parametrize(
+    "stderr",
+    [f"no server running on {SOCK}\n", f"error connecting to {SOCK} (No such file or directory)\n"],
+)
+def test_a_tagging_that_found_no_server_connects_no_more(stderr: str) -> None:
+    # Review round 1, R1-6: a no-server result is never followed by a connect without the
+    # socket checks, so there is no cleanup kill (and nothing to kill).
     p = plan()
-    gateway = FakeGateway({tag_key(p): NOMATCH, CLEANUP: subprocess.TimeoutExpired(["t"], 30)})
+    gateway = FakeGateway({tag_key(p): completed(stderr=stderr, returncode=1)})
+    warnings: list[str] = []
     with pytest.raises(TermctlError) as caught:
-        tag(gateway, p)
+        tag(gateway, p, warnings)
+    assert (caught.value.code, caught.value.exit_code) == ("tag_failed", 12)
+    assert caught.value.details is None
+    assert gateway.calls == [list(tag_key(p))]
+    assert warnings == []
+
+
+@pytest.mark.parametrize(
+    "cleanup",
+    [NOMATCH, completed(stderr="boom\n", returncode=1), subprocess.TimeoutExpired(["t"], 30)],
+    ids=["nomatch", "failed", "timeout"],
+)
+def test_a_cleanup_that_kills_nothing_warns_and_still_reports_tag_failed(cleanup: object) -> None:
+    # Review round 1, R1-7: a forged @termctl_pane, say, leaves an unmanaged window behind.
+    p = plan()
+    gateway = FakeGateway({tag_key(p): NOMATCH, CLEANUP: cleanup})  # type: ignore[dict-item]
+    warnings: list[str] = []
+    with pytest.raises(TermctlError) as caught:
+        tag(gateway, p, warnings)
     assert caught.value.code == "tag_failed"
+    assert len(warnings) == 1
+    assert "%5" in warnings[0] and "@3" in warnings[0]
 
 
 def test_tag_failed_never_echoes_env_values() -> None:
@@ -447,8 +489,8 @@ def key(invocation: tb.Invocation) -> tuple[str, ...]:
 
 
 HAS = key(tb.has_session("work"))
-START = key(tb.new_session("work", SPEC, start_server=True))
-NEW_SESSION = key(tb.new_session("work", SPEC, start_server=False))
+START = key(tb.new_session("work", SPEC, start_server=True, env={}))
+NEW_SESSION = key(tb.new_session("work", SPEC, start_server=False, env={}))
 NEW_WINDOW = key(tb.new_window("work", SPEC))
 
 NO_SERVER = completed(stderr=f"no server running on {SOCK}\n", returncode=1)

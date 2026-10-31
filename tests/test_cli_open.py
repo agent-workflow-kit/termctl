@@ -438,7 +438,7 @@ def test_no_server_starts_one_with_the_new_session_invocation() -> None:
     plan = make_plan()
     files = safe_default_server()
     del files[SOCK]
-    start = key(tb.new_session(SESSION, plan.window, start_server=True))
+    start = key(tb.new_session(SESSION, plan.window, start_server=True, env={}))
 
     def socket_appears(gateway: FakeGateway) -> None:
         gateway.files[SOCK] = socket_file()
@@ -508,3 +508,95 @@ def test_a_long_argv_fails_the_size_check_before_any_tmux_call() -> None:
     err = error(run(["--", "true", "x" * 12500], gateway), "usage", 2)
     assert "12288" in err["message"]
     assert gateway.calls == []
+
+
+# --- review round 1 -----------------------------------------------------------------------------
+
+
+def no_tmux_creation(gateway: FakeGateway) -> None:
+    """No call that could create or change anything ran: only ``tmux -V`` and reads."""
+    assert set(calls(gateway)) <= {"-V", "list-panes"}
+    assert gateway.mkdirs == []
+
+
+@pytest.mark.usefixtures("fixed_id")
+@pytest.mark.parametrize("hook", ["pre-open", "post-open"])
+def test_open_hooks_in_config_refuse_before_anything_is_created(hook: str, tmp_path: Path) -> None:
+    # R1-1: hooks do not run yet (#17), so a configured veto must not fail open.
+    config = tmp_path / "config.yaml"
+    config.write_text(yaml.safe_dump({"hooks": {hook: [{"cmd": "exit 1"}]}}), encoding="utf-8")
+    gateway = existing_session_flow(make_plan())
+    result = Run(["--json", "--config", str(config), "open", "--", "true"], gateway, ENVIRON)
+    err = error(result, "internal", 1)
+    assert "hooks" in err["message"]
+    no_tmux_creation(gateway)
+
+
+@pytest.mark.usefixtures("fixed_id")
+@pytest.mark.parametrize("hook", ["pre-open=exit 1", "post-open=true"])
+def test_open_hooks_given_with_the_flag_refuse_before_anything_is_created(hook: str) -> None:
+    gateway = existing_session_flow(make_plan())
+    err = error(run(["--hook", hook, "--", "true"], gateway), "internal", 1)
+    assert "hooks" in err["message"]
+    no_tmux_creation(gateway)
+
+
+@pytest.mark.usefixtures("fixed_id")
+def test_close_hooks_do_not_refuse_open(tmp_path: Path) -> None:
+    config = tmp_path / "config.yaml"
+    config.write_text(yaml.safe_dump({"hooks": {"pre-close": [{"cmd": "exit 1"}]}}), "utf-8")
+    gateway = existing_session_flow(make_plan())
+    result = Run(["--json", "--config", str(config), "open", "--", "true"], gateway, ENVIRON)
+    assert result.code == 0, result.stderr
+
+
+def test_usage_errors_win_over_the_hook_refusal() -> None:
+    gateway = FakeGateway(panes=[], executables=TRUE)
+    error(run(["--hook", "pre-open=exit 1", "--", "A=b"], gateway), "usage", 2)
+    assert gateway.calls == []
+
+
+# An invalid managed pane: the reader ignores it with a warning (interface.md "Pane options").
+INVALID = pane_row("%9", OTHER, {"window_id": "@9", "@termctl_window": "@9", "@termctl_v": "99"})
+
+
+@pytest.mark.usefixtures("fixed_id")
+def test_a_warning_seen_by_both_reads_is_printed_once() -> None:
+    # R1-5: the id-collision read and the read after tagging both see the invalid pane.
+    gateway = existing_session_flow(make_plan(), after=[new_row(), INVALID])
+    gateway.panes = [INVALID]
+    result = run(["--", "true"], gateway)
+    assert result.code == 0, result.stderr
+    assert result.stderr.count("warning:") == 1, result.stderr
+    assert "%9" in result.stderr
+
+
+@pytest.mark.usefixtures("fixed_id")
+def test_a_warning_only_the_read_after_tagging_sees_is_printed() -> None:
+    gateway = existing_session_flow(make_plan(), after=[new_row(), INVALID])
+    result = run(["--", "true"], gateway)
+    assert result.code == 0, result.stderr
+    assert result.stderr.count("warning:") == 1, result.stderr
+    assert "%9" in result.stderr
+
+
+@pytest.mark.usefixtures("fixed_id")
+def test_a_failed_cleanup_after_a_failed_tagging_warns_about_the_window() -> None:
+    # R1-7: the cleanup guard did not match, so the window stays; the warning names it.
+    gateway = existing_session_flow(make_plan(), completed("termctl-nomatch\n"))
+    gateway.responses[key(tb.cleanup_kill("%5", "@3"))] = completed("termctl-nomatch\n")
+    result = run(["--", "true"], gateway)
+    error(result, "tag_failed", 12)
+    assert "warning:" in result.stderr and "%5" in result.stderr and "@3" in result.stderr
+
+
+@pytest.mark.usefixtures("fixed_id")
+def test_a_tagging_that_found_no_server_has_no_cleanup() -> None:
+    # R1-6: no connect after a no-server result without the socket checks.
+    plan = make_plan()
+    gateway = existing_session_flow(
+        plan, completed(stderr=f"no server running on {SOCK}\n", returncode=1)
+    )
+    error(run(["--", "true"], gateway), "tag_failed", 12)
+    assert calls(gateway)[-1] == "if-shell -F"
+    assert list(key(tb.cleanup_kill("%5", "@3"))) not in gateway.calls
