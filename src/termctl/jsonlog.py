@@ -15,11 +15,10 @@ failure to write raises ``StateDirError``; what a command does about it is the c
 decision.
 """
 
-# open's tag_failed record (cli._log_open_error) is the first caller. interface.md "Audit and
-# log" ("Records"): a record that cannot be written produces a warning and does not change the
-# exit code.
-# TODO(#17): open's other records follow that rule, and #19-#24 too. Each command builds its
-# record with the builders below and appends it with the CLI context's environ and clock.
+# open (cli.Context.log) is the first caller. interface.md "Audit and log" ("Records"): a
+# record that cannot be written produces a warning and does not change the exit code; #19-#24
+# follow that rule. Each command builds its record with the builders below and appends it with
+# the CLI context's environ and clock.
 
 from __future__ import annotations
 
@@ -95,9 +94,12 @@ def log_record(
     escalation_override: bool | None = None,
     force: bool | None = None,
     action: str | None = None,
+    hooks: Sequence[Mapping[str, Any]] | None = None,
 ) -> dict[str, Any]:
     """A ``log.jsonl`` record; fields given as None are omitted (``id`` and ``socket_path``
-    are always present, null when none was resolved)."""
+    are always present, null when none was resolved). ``hooks`` (``open`` and ``close`` only)
+    lists the hooks the step started, with their process groups
+    (``hooks.HookProcess.log_entry``)."""
     if event not in _COMMAND_EVENTS | _WARNING_EVENTS:
         raise ValueError(f"unknown event: {event!r}")
     if (event in _WARNING_EVENTS) != (result == "warning"):
@@ -105,6 +107,7 @@ def log_record(
     gated = event in ("open", "close")
     _require(event, "actor", actor, gated)
     _require(event, "escalation_override", escalation_override, gated)
+    _require(event, "hooks", hooks, gated)
     if gated:
         _require(event, "decision_ids", decision_ids, True)
     _require(event, "force", force, event == "close")
@@ -124,6 +127,7 @@ def log_record(
         "escalation_override": escalation_override,
         "force": force,
         "action": action,
+        "hooks": None if hooks is None else [dict(entry) for entry in hooks],
         "message": message,
         "details": None if details is None else dict(details),
     }

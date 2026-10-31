@@ -1469,6 +1469,17 @@ def test_guard_sets_only_the_options_of_the_spec(inner: Command) -> None:
         .format_arg(tb.fields("pane_pid", "pane_title"))
         .build(),
         command("display").flag("-p").target(tb.pane("%5")).format_arg(tb.owned(ID)).build(),
+        # The only fixed text allowed is the tagging's confirmation, exactly.
+        command("display")
+        .flag("-p")
+        .target(tb.pane("%5"))
+        .format_arg(tb._format(tb.NOMATCH))
+        .build(),
+        command("display")
+        .flag("-p")
+        .target(tb.pane("%5"))
+        .format_arg(tb._format(tb.TAG_CONFIRMATION + " #{pane_id}"))
+        .build(),
     ],
     ids=lambda c: " ".join(c.elements),
 )
@@ -1670,8 +1681,10 @@ def test_tag_pane_shape_with_respawn() -> None:
         "'set' '-p' '-t' '%5' '--' 'remain-on-exit' 'failed'",
         "'respawn-pane' '-k' '-t' '%5' '-c' '/w' '-e' 'A=1' '--' '/usr/bin/env' '--'"
         " 'PATH=/opt/bin' 'tool' '-x'",
-        # Open order step 7: the query ends the invocation (spike E6).
+        # Open order step 7: the query (spike E6), then the confirmation that the chain ran to
+        # the end (review round 2 of #17, R2-1).
         "'display' '-p' '-t' '%5' '--' '#{pane_pid} #{pane_dead} #{pid}'",
+        "'display' '-p' '-t' '%5' '--' 'termctl-tagged'",
     ]
     assert argv[10] == "'display' '-p' '--' 'termctl-nomatch'"
     assert len(argv) == 11
@@ -1681,8 +1694,31 @@ def test_tag_pane_without_respawn_sets_options_then_queries() -> None:
     argv = tb.tag_pane("%5", "@2", OPTIONS, "off", None).argv(TMUX, SOCK)
     assert "respawn-pane" not in argv[9]
     inner = argv[9].split(" ; ")
-    assert inner[-2].endswith("'remain-on-exit' 'off'")
-    assert inner[-1] == "'display' '-p' '-t' '%5' '--' '#{pane_pid} #{pane_dead} #{pid}'"
+    assert inner[-3].endswith("'remain-on-exit' 'off'")
+    assert inner[-2] == "'display' '-p' '-t' '%5' '--' '#{pane_pid} #{pane_dead} #{pid}'"
+    assert inner[-1] == "'display' '-p' '-t' '%5' '--' 'termctl-tagged'"
+
+
+@pytest.mark.parametrize(
+    ("stdout", "expected"),
+    [
+        ("termctl-tagged\n", ""),
+        ("termctl-tagged", ""),
+        ("4242 0 77\ntermctl-tagged\n", "4242 0 77\n"),
+        ("  \ntermctl-tagged\n", "  \n"),
+        ("", None),
+        ("\n", None),
+        ("4242 0 77\n", None),
+        ("termctl-tagged\n4242 0 77\n", None),
+        ("termctl-tagged\n\n", None),
+        ("xtermctl-tagged\n", None),
+        ("termctl-tagged \n", None),
+    ],
+)
+def test_tagged_query_requires_the_confirmation_as_the_last_line(
+    stdout: str, expected: str | None
+) -> None:
+    assert tb.tagged_query(stdout) == expected
 
 
 @pytest.mark.parametrize(
@@ -1751,7 +1787,7 @@ def test_record_process_refuses_values_outside_the_grammars(
 def test_respawn_without_path_runs_argv_after_usr_bin_env() -> None:
     respawn = tb.Respawn(cwd="/w", argv=("A=b-is-an-argument", "x"))
     argv = tb.tag_pane("%5", "@2", OPTIONS, "on", respawn).argv(TMUX, SOCK)
-    assert argv[9].split(" ; ")[-2].endswith("'--' '/usr/bin/env' '--' 'A=b-is-an-argument' 'x'")
+    assert argv[9].split(" ; ")[-3].endswith("'--' '/usr/bin/env' '--' 'A=b-is-an-argument' 'x'")
 
 
 def test_tag_pane_shows_env_names_never_values() -> None:

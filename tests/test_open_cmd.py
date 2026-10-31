@@ -401,6 +401,8 @@ def tag_key(p: open_cmd.Plan) -> tuple[str, ...]:
 
 CLEANUP = tuple(tb.cleanup_kill("%5", "@3").argv(TMUX, SOCK))
 NOMATCH = completed("termctl-nomatch\n")
+# The line the tagging invocation ends with when it ran to the end.
+TAGGED = f"{tb.TAG_CONFIRMATION}\n"
 
 
 def tag(gateway: FakeGateway, p: open_cmd.Plan, warnings: list[str] | None = None) -> None:
@@ -410,9 +412,27 @@ def tag(gateway: FakeGateway, p: open_cmd.Plan, warnings: list[str] | None = Non
 
 def test_tag_runs_one_guarded_invocation() -> None:
     p = plan()
-    gateway = FakeGateway({tag_key(p): completed()})
+    gateway = FakeGateway({tag_key(p): completed(TAGGED)})
     tag(gateway, p)
     assert gateway.calls == [list(tag_key(p))]
+
+
+@pytest.mark.parametrize(
+    "stdout",
+    ["", "4242 0 77\n", "4242 0 77\ntermctl-tagged-not\n", TAGGED + "4242 0 77\n"],
+    ids=["empty", "query-only", "other-line", "not-last"],
+)
+def test_a_tagging_that_exits_0_unconfirmed_is_tag_failed_and_cleaned_up(stdout: str) -> None:
+    # Review round 2, R2-1: a tmux client killed mid-chain can exit 0 with the rest of the
+    # chain dropped; only the confirmation the chain ends with counts as tagged.
+    p = plan()
+    gateway = FakeGateway({tag_key(p): completed(stdout), CLEANUP: completed()})
+    warnings: list[str] = []
+    with pytest.raises(TermctlError) as caught:
+        tag(gateway, p, warnings)
+    assert (caught.value.code, caught.value.exit_code) == ("tag_failed", 12)
+    assert gateway.calls == [list(tag_key(p)), list(CLEANUP)]
+    assert warnings == []
 
 
 @pytest.mark.parametrize(
@@ -508,7 +528,7 @@ def test_tag_failed_never_echoes_env_values() -> None:
 
 def test_tag_returns_the_answer_of_the_step_7_query() -> None:
     p = plan()
-    gateway = FakeGateway({tag_key(p): completed("4242 0 77\n")})
+    gateway = FakeGateway({tag_key(p): completed("4242 0 77\n" + TAGGED)})
     backend = TmuxBackend(Tmux(gateway, TMUX, SOCK, env={}))
     assert open_cmd.tag(backend, PANE, ID, p, AT, [].append) == tb.ProcessQuery(4242, False, 77)
 
@@ -516,7 +536,7 @@ def test_tag_returns_the_answer_of_the_step_7_query() -> None:
 @pytest.mark.parametrize("stdout", ["", "  \n", "garbage\n", "4242 0\n"])
 def test_tag_returns_none_when_the_query_failed(stdout: str) -> None:
     p = plan()
-    gateway = FakeGateway({tag_key(p): completed(stdout)})
+    gateway = FakeGateway({tag_key(p): completed(stdout + TAGGED)})
     backend = TmuxBackend(Tmux(gateway, TMUX, SOCK, env={}))
     assert open_cmd.tag(backend, PANE, ID, p, AT, [].append) is None
     assert gateway.calls == [list(tag_key(p))]

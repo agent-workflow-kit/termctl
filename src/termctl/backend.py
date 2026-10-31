@@ -11,7 +11,6 @@ implements it:
   (``open_cmd.create_window`` runs them in the order of interface.md "Open order" step 5).
 - ``tag_pane`` and ``cleanup_pane``: ``open``'s pane (Open order step 6, ``open_cmd.tag``).
 - ``record_process``: ``open``'s PID recording (Open order step 7, ``open_cmd.record``).
-- TODO(#17): the rest of ``open`` (hooks).
 - TODO(#19): ``rename``; TODO(#20): ``mark`` and ``unmark``; TODO(#21): label changes.
 - TODO(#23): ``close``; TODO(#24): ``focus``.
 """
@@ -179,7 +178,14 @@ class TmuxBackend:
                 f"pane {created.pane_id} was gone, moved or already tagged before termctl"
                 " could tag it",
             )
-        return tb.parse_process_query(result.stdout)
+        query = tb.tagged_query(result.stdout)
+        if query is None:
+            raise TermctlError(
+                "tag_failed",
+                f"tagging pane {created.pane_id} failed: tmux did not confirm that the tagging"
+                " ran to the end",
+            )
+        return tb.parse_process_query(query)
 
     def cleanup_pane(self, created: Created) -> bool:
         try:

@@ -28,6 +28,8 @@ from termctl.gateway import (
     SystemClock,
     SystemGateway,
     Terminated,
+    started_pgid,
+    stop_signals,
 )
 
 from .fakes import FakeClock, FakeGateway
@@ -43,6 +45,33 @@ def test_system_gateway_passes_stdin_and_env() -> None:
     script = "import os, sys; print(sys.stdin.read() + os.environ['X'])"
     result = SystemGateway().run([sys.executable, "-c", script], stdin="a", env={"X": "b"})
     assert result.stdout == "ab\n"
+
+
+def test_run_starts_the_program_in_a_process_group_of_its_own() -> None:
+    # Review round 2, R2-1: a signal sent to termctl's process group (timeout, a terminal
+    # hangup) must not kill a tmux client halfway through a command chain.
+    script = (
+        "import os; print(os.getpgrp() == os.getpid(), os.getpgrp() != os.getpgid(os.getppid()))"
+    )
+    result = SystemGateway().run([sys.executable, "-c", script])
+    assert result.stdout == "True True\n"
+
+
+def test_run_without_input_gives_the_program_no_terminal_input(
+    monkeypatch: pytest.MonkeyPatch,
+) -> None:
+    seen: dict[str, Any] = {}
+    real_run = subprocess.run
+
+    def run(*args: Any, **kwargs: Any) -> Any:
+        seen.update(kwargs)
+        return real_run(*args, **kwargs)
+
+    monkeypatch.setattr(subprocess, "run", run)
+    result = SystemGateway().run([sys.executable, "-c", "import sys; print(sys.stdin.read())"])
+    assert result.stdout == "\n"
+    assert seen["stdin"] is subprocess.DEVNULL
+    assert seen["process_group"] == 0
 
 
 # The child writes UTF-8 (a bell emoji and an accent) plus one invalid byte to stdout and
@@ -444,9 +473,185 @@ def test_run_group_kills_the_group_on_a_stop_signal_while_it_starts(
     monkeypatch: pytest.MonkeyPatch,
 ) -> None:
     seen = _send_term_after(monkeypatch)
-    with pytest.raises(Terminated):
+    with pytest.raises(Terminated) as info:
         group("sleep 10", timeout=10)
     assert group_is_gone(seen[0])
+    assert started_pgid(info.value) == seen[0]
+
+
+def test_run_group_takes_the_stop_signals_over_from_a_run(
+    monkeypatch: pytest.MonkeyPatch,
+) -> None:
+    # The run's handler would raise at once; the hook's holds the signal while it starts.
+    with stop_signals():
+        outer = signal.getsignal(signal.SIGTERM)
+        seen = _send_term_after(monkeypatch)
+        with pytest.raises(Terminated) as info:
+            group("sleep 10", timeout=10)
+        assert signal.getsignal(signal.SIGTERM) == outer
+    assert group_is_gone(seen[0])
+    assert started_pgid(info.value) == seen[0]
+
+
+def test_a_failure_to_start_carries_no_group() -> None:
+    with pytest.raises(OSError) as info:
+        SystemGateway().run_group(
+            ["/nonexistent/program"], stdin=b"", env={}, timeout=1, stdout_limit=0,
+            stderr_limit=0,
+        )  # fmt: skip
+    assert started_pgid(info.value) is None
+
+
+STOPS = (signal.SIGINT, signal.SIGTERM, signal.SIGHUP)
+
+
+def test_stop_signals_raise_for_a_run_and_restore_the_handlers() -> None:
+    before = {signum: signal.getsignal(signum) for signum in STOPS}
+    with stop_signals():
+        assert signal.getsignal(signal.SIGTERM) not in (signal.SIG_DFL, signal.SIG_IGN)
+        with pytest.raises(Terminated) as info:
+            os.kill(os.getpid(), signal.SIGTERM)  # this process: exact, and handled
+            time.sleep(1)
+    assert info.value.signum == signal.SIGTERM
+    assert {signum: signal.getsignal(signum) for signum in STOPS} == before
+
+
+@pytest.mark.parametrize("signum", STOPS)
+def test_a_deferred_stop_signal_is_raised_when_the_block_ends(signum: int) -> None:
+    done: list[str] = []
+    with stop_signals() as signals:
+        assert signal.getsignal(signum) not in (signal.SIG_DFL, signal.SIG_IGN)
+        with pytest.raises((KeyboardInterrupt, Terminated)) as info:
+            with signals.deferred():
+                os.kill(os.getpid(), signum)  # this process: exact, and handled
+                time.sleep(0.05)
+                done.append("block")
+            done.append("after")  # never reached
+    assert done == ["block"]
+    if signum == signal.SIGINT:
+        assert isinstance(info.value, KeyboardInterrupt)
+    else:
+        assert isinstance(info.value, Terminated) and info.value.signum == signum
+
+
+def test_an_error_in_a_deferred_block_wins_and_later_signals_are_ignored() -> None:
+    with stop_signals() as signals:
+        with pytest.raises(RuntimeError):
+            with signals.deferred():
+                os.kill(os.getpid(), signal.SIGTERM)  # this process: exact, and handled
+                raise RuntimeError("step failed")
+        os.kill(os.getpid(), signal.SIGTERM)  # ignored now
+        time.sleep(0.05)
+
+
+@pytest.mark.parametrize("signum", STOPS)
+def test_run_group_holds_stop_signals_while_the_run_is_recorded(signum: int) -> None:
+    # Review round 2, R2-2: a stop between the hook's end and the caller's bookkeeping must
+    # not lose the hook; it is raised once the run is recorded, without a group to list again.
+    recorded: list[GroupRun] = []
+
+    def record(run: GroupRun) -> None:
+        os.kill(os.getpid(), signum)  # this process: exact, and handled
+        time.sleep(0.05)
+        recorded.append(run)
+
+    with stop_signals():
+        with pytest.raises((KeyboardInterrupt, Terminated)) as info:
+            SystemGateway().run_group(
+                [SH, "-c", "exit 3"], stdin=b"", env=base_env(), timeout=10, stdout_limit=0,
+                stderr_limit=0, record=record,
+            )  # fmt: skip
+    assert [run.returncode for run in recorded] == [3]
+    assert started_pgid(info.value) is None
+
+
+@pytest.mark.filterwarnings("ignore::ResourceWarning")
+def test_spawn_watched_reports_the_watchdog_a_stop_signal_came_after(
+    monkeypatch: pytest.MonkeyPatch,
+) -> None:
+    with stop_signals():
+        seen = _send_term_after(monkeypatch)
+        with pytest.raises(Terminated) as info:
+            watched("exit 0", timeout=5)
+    assert started_pgid(info.value) == seen[0]
+    assert reap(seen[0])
+
+
+@pytest.mark.filterwarnings("ignore::ResourceWarning")
+def test_spawn_watched_records_the_watchdog_before_raising_a_stop(
+    monkeypatch: pytest.MonkeyPatch,
+) -> None:
+    recorded: list[int] = []
+    with stop_signals():
+        seen = _send_term_after(monkeypatch)
+        with pytest.raises(Terminated) as info:
+            SystemGateway().spawn_watched(
+                [SH, "-c", "exit 0"], stdin=b"", env=base_env(), timeout=5,
+                record=recorded.append,
+            )  # fmt: skip
+    assert recorded == seen
+    assert started_pgid(info.value) is None
+    assert reap(seen[0])
+
+
+def test_a_second_stop_signal_while_a_stopped_hook_unwinds_does_not_raise_again(
+    monkeypatch: pytest.MonkeyPatch,
+) -> None:
+    # Review round 2, R2-3: the hook's handler raised; the run's handler, restored, must not
+    # raise a second stop that would replace the first (and its group).
+    with stop_signals():
+        seen = _send_term_after(monkeypatch)
+        with pytest.raises(Terminated) as info:
+            try:
+                group("sleep 10", timeout=10)
+            finally:
+                os.kill(os.getpid(), signal.SIGHUP)  # this process: exact, and handled
+                time.sleep(0.05)
+    assert info.value.signum == signal.SIGTERM
+    assert started_pgid(info.value) == seen[0]
+    assert group_is_gone(seen[0])
+
+
+def test_a_stop_signal_while_a_hook_is_killed_after_sigint_does_not_raise_again(
+    monkeypatch: pytest.MonkeyPatch,
+) -> None:
+    # SIGINT reaches the run's handler while a hook runs; a SIGTERM during the kill that
+    # follows must not replace the KeyboardInterrupt.
+    real_stop = gateway_module._stop
+
+    def stop(proc: Any) -> None:
+        os.kill(os.getpid(), signal.SIGTERM)  # this process: exact, and handled
+        time.sleep(0.05)
+        real_stop(proc)
+
+    monkeypatch.setattr(gateway_module, "_stop", stop)
+    seen: list[int] = []
+    real_popen = subprocess.Popen
+
+    def popen(*args: Any, **kwargs: Any) -> Any:
+        monkeypatch.setattr(subprocess, "Popen", real_popen)  # only the first call
+        # Only with termctl's handler installed: SIGINT must not reach the test runner itself.
+        assert signal.getsignal(signal.SIGINT) is not signal.default_int_handler
+        proc = real_popen(*args, **kwargs)
+        seen.append(proc.pid)
+        os.kill(os.getpid(), signal.SIGINT)  # this process: exact, and handled
+        return proc
+
+    with stop_signals():
+        monkeypatch.setattr(subprocess, "Popen", popen)
+        with pytest.raises(KeyboardInterrupt) as info:
+            group("sleep 10", timeout=10)
+    assert started_pgid(info.value) == seen[0]
+    assert group_is_gone(seen[0])
+
+
+def test_stop_signals_leave_an_ignored_signal_alone() -> None:
+    previous = signal.signal(signal.SIGHUP, signal.SIG_IGN)
+    try:
+        with stop_signals():
+            assert signal.getsignal(signal.SIGHUP) == signal.SIG_IGN
+    finally:
+        signal.signal(signal.SIGHUP, previous)
 
 
 def test_run_group_reports_a_stop_signal_that_came_while_it_failed_to_start(

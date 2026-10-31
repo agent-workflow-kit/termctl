@@ -91,7 +91,7 @@ Status: planned, 2026-10-30. Implements [interface.md](interface.md) (normative)
 - hooks: pre-open payload fields (env names only), veto/escalate/override, decision ids in output, log and audit (override runs).
 - `--dry-run`: read-only tmux queries only, tmux checks, `%NEW`/`@NEW` tokens, no hooks, nothing created.
 
-Interim state: the CLI `open` runs steps 1 to 3, 5, 6 and 7 (no hooks yet; until #17 it refuses, exit 1 `internal`, before anything is created whenever a `pre-open` or `post-open` hook is configured or given with `--hook`), then reads the pane back for its output. Its only `log.jsonl` record is the `result: error` record of `tag_failed` (#17 adds the others); output has `focused: false` until focus-on-open lands (#24) and only the `--decision-id` values (#17). `open --dry-run` still refuses (exit 1, `internal`) until #18.
+Interim state: the CLI `open` runs every step but 8 (focus): pre-open hooks, creation, PID recording, the read for its output, post-open hooks, and the log and audit records. Its output has `focused: false` until focus-on-open lands (#24). `open --dry-run` still refuses (exit 1, `internal`) until #18.
 
 **Status**: Not Started
 
