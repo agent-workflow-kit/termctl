@@ -19,7 +19,7 @@ import pytest
 
 from termctl.cli import main
 
-from .conftest import TMUX_3_2, TMUX_VERSION, TmuxServer, wait_for
+from .conftest import TMUX_3_2, TmuxServer, wait_for
 from .schemas import validate
 from .test_panes_integration import ID, OTHER_ID, new_window, tag
 
@@ -222,7 +222,7 @@ def test_show_a_dead_pane_with_its_exit_status(tmux_server: TmuxServer) -> None:
 
 def test_show_a_pane_killed_by_a_signal(tmux_server: TmuxServer) -> None:
     _dead(tmux_server, "kill -9 $$")
-    if TMUX_VERSION is not None and TMUX_VERSION < (3, 3):
+    if TMUX_3_2:
         # tmux 3.2 has no #{pane_dead_signal}: both exit fields are null.
         obj = termctl(tmux_server, "--json", "show", ID).json()
         assert (obj["exit_status"], obj["exit_signal"]) == (None, None)

@@ -18,7 +18,7 @@ from termctl import panes
 from termctl.errors import TermctlError
 from termctl.panes import PaneRead
 
-from .conftest import TMUX_3_2, TMUX_VERSION, TmuxServer, wait_for
+from .conftest import TMUX_3_2, TmuxServer, wait_for
 from .schemas import validate
 
 pytestmark = pytest.mark.tmux
@@ -246,7 +246,7 @@ def test_a_dead_pane_reports_its_exit_status(tmux_server: TmuxServer) -> None:
     assert pane.exit_signal is None
 
 
-@pytest.mark.skipif(TMUX_VERSION is not None and TMUX_VERSION < (3, 3), reason="tmux 3.3+")
+@pytest.mark.skipif(TMUX_3_2, reason="tmux 3.3+")
 def test_a_dead_pane_reports_its_exit_signal(tmux_server: TmuxServer) -> None:
     _dead_pane(tmux_server, "kill -9 $$")
     assert wait_for(lambda: read(tmux_server).panes[0].exit_signal == 9)
