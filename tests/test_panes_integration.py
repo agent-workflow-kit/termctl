@@ -18,7 +18,7 @@ from termctl import panes
 from termctl.errors import TermctlError
 from termctl.panes import PaneRead
 
-from .conftest import TMUX_VERSION, TmuxServer, wait_for
+from .conftest import TMUX_3_2, TmuxServer, wait_for
 from .schemas import validate
 
 pytestmark = pytest.mark.tmux
@@ -159,8 +159,10 @@ def test_tab_and_newline_in_names_become_spaces(tmux_server: TmuxServer) -> None
     renamed = tmux_server.raw("rename-session", "-t", "=base:", "my\twork")
     assert renamed.returncode == 0, renamed.stderr
     (pane,) = read(tmux_server).panes
-    # tmux escapes ESC itself on output; the reader replaces only tab and newline.
-    assert pane.display_name == "a b c\\033d"
+    # tmux 3.3+ escapes ESC itself on output, 3.2 prints it raw; the reader replaces only tab
+    # and newline either way (a raw ESC is escaped by every output path, interface.md
+    # "Human output").
+    assert pane.display_name == ("a b c\x1bd" if TMUX_3_2 else "a b c\\033d")
     assert "\t" not in pane.session and "\n" not in pane.session
 
 
@@ -203,7 +205,13 @@ def test_invalid_utf8_in_an_option_reads_as_tmux_escapes_it(tmux_server: TmuxSer
     pane_id = tmux_server.start()
     tag(tmux_server, pane_id, **{"@termctl_name": os.fsdecode(b"a\xc3b")})
     result = read(tmux_server)
-    # tmux prints the stray byte as the text \303, a valid name; the read is still safe.
+    if TMUX_3_2:
+        # tmux 3.2 prints the stray byte raw: it reads as a lone surrogate, which the name
+        # grammar rejects, so the pane is ignored with a warning.
+        assert result.panes == () and len(result.warnings) == 1
+        assert pane_id in result.warnings[0]
+        return
+    # tmux 3.3+ prints the stray byte as the text \303, a valid name; the read is still safe.
     assert [p.name for p in result.panes] == ["a\\303b"]
 
 
@@ -238,7 +246,7 @@ def test_a_dead_pane_reports_its_exit_status(tmux_server: TmuxServer) -> None:
     assert pane.exit_signal is None
 
 
-@pytest.mark.skipif(TMUX_VERSION is not None and TMUX_VERSION < (3, 3), reason="tmux 3.3+")
+@pytest.mark.skipif(TMUX_3_2, reason="tmux 3.3+")
 def test_a_dead_pane_reports_its_exit_signal(tmux_server: TmuxServer) -> None:
     _dead_pane(tmux_server, "kill -9 $$")
     assert wait_for(lambda: read(tmux_server).panes[0].exit_signal == 9)
@@ -278,6 +286,12 @@ def test_a_killed_server_means_no_server(tmux_server: TmuxServer) -> None:
     tmux_server.start()
     assert tmux_server.raw("kill-server").returncode == 0
     assert os.path.exists(tmux_server.socket_path)  # kill-server leaves the socket (spike F)
+    # tmux 3.2's kill-server returns before the server has exited: a client connecting in that
+    # moment gets "server exited unexpectedly", which the reader reports as server_unavailable
+    # (test_panes.py), never as no server. Wait until tmux itself says no server runs.
+    assert wait_for(
+        lambda: tmux_server.raw("list-sessions").stderr.startswith("no server running on ")
+    )
     assert read(tmux_server).server_running is False
 
 

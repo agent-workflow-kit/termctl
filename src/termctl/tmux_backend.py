@@ -315,9 +315,7 @@ def pane_in_session(session_id: str, window_id: str, pane_id: str) -> Target:
     The session is named by its id, not its name: a session a user renamed may have any name
     (``my work``, one with characters tmux prints escaped, or ``$9``, which ``=$9`` would look
     up as a session id), while the id is tmux's own and still enforces containment (#24;
-    checked on tmux 3.2a and 3.5a).
-
-    TODO(#25): the ``=$N:`` form on tmux 3.2 beyond that containment check is #25's."""
+    checked on tmux 3.2a and 3.5a; the focus integration tests run it on both in CI, #25)."""
     _fullmatch(_SESSION_ID, session_id, "session id")
     _fullmatch(_WINDOW_ID, window_id, "window id")
     _fullmatch(_PANE_ID, pane_id, "pane id")
@@ -1304,9 +1302,8 @@ def parse_tty_query(stdout: str, pane_id: str, termctl_id: str) -> str | None:
 # --- focus (interface.md `focus`) ---------------------------------------------------------------
 
 # One line per client: its name, last activity (seconds), and its session's id and current
-# window. A client attached to no session prints empty session and window fields.
-# TODO(#25): `list-clients -F` with these fields is checked on tmux 3.5a only; #25 verifies
-# tmux 3.2 (the floor).
+# window. A client attached to no session prints empty session and window fields. Same output
+# on tmux 3.2a and 3.5a (#25); the focus integration tests run it on both in CI.
 CLIENT_FORMAT = fields("client_name", "client_activity", "session_id", "window_id")
 _CLIENT_LINE = re.compile(r"(\S+) ([0-9]{1,20}) (\$[0-9]+) (@[0-9]+)")
 # Every pane with its session, once per session its window is in (focus step 1).
@@ -1327,7 +1324,6 @@ def list_clients() -> Invocation:
     return Invocation.of(command("list-clients").format("-F", CLIENT_FORMAT).build())
 
 
-# TODO(#25): parse_clients follows tmux 3.5a's `list-clients -F` output; #25 checks tmux 3.2.
 def parse_clients(stdout: str) -> tuple[ClientInfo, ...]:
     """The clients ``list_clients`` printed that termctl can name: a line that is not exactly
     the format (a client attached to no session) or whose name breaks the ``--client`` grammar
