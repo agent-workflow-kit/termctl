@@ -1,0 +1,1 @@
+{"error": {"code": "config_invalid", "message": "invalid config: hooks.pre-close[0].async: async is allowed only on post-hooks", "details": {"key": "hooks.pre-close[0].async"}}}

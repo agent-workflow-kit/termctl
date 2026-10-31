@@ -15,7 +15,9 @@ from dataclasses import dataclass, field
 from typing import Any, NoReturn, TextIO
 
 from . import __version__, ids, validate
+from . import config as config_module
 from .argv import Scan, scan
+from .config import Config
 from .errors import TermctlError, UsageError
 from .gateway import Clock, Gateway, SystemClock, SystemGateway
 from .output import PROG, Output, Result, flush_standard_streams
@@ -31,6 +33,7 @@ class Context:
     clock: Clock
     environ: Mapping[str, str]
     out: Output = field(repr=False)
+    config: Config = field(default_factory=config_module.defaults)
 
 
 # --- argument parsing ---------------------------------------------------------------------------
@@ -294,6 +297,8 @@ def _parse(parser: _Parser, scanned: Scan) -> argparse.Namespace:
     args, extra = parser.parse_known_args(scanned.args)
     if extra:
         raise UsageError(f"unrecognized arguments: {' '.join(extra)}", usage=usage)
+    if args.config == "":
+        raise UsageError("--config must not be empty", usage=usage)
     if args.verbose and args.quiet:
         raise UsageError("--verbose and --quiet cannot be combined", usage=usage)
     if args.command == "open":
@@ -392,7 +397,7 @@ def check_args(args: argparse.Namespace, ctx: Context) -> None:
 
 def load_config(args: argparse.Namespace, ctx: Context) -> None:
     """Step 1 (rest): the config file, drop-ins and ``TERMCTL_*`` variables (exit 2)."""
-    # TODO: config loading - issue #3 (config.py)
+    ctx.config = config_module.load(ctx.environ, args.config)
 
 
 def resolve_server(args: argparse.Namespace, ctx: Context) -> None:
