@@ -1,7 +1,11 @@
 from __future__ import annotations
 
 import json
+import math
 import multiprocessing
+import os
+import subprocess
+import sys
 from datetime import UTC, datetime, timedelta, timezone
 from pathlib import Path
 from typing import Any
@@ -16,6 +20,7 @@ from .schemas import validate
 
 TS = datetime(2026, 10, 30, 12, 34, 56, 789123, tzinfo=UTC)
 SOCKET = "/tmp/tmux-1000/default"
+SRC = str(Path(__file__).resolve().parents[1] / "src")
 ID = "tc-abcdefgh"
 
 
@@ -38,6 +43,13 @@ def test_format_ts_is_utc_milliseconds() -> None:
 def test_format_ts_converts_to_utc() -> None:
     local = datetime(2026, 10, 30, 14, 0, 0, tzinfo=timezone(timedelta(hours=2)))
     assert jsonlog.format_ts(local) == "2026-10-30T12:00:00.000Z"
+
+
+def test_format_ts_takes_milliseconds_after_conversion() -> None:
+    # An offset with a fractional second shifts the milliseconds too.
+    offset = timezone(timedelta(hours=1, microseconds=500_000))
+    when = datetime(2026, 10, 30, 13, 0, 0, 600_000, tzinfo=offset)
+    assert jsonlog.format_ts(when) == "2026-10-30T12:00:00.100Z"
 
 
 def test_format_ts_rejects_naive_datetimes() -> None:
@@ -372,6 +384,78 @@ def test_symlinked_log_is_refused(environ: dict[str, str], tmp_path: Path) -> No
     with pytest.raises(StateDirError):
         jsonlog.append_log(environ, open_record())
     assert victim.read_text() == "keep\n"
+
+
+def test_nan_is_never_written(environ: dict[str, str], tmp_path: Path) -> None:
+    log = tmp_path / "state" / "termctl" / "log.jsonl"
+    jsonlog.append_log(environ, open_record())
+    before = log.read_bytes()
+    record = open_record(details={"ratio": math.nan})
+    with pytest.raises(ValueError):
+        jsonlog.append_log(environ, record)
+    with pytest.raises(ValueError):
+        jsonlog.append_log(environ, open_record(details={"x": [math.inf]}))
+    assert log.read_bytes() == before
+
+
+def test_a_record_never_joins_a_partial_line(environ: dict[str, str], tmp_path: Path) -> None:
+    log = tmp_path / "state" / "termctl" / "log.jsonl"
+    log.parent.parent.mkdir()
+    log.parent.mkdir(mode=0o700)
+    log.write_bytes(b'{"old": true}\n{"torn": ')
+    log.chmod(0o600)
+    record = open_record()
+    jsonlog.append_log(environ, record)
+    assert log.read_bytes() == b'{"old": true}\n{"torn": \n' + json.dumps(record).encode() + b"\n"
+
+
+# Appends a large record with the file size limited to argv[2] bytes, so the write is cut
+# short; SIGXFSZ is ignored so the write returns instead of killing the process.
+TORN_WRITER = """
+import resource, signal, sys
+from termctl import jsonlog
+from termctl.statedir import StateDirError
+from datetime import UTC, datetime
+signal.signal(signal.SIGXFSZ, signal.SIG_IGN)
+limit = int(sys.argv[2])
+resource.setrlimit(resource.RLIMIT_FSIZE, (limit, limit))
+record = jsonlog.log_record(
+    datetime.now(UTC), event="warning", result="warning", id=None, socket_path=None,
+    message="z" * 10000,
+)
+try:
+    jsonlog.append_log({"XDG_STATE_HOME": sys.argv[1]}, record)
+except StateDirError as exc:
+    print(exc)
+    sys.exit(3)
+"""
+
+
+def test_a_write_cut_short_damages_only_its_own_line(
+    environ: dict[str, str], tmp_path: Path
+) -> None:
+    log = tmp_path / "state" / "termctl" / "log.jsonl"
+    first = open_record()
+    jsonlog.append_log(environ, first)
+    size = log.stat().st_size
+    child = subprocess.run(
+        [sys.executable, "-c", TORN_WRITER, str(tmp_path / "state"), str(size + 100)],
+        capture_output=True,
+        text=True,
+        env={**os.environ, "PYTHONPATH": SRC},
+        timeout=60,
+        check=False,
+    )
+    assert child.returncode == 3, child.stderr
+    assert str(log) in child.stdout
+    assert log.stat().st_size == size + 100  # one write, cut short; no second write
+    last = open_record(result="error", exit_code=12)
+    jsonlog.append_log(environ, last)
+    raw = log.read_bytes().split(b"\n")
+    assert raw[-1] == b""
+    assert json.loads(raw[0]) == first
+    assert json.loads(raw[-2]) == last
+    assert len(raw) == 4  # first, the torn fragment, last
 
 
 def _append_many(environ: dict[str, str], worker: int, count: int) -> None:

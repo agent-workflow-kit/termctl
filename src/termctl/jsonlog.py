@@ -1,10 +1,18 @@
 """``log.jsonl`` and ``audit.jsonl`` records (interface.md "Audit and log").
 
-The record builders enforce the field rules of ``schemas/log.json`` and ``schemas/audit.json``;
-breaking one is a programming error (``ValueError``), not a user error. Writers append one
-JSON line per record with a single ``O_APPEND`` write, so records from concurrent termctl
-processes never interleave. A failure to write raises ``StateDirError``; what a command does
-about it is the command's decision.
+The record builders check which fields a record carries (presence and exclusivity rules of
+``schemas/log.json`` and ``schemas/audit.json``); breaking one is a programming error
+(``ValueError``). They do not validate field values: callers pass validated values. A NaN or
+infinity anywhere in a record is also a programming error (``ValueError``, nothing written).
+
+Writers append one JSON line per record with exactly one ``O_APPEND`` write, so records from
+concurrent termctl processes never interleave; writers hold an exclusive ``flock`` on the file
+around the write so the newline check below sees no write in progress. A write cut short
+(disk full, file size limit) is a failure and is never continued: a second write could
+interleave with another process. It leaves a partial line; the next record starts with a
+newline when the file does not end with one, so the partial line damages only itself. A
+failure to write raises ``StateDirError``; what a command does about it is the command's
+decision.
 """
 
 # TODO(#17): open is the first caller; it decides what a write failure does (the action has
@@ -13,6 +21,7 @@ about it is the command's decision.
 
 from __future__ import annotations
 
+import fcntl
 import os
 from collections.abc import Mapping, Sequence
 from datetime import UTC, datetime
@@ -49,7 +58,8 @@ def format_ts(when: datetime) -> str:
     """``when`` in UTC with millisecond precision, e.g. ``2026-10-30T12:34:56.789Z``."""
     if when.tzinfo is None:
         raise ValueError("timestamps must be timezone-aware")
-    return when.astimezone(UTC).strftime("%Y-%m-%dT%H:%M:%S.") + f"{when.microsecond // 1000:03d}Z"
+    utc = when.astimezone(UTC)
+    return utc.strftime("%Y-%m-%dT%H:%M:%S.") + f"{utc.microsecond // 1000:03d}Z"
 
 
 def level_for(result: str) -> str:
@@ -222,33 +232,39 @@ def audit_close_record(
 
 
 def _append(environ: Mapping[str, str], name: str, record: dict[str, Any]) -> None:
-    # One ASCII line (to_json escapes every control and non-ASCII character), written with
-    # one O_APPEND write so concurrent appends never interleave.
-    data = to_json(record).encode("ascii")
-    dir_fd = open_state_dir(environ)
+    # One ASCII line (to_json escapes every control and non-ASCII character).
+    data = to_json(record, allow_nan=False).encode("ascii")
+    dir_fd, dir_path = open_state_dir(environ)
     try:
-        fd = open_file(dir_fd, name, os.O_WRONLY | os.O_APPEND)
+        fd = open_file(dir_fd, dir_path, name, os.O_RDWR | os.O_APPEND)
     finally:
         os.close(dir_fd)
+    path = os.path.join(dir_path, name)
     try:
-        view = memoryview(data)
-        while view:
-            view = view[os.write(fd, view) :]
+        try:
+            # Serializes termctl writers for the newline check below, which another
+            # writer's in-progress append would otherwise fool. Held for microseconds; where
+            # flock is unsupported, write without it.
+            fcntl.flock(fd, fcntl.LOCK_EX)
+        except OSError:
+            pass
+        size = os.fstat(fd).st_size
+        if size > 0 and os.pread(fd, 1, size - 1) != b"\n":
+            data = b"\n" + data  # never join a partial line left by a failed write
+        written = os.write(fd, data)
+    except OSError as exc:
+        raise StateDirError(path, exc.strerror or str(exc)) from None
     finally:
         os.close(fd)
+    if written != len(data):
+        raise StateDirError(path, f"write cut short ({written} of {len(data)} bytes)")
 
 
 def append_log(environ: Mapping[str, str], record: dict[str, Any]) -> None:
     """Append ``record`` to ``log.jsonl``; raises ``StateDirError`` if it cannot."""
-    try:
-        _append(environ, LOG_FILE, record)
-    except OSError as exc:
-        raise StateDirError(f"{LOG_FILE}: {exc.strerror or exc}") from None
+    _append(environ, LOG_FILE, record)
 
 
 def append_audit(environ: Mapping[str, str], record: dict[str, Any]) -> None:
     """Append ``record`` to ``audit.jsonl``; raises ``StateDirError`` if it cannot."""
-    try:
-        _append(environ, AUDIT_FILE, record)
-    except OSError as exc:
-        raise StateDirError(f"{AUDIT_FILE}: {exc.strerror or exc}") from None
+    _append(environ, AUDIT_FILE, record)

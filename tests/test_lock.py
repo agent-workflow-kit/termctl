@@ -1,5 +1,7 @@
 from __future__ import annotations
 
+import errno
+import fcntl
 import hashlib
 import os
 import signal
@@ -115,6 +117,7 @@ def test_second_holder_times_out_after_10_seconds(
             pytest.fail("acquired a held lock")
     assert info.value.code == "locked"
     assert info.value.exit_code == 12
+    assert info.value.details == {"socket_path": SOCKET, "cause": "timeout"}
     assert clock.monotonic() - start == pytest.approx(10.0)
     assert not lock.held()
 
@@ -197,6 +200,12 @@ def test_symlinked_lock_file_is_refused(environ: dict[str, str], tmp_path: Path)
         with lock.server_lock(SOCKET, environ=environ, clock=SystemClock()):
             pass
     assert info.value.code == "locked"
+    assert info.value.details == {
+        "socket_path": SOCKET,
+        "cause": "unusable",
+        "path": str(locks / lock.lock_name(SOCKET)),
+        "problem": "is a symlink",
+    }
     assert victim.read_text() == "keep"
     assert not lock.held()
 
@@ -220,16 +229,78 @@ def test_unusable_state_dir_exits_locked(environ: dict[str, str], tmp_path: Path
         with lock.server_lock(SOCKET, environ=environ, clock=SystemClock()):
             pass
     assert info.value.code == "locked"
-    assert info.value.details == {"socket_path": SOCKET}
+    path = str(tmp_path / "state" / "termctl")
+    assert info.value.details == {
+        "socket_path": SOCKET,
+        "cause": "unusable",
+        "path": path,
+        "problem": "not a directory",
+    }
+    assert path in info.value.message
 
 
-def test_lock_fd_is_not_inherited(environ: dict[str, str], tmp_path: Path) -> None:
-    """A child started while the lock is held (e.g. a tmux server) must not keep it."""
-    with lock.server_lock(SOCKET, environ=environ, clock=SystemClock()):
-        child = subprocess.Popen([sys.executable, "-c", "import time; time.sleep(30)"])
-    try:
-        with lock.server_lock(SOCKET, environ=environ, clock=SystemClock(), timeout=0):
+def test_flock_failure_exits_locked_unusable(
+    environ: dict[str, str], tmp_path: Path, monkeypatch: pytest.MonkeyPatch
+) -> None:
+    def no_locks(fd: int, operation: int) -> None:
+        raise OSError(errno.ENOLCK, os.strerror(errno.ENOLCK))
+
+    monkeypatch.setattr(lock.fcntl, "flock", no_locks)
+    with pytest.raises(TermctlError) as info:
+        with lock.server_lock(SOCKET, environ=environ, clock=SystemClock()):
             pass
-    finally:
-        os.kill(child.pid, signal.SIGKILL)  # the exact child this test started
-        child.wait(10)
+    assert info.value.code == "locked"
+    assert info.value.details == {
+        "socket_path": SOCKET,
+        "cause": "unusable",
+        "path": str(tmp_path / "state" / "termctl" / "locks" / lock.lock_name(SOCKET)),
+        "problem": f"cannot lock: {os.strerror(errno.ENOLCK)}",
+    }
+    assert not lock.held()
+
+
+def test_lock_file_deleted_before_flock_is_reopened(
+    environ: dict[str, str], tmp_path: Path, monkeypatch: pytest.MonkeyPatch
+) -> None:
+    """A lock taken on a file whose name was deleted would let a second process lock a new
+    file of the same name; acquisition ends on the inode the name points to."""
+    path = tmp_path / "state" / "termctl" / "locks" / lock.lock_name(SOCKET)
+    real_flock = fcntl.flock
+    calls: list[int] = []
+
+    def flock_after_delete(fd: int, operation: int) -> None:
+        calls.append(fd)
+        if len(calls) == 1:
+            path.unlink()
+        real_flock(fd, operation)
+
+    monkeypatch.setattr(lock.fcntl, "flock", flock_after_delete)
+    with lock.server_lock(SOCKET, environ=environ, clock=SystemClock(), timeout=0):
+        monkeypatch.setattr(lock.fcntl, "flock", real_flock)
+        assert path.exists()
+        other = os.open(path, os.O_RDONLY)
+        try:
+            with pytest.raises(BlockingIOError):
+                fcntl.flock(other, fcntl.LOCK_EX | fcntl.LOCK_NB)
+        finally:
+            os.close(other)
+    assert len(calls) == 2
+
+
+def test_held_lock_fd_is_close_on_exec(
+    environ: dict[str, str], monkeypatch: pytest.MonkeyPatch
+) -> None:
+    """The lock descriptor never reaches a child (a hook or a tmux server) started while the
+    lock is held."""
+    real_flock = fcntl.flock
+    held: list[int] = []
+
+    def record(fd: int, operation: int) -> None:
+        held.append(fd)
+        real_flock(fd, operation)
+
+    monkeypatch.setattr(lock.fcntl, "flock", record)
+    with lock.server_lock(SOCKET, environ=environ, clock=SystemClock()):
+        (fd,) = held
+        assert fcntl.fcntl(fd, fcntl.F_GETFD) & fcntl.FD_CLOEXEC
+        assert not os.get_inheritable(fd)
