@@ -58,12 +58,13 @@ def _without_surrogates(value: Any) -> Any:
     return value
 
 
-def _to_json(data: dict[str, Any]) -> str:
+def to_json(data: dict[str, Any], *, allow_nan: bool = True) -> str:
     # interface.md "Human output": JSON string encoding escapes the control characters, so
     # --json output is never escaped as human output is. ensure_ascii also escapes C1 and
     # every other non-ASCII character; it is the default, but stated so it is not lost.
-    # Lone surrogates are mapped first, so a strict parser accepts the output.
-    return json.dumps(_without_surrogates(data), ensure_ascii=True) + "\n"
+    # Lone surrogates are mapped first, so a strict parser accepts the output. With
+    # allow_nan=False a NaN or infinity raises ValueError instead of producing invalid JSON.
+    return json.dumps(_without_surrogates(data), ensure_ascii=True, allow_nan=allow_nan) + "\n"
 
 
 def _write(stream: TextIO, text: str) -> None:
@@ -106,7 +107,7 @@ class Output:
 
     def result(self, result: Result) -> None:
         if self.json:
-            _write(self.stdout, _to_json(result.data))
+            _write(self.stdout, to_json(result.data))
         elif result.human:
             _write(self.stdout, _escape_lines(result.human) + "\n")
 
@@ -117,7 +118,7 @@ class Output:
     def error(self, err: TermctlError) -> None:
         """Errors always reach stderr (even with ``--quiet``); with ``--json`` stdout first."""
         if self.json:
-            _write(self.stdout, _to_json(err.envelope()))
+            _write(self.stdout, to_json(err.envelope()))
             # Flushed now so that it precedes the message when both go to one pipe or file.
             _flush(self.stdout)
         # TODO(#6): hook_stderr is not printed in human mode yet (PR #41 adds its lines).
