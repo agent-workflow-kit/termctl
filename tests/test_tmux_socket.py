@@ -6,6 +6,7 @@ from __future__ import annotations
 import os
 import shutil
 import socket
+import stat
 import tempfile
 from collections.abc import Iterator, Mapping
 from pathlib import Path
@@ -877,3 +878,181 @@ def test_real_tmp_is_an_accepted_sticky_ancestor() -> None:
     if info.st_uid != 0 or not info.st_mode & 0o1000:
         pytest.skip("/tmp is not a root-owned sticky directory here")
     assert real_check("/tmp/tc-no-such-dir-for-termctl-tests/s", {}) is False
+
+
+# --- before open starts a server ----------------------------------------------------------------
+
+
+def no_default_dir(uid: int = UID) -> dict[str, FileInfo]:
+    files = safe_default_server(uid)
+    del files[f"/tmp/tmux-{uid}/default"], files[f"/tmp/tmux-{uid}"]
+    return files
+
+
+def prepare(gateway: FakeGateway, flag: str | None = None) -> bool:
+    return tmux_socket.prepare_start(resolve(flag, gateway=gateway), gateway)
+
+
+def prepare_error(gateway: FakeGateway, flag: str | None = None) -> TermctlError:
+    with pytest.raises(TermctlError) as caught:
+        prepare(gateway, flag)
+    assert (caught.value.code, caught.value.exit_code) == ("server_unavailable", 12)
+    return caught.value
+
+
+def test_prepare_creates_a_missing_default_directory_with_mode_0700() -> None:
+    gateway = FakeGateway(files=no_default_dir())
+    assert prepare(gateway) is False
+    assert gateway.mkdirs == [(f"/tmp/tmux-{UID}", 0o700)]
+
+
+def test_prepare_creates_the_default_directory_for_a_socket_name() -> None:
+    gateway = FakeGateway(files=no_default_dir())
+    assert prepare(gateway, "work") is False
+    assert gateway.mkdirs == [(f"/tmp/tmux-{UID}", 0o700)]
+
+
+def test_prepare_rechecks_an_existing_directory_after_eexist() -> None:
+    files = safe_default_server()
+    del files[DEFAULT]
+    gateway = FakeGateway(files=files)
+    assert prepare(gateway) is False
+    # mkdir is always attempted; EEXIST leaves the directory as it is, checked again.
+    assert gateway.mkdirs == [(f"/tmp/tmux-{UID}", 0o700)]
+    assert gateway.files[f"/tmp/tmux-{UID}"] == directory(0o700, UID)
+
+
+def test_prepare_reports_an_existing_socket() -> None:
+    gateway = FakeGateway()
+    assert prepare(gateway) is True
+    assert gateway.mkdirs == []
+
+
+def test_prepare_checks_a_directory_that_appeared_meanwhile() -> None:
+    # EEXIST: someone else created it between the lstat and the mkdir; it is checked again.
+    gateway = FakeGateway(files=no_default_dir())
+    gateway.appears[f"/tmp/tmux-{UID}"] = directory(0o705, UID)
+    message = prepare_error(gateway).message
+    assert "allows group write or others" in message
+    assert len(gateway.mkdirs) == 1
+
+
+def test_prepare_accepts_a_safe_directory_that_appeared_meanwhile() -> None:
+    gateway = FakeGateway(files=no_default_dir())
+    gateway.appears[f"/tmp/tmux-{UID}"] = directory(0o700, UID)
+    assert prepare(gateway) is False
+    assert len(gateway.mkdirs) == 1
+
+
+def test_prepare_refuses_a_default_directory_that_appeared_as_a_symlink() -> None:
+    gateway = FakeGateway(files=no_default_dir())
+    gateway.appears[f"/tmp/tmux-{UID}"] = symlink(UID)
+    assert "symlink" in prepare_error(gateway).message
+
+
+def test_prepare_refuses_a_default_directory_that_appeared_owned_by_another_user() -> None:
+    gateway = FakeGateway(files=no_default_dir())
+    gateway.appears[f"/tmp/tmux-{UID}"] = directory(0o700, UID + 1)
+    assert "owned by uid" in prepare_error(gateway).message
+
+
+class LateLstat(FakeGateway):
+    """A fake gateway where ``path`` appears (with ``info``) just before its ``nth`` lstat:
+    another process creating it between two of termctl's looks. Resolution looks once and
+    the first check once, so ``nth=3`` is right after the first check."""
+
+    def __init__(self, path: str, nth: int, info: FileInfo, **kwargs: object) -> None:
+        super().__init__(**kwargs)  # type: ignore[arg-type]
+        self.late = (path, nth, info)
+
+    def lstat(self, path: str) -> FileInfo:
+        late_path, nth, info = self.late
+        if path == late_path and self.lstats.count(path) + 1 == nth:
+            self.files[path] = info
+        return super().lstat(path)
+
+
+@pytest.mark.parametrize(
+    ("info", "problem"),
+    [(symlink(UID), "symlink"), (directory(0o777, UID), "writable by group or others")],
+    ids=["symlink", "mode-0777"],
+)
+def test_prepare_rechecks_a_default_directory_that_appeared_after_the_first_check(
+    info: FileInfo, problem: str
+) -> None:
+    # The directory is missing at the first check and appears right after it.
+    gateway = LateLstat(f"/tmp/tmux-{UID}", 3, info, files=no_default_dir())
+    assert problem in prepare_error(gateway).message
+
+
+def test_prepare_accepts_a_safe_default_directory_that_appeared_after_the_first_check() -> None:
+    gateway = LateLstat(f"/tmp/tmux-{UID}", 3, directory(0o700, UID), files=no_default_dir())
+    assert prepare(gateway) is False
+
+
+def test_prepare_rechecks_after_creating_the_directory() -> None:
+    # A socket that appears with the directory is reported: the checks run after the mkdir.
+    gateway = FakeGateway(files=no_default_dir())
+    gateway.appears[DEFAULT] = socket_file()
+    assert prepare(gateway) is True
+    assert gateway.mkdirs == [(f"/tmp/tmux-{UID}", 0o700)]
+
+
+def test_prepare_explicit_path_rechecks_a_parent_that_appeared_after_the_first_check() -> None:
+    files = safe_default_server()
+    gateway = LateLstat("/srv", 3, directory(0o777, UID), files=files)
+    assert "writable by group or others" in prepare_error(gateway, "/srv/sock").message
+
+
+def test_prepare_mkdir_failure_is_server_unavailable() -> None:
+    gateway = FakeGateway(files=no_default_dir())
+    gateway.mkdir_error = PermissionError(13, "Permission denied")
+    err = prepare_error(gateway)
+    assert "Permission denied" in err.message
+    assert err.details == {"socket_path": DEFAULT}
+
+
+def test_prepare_explicit_path_with_a_missing_parent_is_server_unavailable() -> None:
+    gateway = FakeGateway()
+    err = prepare_error(gateway, "/srv/missing/sock")
+    assert "/srv/missing" in err.message
+    assert err.details == {"socket_path": "/srv/missing/sock"}
+    assert gateway.mkdirs == []
+
+
+def test_prepare_explicit_path_in_the_default_directory_creates_it() -> None:
+    # A path given explicitly but in the default directory form is treated as that form.
+    gateway = FakeGateway(files=no_default_dir())
+    assert prepare(gateway, f"/tmp/tmux-{UID}/mine") is False
+    assert gateway.mkdirs == [(f"/tmp/tmux-{UID}", 0o700)]
+
+
+def test_prepare_never_creates_a_directory_under_an_unsafe_ancestor() -> None:
+    files = no_default_dir()
+    files["/tmp"] = directory(0o777)  # writable by others, not sticky
+    gateway = FakeGateway(files=files)
+    prepare_error(gateway)
+    assert gateway.mkdirs == []
+
+
+def test_real_prepare_creates_the_default_directory(base: Path) -> None:
+    gateway = RealFs()
+    server = tmux_socket.resolve(None, None, {"TMUX_TMPDIR": str(base)}, gateway)
+    old = os.umask(0o022)
+    try:
+        assert tmux_socket.prepare_start(server, gateway) is False
+    finally:
+        os.umask(old)
+    created = base / f"tmux-{os.getuid()}"
+    assert stat.S_IMODE(created.lstat().st_mode) == 0o700
+    # A second call finds it and creates nothing.
+    assert tmux_socket.prepare_start(server, gateway) is False
+
+
+def test_real_prepare_explicit_missing_parent_creates_nothing(base: Path) -> None:
+    gateway = RealFs()
+    server = tmux_socket.resolve(str(base / "missing" / "s"), None, {}, gateway)
+    with pytest.raises(TermctlError) as caught:
+        tmux_socket.prepare_start(server, gateway)
+    assert caught.value.exit_code == 12
+    assert list(base.iterdir()) == []

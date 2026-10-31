@@ -962,6 +962,90 @@ def check_guard(
         )
 
 
+# --- open: server and session (interface.md "Open order" step 5) --------------------------------
+
+# What new-session and new-window print with -P: the ids of the pane and window they created.
+CREATED_FORMAT = fields("pane_id", "window_id")
+_CREATED = re.compile(r"(%[0-9]+) (@[0-9]+)\n?")
+
+
+@dataclass(frozen=True)
+class WindowSpec:
+    """The window ``open`` creates: its displayed name, its absolute working directory, the
+    command (``None`` for tmux's default shell) and its ``-e`` variables."""
+
+    name: str
+    cwd: str
+    command: tuple[str, ...] | None
+    env: tuple[tuple[str, str], ...] = ()
+
+
+def has_session(name: str) -> Invocation:
+    """``has-session -t =S:``: whether the session exists, and whether a server runs."""
+    return Invocation.of(command("has-session").target(session(name)).build())
+
+
+def _create(builder: CommandBuilder, spec: WindowSpec) -> Command:
+    """The rest of ``new-session`` or ``new-window``: always ``-d`` (never the current window),
+    the name, the directory, the variables and the command."""
+    if not os.path.isabs(spec.cwd):
+        raise ValueError(f"the working directory must be absolute: {spec.cwd!r}")
+    builder.window_name(spec.name).option("-c", spec.cwd)
+    for name, value in spec.env:
+        builder.env(name, value)
+    for element in spec.command or ():
+        builder.arg(element)
+    return builder.build()
+
+
+def _created(name: str) -> CommandBuilder:
+    return command(name).flag("-d").flag("-P").format("-F", CREATED_FORMAT)
+
+
+def new_window(name: str, spec: WindowSpec) -> Invocation:
+    """A window in the existing session ``name`` (exact ``=S:``)."""
+    return Invocation.of(_create(_created("new-window").target(session(name)), spec))
+
+
+def new_session(name: str, spec: WindowSpec, *, start_server: bool) -> Invocation:
+    """The session ``name`` with its first window, chained with ``destroy-unattached off``
+    (spike C2) and, for each ``-e`` variable, ``set-environment -u`` so that only the first
+    pane keeps it (spike G3c). ``start_server`` prefixes ``set -s exit-unattached off``, for a
+    server this invocation starts (spike F2); never for a server termctl did not start."""
+    target = session(name)
+    commands: list[Command] = []
+    if start_server:
+        commands.append(command("set").server_scope().arg("exit-unattached").arg("off").build())
+    commands.append(_create(_created("new-session").session_name(name), spec))
+    commands.append(command("set").target(target).arg("destroy-unattached").arg("off").build())
+    for variable, _ in spec.env:
+        commands.append(command("set-environment").target(target).flag("-u").arg(variable).build())
+    return Invocation.of(*commands)
+
+
+def parse_created(stdout: str) -> tuple[str, str] | None:
+    """The pane and window ids that ``-P -F CREATED_FORMAT`` printed, or None for anything but
+    exactly one such line."""
+    match = _CREATED.fullmatch(stdout)
+    return None if match is None else (match.group(1), match.group(2))
+
+
+def _first_line_is(result: subprocess.CompletedProcess[str], line: str) -> bool:
+    lines = _stderr_lines(result)
+    return result.returncode != 0 and bool(lines) and lines[0] == line
+
+
+def is_duplicate_session(result: subprocess.CompletedProcess[str], name: str) -> bool:
+    """Whether ``new-session`` failed because the session ``name`` exists (another caller
+    created it first). Only stderr's first line counts, as for ``is_no_server``."""
+    return _first_line_is(result, f"duplicate session: {name}")
+
+
+def is_session_missing(result: subprocess.CompletedProcess[str], name: str) -> bool:
+    """Whether a command targeting ``=name:`` failed because no such session exists."""
+    return _first_line_is(result, f"can't find session: {name}")
+
+
 # --- the runner ---------------------------------------------------------------------------------
 
 

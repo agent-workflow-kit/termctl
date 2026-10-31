@@ -195,6 +195,11 @@ class Gateway(Protocol):
         """The target of the symlink ``path``, as stored; raises ``OSError``."""
         ...
 
+    def make_dir(self, path: str, mode: int) -> None:
+        """``mkdir`` of ``path`` with ``mode`` (less the umask); never creates parents. Raises
+        ``FileExistsError`` if ``path`` exists (a symlink included) and ``OSError`` otherwise."""
+        ...
+
     def stdin_isatty(self) -> bool:
         """Whether stdin (fd 0) is a terminal."""
         ...
@@ -340,6 +345,9 @@ class SystemGateway:
 
     def read_link(self, path: str) -> str:
         return os.readlink(path)
+
+    def make_dir(self, path: str, mode: int) -> None:
+        os.mkdir(path, mode)
 
     def stdin_isatty(self) -> bool:
         return os.isatty(0)

@@ -383,3 +383,62 @@ def _unsafe(server: Server, path: str, problem: str) -> TermctlError:
         f"{validate.show(path, 200)}: {problem}",
         details={"socket_path": server.socket_path, "path": path},
     )
+
+
+# --- before open starts a server ----------------------------------------------------------------
+
+DEFAULT_DIR_MODE = 0o700
+
+
+def require_parent(server: Server, gateway: Gateway) -> None:
+    """For a socket outside the default directory form: its parent directory must exist, since
+    termctl never creates it and tmux would exit 0 there without a server (spike F6). A missing
+    parent, or one that is not a directory, exits 12 (``server_unavailable``). ``open`` runs
+    this in its tmux checks (Open order step 3) and again before it starts a server (step 5).
+    """
+    if server.default_form:
+        return
+    parent = posixpath.dirname(server.socket_path)
+    info = _lstat(server, parent, gateway)
+    if info is None:
+        raise _cannot_start(server, f"its directory {validate.show(parent, 200)} does not exist")
+    if not stat.S_ISDIR(info.mode):
+        raise _cannot_start(server, f"{validate.show(parent, 200)} is not a directory")
+
+
+def prepare_start(server: Server, gateway: Gateway) -> bool:
+    """Make the socket's directory ready for ``open`` to start a server (interface.md "Open
+    order" step 5), with the safety checks run before and after.
+
+    In the default directory form the directory is always made with ``mkdir`` (mode 0700,
+    never its parents); whether that creates it or finds it there (``EEXIST``), the full
+    checks then run again on what is there now, so a directory that appeared after the first
+    check is never trusted unchecked. For any other path a missing parent exits 12
+    (``server_unavailable``, ``require_parent``), and the checks run again too. Returns what
+    the last ``check`` returns: True when a socket file is now there (a stale one, or a server
+    started meanwhile).
+    """
+    if check(server, gateway):
+        return True
+    if not server.default_form:
+        require_parent(server, gateway)
+        return check(server, gateway)
+    assert server.default_dir is not None
+    try:
+        gateway.make_dir(server.default_dir, DEFAULT_DIR_MODE)
+    except FileExistsError:
+        pass
+    except OSError as exc:
+        reason = exc.strerror or errno.errorcode.get(exc.errno or 0, str(exc))
+        raise _cannot_start(
+            server, f"cannot create {validate.show(server.default_dir, 200)}: {reason}"
+        ) from None
+    return check(server, gateway)
+
+
+def _cannot_start(server: Server, problem: str) -> TermctlError:
+    return TermctlError(
+        "server_unavailable",
+        f"cannot start a tmux server on {validate.show(server.socket_path, 200)}: {problem}",
+        details={"socket_path": server.socket_path},
+    )

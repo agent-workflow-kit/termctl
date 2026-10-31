@@ -612,12 +612,21 @@ def steps(monkeypatch: pytest.MonkeyPatch) -> list[str]:
     seen: list[str] = []
 
     def recorder(step: str):
-        def record(args: Any, ctx: Context) -> None:
+        def record(*_: Any) -> None:
             seen.append(step)
 
         return record
 
-    for step in ("load_config", "resolve_server", "check_tmux", "resolve_id"):
+    for step in (
+        "load_config",
+        "resolve_server",
+        "resolve_tmux_bin",
+        "resolve_placement",
+        "resolve_command",
+        "check_tmux",
+        "check_id_collision",
+        "resolve_id",
+    ):
         monkeypatch.setattr(cli, step, recorder(step))
 
     def handler(args: Any, ctx: Context) -> Result:
@@ -634,10 +643,25 @@ def test_check_order_for_commands_with_an_id(command: str, steps: list[str]) -> 
     assert steps == ["load_config", "resolve_server", "check_tmux", "resolve_id", f"run {command}"]
 
 
-@pytest.mark.parametrize("command", ["open", "list"])
-def test_check_order_for_tmux_commands_without_an_id(command: str, steps: list[str]) -> None:
-    assert Run(MINIMAL[command]).code == 0
-    assert steps == ["load_config", "resolve_server", "check_tmux", f"run {command}"]
+def test_check_order_for_list(steps: list[str]) -> None:
+    assert Run(MINIMAL["list"]).code == 0
+    assert steps == ["load_config", "resolve_server", "check_tmux", "run list"]
+
+
+def test_check_order_for_open(steps: list[str]) -> None:
+    # Open order: resolve (server, tmux_bin, placement, command and size), then the tmux
+    # checks and the id-collision check, then the command's own steps.
+    assert Run(MINIMAL["open"]).code == 0
+    assert steps == [
+        "load_config",
+        "resolve_server",
+        "resolve_tmux_bin",
+        "resolve_placement",
+        "resolve_command",
+        "check_tmux",
+        "check_id_collision",
+        "run open",
+    ]
 
 
 def test_placements_needs_no_tmux(steps: list[str]) -> None:
@@ -827,7 +851,7 @@ def test_context_carries_injected_gateway_and_clock(monkeypatch: pytest.MonkeyPa
 # --- unimplemented commands ---------------------------------------------------------------------
 
 
-IMPLEMENTED = {"show", "exists", "list", "placements"}
+IMPLEMENTED = {"show", "exists", "list", "placements", "open"}
 UNIMPLEMENTED = sorted(set(MINIMAL) - IMPLEMENTED)
 
 

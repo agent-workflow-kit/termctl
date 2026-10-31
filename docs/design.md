@@ -49,7 +49,7 @@ Terminal placement, tmux backend. Layer 1 (primitive), fully standalone (archite
 | D32 | Unsupported placement fields are rejected only when a placement using them is resolved; loading config for other commands never fails on them ([Placement](interface.md#placement), [Config](interface.md#config)). | A config written for a later version must not stop `mark` or `close` from working on panes that are already running. |
 | D33 | `--env PATH=X` reaches the program through `/usr/bin/env` in the pane's argv, never through tmux or the server's environment ([Command](interface.md#command), [Environment](interface.md#environment)). | tmux ignores `-e PATH` and gives the pane the invoking process's `PATH` (spike C7); setting it through `env` reaches the program without changing the server's environment. GNU `env` takes assignments only before the command, after its own `--` (spike G4). |
 | D34 | `close` does nothing and exits 12 `state_changed` when the pane's state at the final re-check differs from its first check; the caller may retry, which runs fresh hooks ([`close`](interface.md#close), [Errors](interface.md#errors)). | Hooks and a human's `--force` decide on the state they saw; acting on a different state (a pane that died, or one respawned into a running command) would carry out a decision nobody made. Retrying is cheap and re-runs every check. |
-| D35 | `open` never exits 10: a session that vanishes mid-`open` is retried once through the new-session path, then reported as a server problem ([Open order](interface.md#open-order), [Exit codes](interface.md#exit-codes)). | Exit 10 reports a missing id, server or client that the caller depends on; `open` creates the server and session it needs, so a session vanishing mid-`open` is a race it can recover from, not a missing object. |
+| D35 | `open` never exits 10: a session or server that is not there at `new-window` or at the `has-session` confirmation that follows every `new-session` is retried once after probing again, by whichever path the probe selects, then reported as a server problem ([Open order](interface.md#open-order), [Exit codes](interface.md#exit-codes)). | Exit 10 reports a missing id, server or client that the caller depends on; `open` creates the server and session it needs, so a session vanishing mid-`open` is a race it can recover from, not a missing object. |
 
 ## Open topics resolved
 
@@ -71,13 +71,14 @@ Terminal placement, tmux backend. Layer 1 (primitive), fully standalone (archite
 | `ids.py` | id generation and prefix resolution |
 | `validate.py` | input grammars: name, label, marker, session, placement, env-name, duration, actor (and its default), decision-id, client, socket and cwd |
 | `placement.py` | placement and rule resolution |
+| `open_cmd.py` | `open`'s own steps: the default name, the command and size checks of the resolve step, and the server and session (Open order step 5); `open_cmd.allowed` is the single `server_env_allow` matcher, which every use of that setting goes through |
 | `backend.py` | the `Backend` protocol (open, close, list, rename, mark, focus, labels) and its tmux implementation `TmuxBackend` |
 | `tmux_backend.py` | the tmux argument builder ([tmux argument rules](interface.md#tmux-argument-rules)), guarded writes (`if-shell` wrapping, D28), format strings, command chains, server env filtering |
 | `tmux_bin.py` | `tmux_bin` resolution to an absolute path on the caller's `PATH` and the `tmux -V` version check (3.2 floor) |
 | `tmux_socket.py` | server selection, the canonical socket path and the socket safety checks (D12, D26) |
 | `panes.py` | the pane reader: parses `list-panes -a -F` records, applies the ownership check and validates every `@termctl_*` value (D27) |
 | `procs.py` | process start time and parent check for the recorded PID, the `close --force` signal sequence |
-| `gateway.py` | the only module that runs subprocesses or touches the filesystem outside config and logs (tmux, `ps`, `/proc`, socket `stat`, the cwd check, stdin TTY test and OS user name, BEL write); also holds the injectable clock |
+| `gateway.py` | the only module that runs subprocesses or touches the filesystem outside config and logs (tmux, `ps`, `/proc`, socket `stat`, the default directory's `mkdir`, the cwd check, stdin TTY test and OS user name, BEL write); also holds the injectable clock |
 | `hooks.py` | hook execution per the design guide |
 | `hookwatch.py` | the detached watchdog that runs an async post-hook and enforces its timeout; started by `gateway.py` as `python -I` with its absolute file path and importing only the standard library, it is the one other module that starts a process |
 | `jsonlog.py` | `log.jsonl` and `audit.jsonl` |

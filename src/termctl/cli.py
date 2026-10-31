@@ -15,8 +15,9 @@ from collections.abc import Mapping, Sequence
 from dataclasses import dataclass, field
 from typing import Any, NoReturn, TextIO
 
-from . import __version__, hooks, ids, panes, placement, tmux_bin, tmux_socket, validate
+from . import __version__, hooks, ids, open_cmd, panes, placement, tmux_bin, tmux_socket, validate
 from . import config as config_module
+from . import tmux_backend as tb
 from .argv import Scan, scan
 from .backend import Backend, TmuxBackend
 from .config import Config
@@ -24,7 +25,7 @@ from .errors import TermctlError, UsageError
 from .gateway import Clock, Gateway, SystemClock, SystemGateway, Terminated
 from .output import PROG, Output, Result, flush_standard_streams
 from .panes import ManagedPane, PaneRead
-from .tmux_backend import Tmux
+from .tmux_backend import Tmux, WindowSpec
 from .tmux_bin import TmuxBinary
 
 __all__ = ["Context", "Output", "Result", "main", "parse_args"]
@@ -52,6 +53,11 @@ class Context:
     # id, the pane it resolved to (step 4; None for ``exists`` when nothing matched).
     pane_read: PaneRead | None = None
     pane: ManagedPane | None = None
+    # `open`'s resolved placement (Open order step 2); None for other commands.
+    selection: placement.Selection | None = None
+    # `open`'s window and id (Open order step 2; step 3 replaces the id on a collision).
+    window: WindowSpec | None = None
+    open_id: str | None = None
 
 
 # --- argument parsing ---------------------------------------------------------------------------
@@ -428,6 +434,12 @@ def resolve_server(args: argparse.Namespace, ctx: Context) -> None:
     ctx.server = tmux_socket.resolve(args.socket, ctx.config.socket, ctx.environ, ctx.gateway)
 
 
+def resolve_tmux_bin(ctx: Context) -> None:
+    """Resolve ``tmux_bin`` to an absolute path, once (exit 12, ``tmux_missing``)."""
+    if ctx.tmux_path is None:
+        ctx.tmux_path = tmux_bin.resolve(ctx.config.tmux_bin, ctx.environ, ctx.gateway)
+
+
 def resolve_placement(args: argparse.Namespace, ctx: Context) -> None:
     """Step 2 of ``open``: resolve the placement, without side effects (exit 2, ``usage`` for
     an undefined ``--placement``, ``not_supported``)."""
@@ -440,11 +452,28 @@ def resolve_placement(args: argparse.Namespace, ctx: Context) -> None:
     )
 
 
+def resolve_command(args: argparse.Namespace, ctx: Context) -> None:
+    """Step 2 of ``open``, after the placement: the command check (exit 12,
+    ``command_not_found``) and the size check (exit 2), without side effects."""
+    assert ctx.selection is not None and ctx.server is not None and ctx.tmux_path is not None
+    env = validate.parse_env(args.env)
+    if args.argv:
+        path = open_cmd.command_path(env, ctx.environ, ctx.config.server_env_allow)
+        open_cmd.check_command(args.argv[0], args.cwd, path, ctx.gateway)
+    name = args.name if args.name is not None else open_cmd.default_name(args.argv)
+    ctx.window = open_cmd.window_spec(name, args.cwd)
+    # TODO(#15): also the tagging and respawn invocation of step 6, which carries argv and the
+    # --env values; until then the new-session invocation of step 5 is the largest.
+    largest = tb.new_session(ctx.selection.session, ctx.window, start_server=True)
+    open_cmd.check_size([largest], ctx.tmux_path, ctx.server.socket_path)
+    # The id; step 3 checks it against the managed panes.
+    ctx.open_id = ids.generate()
+
+
 def check_tmux(args: argparse.Namespace, ctx: Context) -> None:
     """Step 3: tmux binary, version and socket safety checks (exit 12)."""
     if ctx.tmux is None:
-        if ctx.tmux_path is None:
-            ctx.tmux_path = tmux_bin.resolve(ctx.config.tmux_bin, ctx.environ, ctx.gateway)
+        resolve_tmux_bin(ctx)
         # TODO(#5): a version warning also gets a `warning` log record in logged commands.
         ctx.tmux = tmux_bin.probe(
             ctx.config.tmux_bin,
@@ -457,11 +486,21 @@ def check_tmux(args: argparse.Namespace, ctx: Context) -> None:
     assert ctx.server is not None
     ctx.socket_present = tmux_socket.check(ctx.server, ctx.gateway)
     # A missing socket or parent directory (False) is no server: `list` and `exists` still
-    # answer, and step 4 exits 10 for the other commands. `read_panes` re-runs these checks
-    # before it connects.
-    # TODO(#14): open re-checks the socket right before connecting, creates the default
-    # directory (default form only, mode 0700), and exits 12 for an explicit path whose parent
-    # is missing.
+    # answer, step 4 exits 10 for the other commands, and `open` starts a server in its step 5
+    # (`open_cmd.create_window`). `read_panes` and step 5 re-run these checks before they
+    # connect.
+    if args.command == "open" and not ctx.socket_present:
+        # `open` could not start a server there: it never creates an explicit path's parent.
+        tmux_socket.require_parent(ctx.server, ctx.gateway)
+
+
+def check_id_collision(ctx: Context) -> None:
+    """Step 3 of ``open``, after the tmux checks: the id from step 2 is kept unless a managed
+    pane carries it, from one read-only ``list-panes -a`` (none without a server)."""
+    assert ctx.open_id is not None
+    taken = {pane.id for pane in read_panes(ctx).panes}
+    if ctx.open_id in taken:
+        ctx.open_id = ids.generate_unique(taken)
 
 
 def connect(ctx: Context) -> Backend | None:
@@ -471,11 +510,19 @@ def connect(ctx: Context) -> Backend | None:
     *no server* result is never followed by a connect without them (interface.md "Residual
     risks", socket path races), and a socket replaced since step 3 is checked as it is now.
     """
-    assert ctx.server is not None and ctx.tmux is not None
+    assert ctx.server is not None
     if not tmux_socket.check(ctx.server, ctx.gateway):
         return None
-    # TODO(#15): run tmux with the environment filtered by server_env_allow; until then only
-    # the caller's locale, as for `tmux -V`.
+    return unchecked_backend(ctx)
+
+
+def unchecked_backend(ctx: Context) -> TmuxBackend:
+    """The backend for the resolved server, without the socket checks: only for a caller that
+    runs them itself immediately before each connect (``open_cmd.create_window``)."""
+    assert ctx.server is not None and ctx.tmux is not None
+    # TODO(#15): run tmux with the environment filtered by server_env_allow, through
+    # `open_cmd.allowed`, the single server_env_allow matcher (never a second one); until then
+    # only the caller's locale, as for `tmux -V`.
     env = tmux_bin.locale_env(ctx.environ)
     tmux = Tmux(
         ctx.gateway,
@@ -570,7 +617,27 @@ def list_panes(args: argparse.Namespace, ctx: Context) -> Result:
     return Result(data, "\n".join(_pane_line(p) for p in chosen))
 
 
-COMMAND_STEPS = {"show": show, "exists": exists, "list": list_panes}
+def open_pane(args: argparse.Namespace, ctx: Context) -> Result:
+    """Steps 4 on of the open order (steps 1 to 3 ran in ``dispatch``)."""
+    assert ctx.selection is not None and ctx.server is not None and ctx.window is not None
+    if args.dry_run:
+        # TODO(#18): the dry run stops after step 3 and prints what a real run would do: its
+        # placement, matched_rule, session and target are in ctx.selection, its id in
+        # ctx.open_id, the window in ctx.window.
+        raise TermctlError("internal", f"{PROG} open --dry-run is not implemented yet")
+    # TODO(#17): step 4, the pre-open hooks (veto 11, escalation 13; nothing created).
+    # TODO(#15): wire in step 5, `open_cmd.create_window(unchecked_backend(ctx), ctx.server,
+    # ctx.gateway, ctx.selection.session, ctx.window)`, together with step 6, which tags the
+    # pane it returns and respawns it with argv (the server environment must be set first);
+    # TODO(#16) records the process; TODO(#17) post-open hooks, the log record and the output.
+    # Until then open refuses here, before any side effect.
+    raise TermctlError(
+        "internal",
+        f"{PROG} open is not implemented yet: creating the pane lands with a later change",
+    )
+
+
+COMMAND_STEPS = {"show": show, "exists": exists, "list": list_panes, "open": open_pane}
 
 
 def run_command(args: argparse.Namespace, ctx: Context) -> Result:
@@ -581,9 +648,7 @@ def run_command(args: argparse.Namespace, ctx: Context) -> Result:
     step = COMMAND_STEPS.get(args.command)
     if step is not None:
         return step(args, ctx)
-    # TODO: each remaining command lands in its own issue (#7, #13-#24). `open` gets its resolved
-    # placement in ctx.selection: TODO(#14) the session, TODO(#15) the window, TODO(#18)
-    # --dry-run's placement, matched_rule, session and target.
+    # TODO: each remaining command lands in its own issue (#19-#24).
     raise TermctlError("internal", f"{PROG} {args.command} is not implemented yet")
 
 
@@ -593,12 +658,16 @@ def dispatch(args: argparse.Namespace, ctx: Context) -> Result:
     check_args(args, ctx)
     load_config(args, ctx)
     if spec.uses_tmux:
-        # Open order step 2: the server, then tmux_bin (#10), then the placement.
         resolve_server(args, ctx)
-        # TODO(#10): resolve tmux_bin here (Open order step 2), before resolve_placement
         if args.command == "open":
+            # Open order step 2: the server, then tmux_bin (tmux_missing is reported here,
+            # before not_supported; `tmux -V` runs in step 3), then the placement.
+            resolve_tmux_bin(ctx)
             resolve_placement(args, ctx)
+            resolve_command(args, ctx)
         check_tmux(args, ctx)
+        if args.command == "open":
+            check_id_collision(ctx)
         if spec.takes_id:
             resolve_id(args, ctx)
     return run_command(args, ctx)

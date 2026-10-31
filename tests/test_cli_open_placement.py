@@ -59,6 +59,9 @@ class Run:
             return Result({}, "")
 
         monkeypatch.setattr(cli, "run_command", capture)
+        # The command, size and id-collision checks are tested in test_cli_open.py.
+        monkeypatch.setattr(cli, "resolve_command", lambda args, ctx: None)
+        monkeypatch.setattr(cli, "check_id_collision", lambda ctx: None)
         self.gateway = FakeGateway()
         stdout, stderr = io.StringIO(), io.StringIO()
         self.code = main(

@@ -42,12 +42,20 @@ def later_steps(monkeypatch: pytest.MonkeyPatch) -> list[str]:
     seen: list[str] = []
 
     def recorder(step: str):
-        def record(args: Any, ctx: Context) -> None:
+        def record(*_: Any) -> None:
             seen.append(step)
 
         return record
 
-    for step in ("load_config", "resolve_server", "check_tmux", "resolve_id"):
+    for step in (
+        "load_config",
+        "resolve_server",
+        "resolve_tmux_bin",
+        "resolve_command",
+        "check_tmux",
+        "check_id_collision",
+        "resolve_id",
+    ):
         monkeypatch.setattr(cli, step, recorder(step))
 
     def handler(args: Any, ctx: Context) -> Result:
@@ -248,8 +256,16 @@ def test_flag_hooks_are_parsed_in_step_1(monkeypatch: pytest.MonkeyPatch) -> Non
         seen.append(args.flag_hooks)
         return Result(data={}, human="")
 
-    for step in ("load_config", "resolve_server", "check_tmux", "resolve_id"):
-        monkeypatch.setattr(cli, step, lambda args, ctx: None)
+    for step in (
+        "load_config",
+        "resolve_server",
+        "resolve_tmux_bin",
+        "resolve_command",
+        "check_tmux",
+        "check_id_collision",
+        "resolve_id",
+    ):
+        monkeypatch.setattr(cli, step, lambda *_: None)
     monkeypatch.setattr(cli, "run_command", handler)
     assert run(["open", "--hook", "post-open=a", "--hook", "pre-open=b=c"])[0] == 0
     assert seen == [[Hook("post-open", "a", 30), Hook("pre-open", "b=c", 30)]]
