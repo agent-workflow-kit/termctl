@@ -9,7 +9,8 @@ from pathlib import Path
 from typing import Any
 
 from jsonschema import Draft202012Validator, ValidationError, validators
-from referencing import Registry, Resource
+from referencing import Registry
+from referencing.jsonschema import DRAFT202012
 
 SCHEMA_DIR = Path(__file__).resolve().parents[1] / "schemas"
 
@@ -24,8 +25,19 @@ def load_schemas() -> dict[str, dict[str, Any]]:
 
 
 SCHEMAS = load_schemas()
+
+
+def _resource_contents(contents: dict[str, Any]) -> dict[str, Any]:
+    """``contents`` without ``$schema``: following a ``$ref`` into a schema that names its
+    dialect would switch to jsonschema's own validator class and lose the ECMA ``$``. Every
+    schema is draft 2020-12, so the registry declares that instead."""
+    assert contents.get("$schema") == "https://json-schema.org/draft/2020-12/schema"
+    return {key: value for key, value in contents.items() if key != "$schema"}
+
+
 REGISTRY: Registry[Any] = Registry().with_resources(
-    (schema_id, Resource.from_contents(contents)) for schema_id, contents in SCHEMAS.items()
+    (schema_id, DRAFT202012.create_resource(_resource_contents(contents)))
+    for schema_id, contents in SCHEMAS.items()
 )
 
 

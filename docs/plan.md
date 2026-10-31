@@ -21,12 +21,15 @@ Status: planned, 2026-10-30. Implements [interface.md](interface.md) (normative)
 | `config.py` | 0 | YAML + `config.d` merge (maps deep, hook lists appended, other lists replaced), Pydantic models, `TERMCTL_*` scalars, load-time checks |
 | `validate.py` | 0 | grammars: ids, names, marker names and texts, labels, sessions, placement names, env names, durations, actor, decision ids, client names, socket names and paths, cwd |
 | `ids.py` | 0 | id generation, input normalization, prefix resolution (10/21, candidates) |
-| `gateway.py` | 0 | the only boundary: subprocess (tmux, `ps`), `/proc`, `stat`/`lstat`/`mkdir`, tty writes, `pidfd` |
+| `gateway.py` | 0 | the only boundary: subprocess (tmux, `ps`), `/proc`, `stat`/`lstat`/`mkdir`, tty writes, `pidfd` (config file reads in `config.py` are the documented exception, see design.md Internal architecture) |
 | `procs.py` | 0, 4 | process start time and parent PID (Linux `/proc`, macOS `ps`), zombie detection, the `close --force` signal sequence |
 | `jsonlog.py` | 0 | `log.jsonl` (level derived from result) and `audit.jsonl` |
 | `lock.py` | 0 | per-server `flock` with 10 s wait, canonical-path hashing |
+| `statedir.py` | 0 | state directory path and safe opening of its files (no symlinks, owner and mode checks) |
 | `hooks.py` | 0 | hook execution (process group, timeout, stdin payload, env vars, decision id parsing and validation), `--hook` and `--override-escalation` handling |
-| `tmux_backend.py` | 1 | tmux argument builder (all tmux argument rules), guarded-write wrapper, version check, socket resolution and safety checks, command chains |
+| `tmux_bin.py` | 1 | `tmux_bin` resolution, the `tmux -V` version check |
+| `tmux_backend.py` | 1 | tmux argument builder (all tmux argument rules), guarded-write wrapper, command chains |
+| `tmux_socket.py` | 1 | server selection, the canonical socket path, socket safety checks |
 | `panes.py` | 1 | the single `list-panes -a` read, field sanitizing, ownership check, option validation, deduplication, in-process filters |
 | `backend.py` | 1 | the `Backend` protocol the commands use |
 | `placement.py` | 2 | placement and rule resolution, inheritance from `default`, `not_supported` |
@@ -76,7 +79,7 @@ Status: planned, 2026-10-30. Implements [interface.md](interface.md) (normative)
 **Success Criteria**: `open` creates a managed pane in the configured placement on a running or absent server, under a user config with `destroy-unattached on` and `exit-unattached on`, and the pane carries every option before the real command can exit; `--env` values reach only that pane; a cron-like caller's credentials never reach tmux; dry runs change nothing.
 **Tests**:
 
-- check order: usage → resolve (placement, cwd, `command_not_found` on the filtered or `--env` PATH, size limit 12288 bytes on the worst case) → tmux checks and id-collision check → pre-open hooks → session → pane → record → focus → post-open.
+- check order: usage (including the cwd) → resolve (placement, `command_not_found` on the filtered or `--env` PATH, size limit 12288 bytes on the worst case) → tmux checks and id-collision check → pre-open hooks → session → pane → record → focus → post-open.
 - placement: rules (first match, empty match), `--placement`, `--session`/`--target` overrides, inheritance from `default`, `not_supported` for `target: pane` and related fields.
 - session creation: exact `=S:` targets; duplicate-session race (two concurrent opens, one server, both panes created); `destroy-unattached off` chained (spike C2); `exit-unattached off` only when the re-probe found no server (spike F2); `has-session` confirmation; the vanished-session retry, never exit 10; re-run socket checks and `mkdir`/`EEXIST`/`lstat` before starting a server.
 - placeholder + respawn (spike C1, E5): options set before a fast-exiting command (`true`, `false`); keep `never|failed|always`; no leftover placeholder; `state: gone` output; `-d` always; PID recorded only when not dead and parented by the server (spike E6).

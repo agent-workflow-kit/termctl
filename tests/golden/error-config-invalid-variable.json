@@ -1,0 +1,1 @@
+{"error": {"code": "config_invalid", "message": "invalid TERMCTL_CLOSE_GRACE: not a valid duration (e.g. 10s, 500ms, 2m; at most 10m): '11m'", "details": {"variable": "TERMCTL_CLOSE_GRACE"}}}

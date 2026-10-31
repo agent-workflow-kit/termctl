@@ -1,0 +1,1 @@
+{"error": {"code": "server_unavailable", "message": "unsafe tmux socket '/tmp/tmux-1000/default': '/tmp': it is writable by group or others and not sticky", "details": {"socket_path": "/tmp/tmux-1000/default", "path": "/tmp"}}}

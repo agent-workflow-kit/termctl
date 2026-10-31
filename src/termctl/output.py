@@ -17,6 +17,7 @@ from typing import Any, TextIO
 from .errors import TermctlError, UsageError
 
 PROG = "termctl"
+HOOK_STDERR_PREFIX = "hook stderr: "
 
 _CONTROL = re.compile("[\x00-\x1f\x7f-\x9f]")
 _SURROGATE = re.compile("[\ud800-\udfff]")
@@ -58,12 +59,13 @@ def _without_surrogates(value: Any) -> Any:
     return value
 
 
-def _to_json(data: dict[str, Any]) -> str:
+def to_json(data: dict[str, Any], *, allow_nan: bool = True) -> str:
     # interface.md "Human output": JSON string encoding escapes the control characters, so
     # --json output is never escaped as human output is. ensure_ascii also escapes C1 and
     # every other non-ASCII character; it is the default, but stated so it is not lost.
-    # Lone surrogates are mapped first, so a strict parser accepts the output.
-    return json.dumps(_without_surrogates(data), ensure_ascii=True) + "\n"
+    # Lone surrogates are mapped first, so a strict parser accepts the output. With
+    # allow_nan=False a NaN or infinity raises ValueError instead of producing invalid JSON.
+    return json.dumps(_without_surrogates(data), ensure_ascii=True, allow_nan=allow_nan) + "\n"
 
 
 def _write(stream: TextIO, text: str) -> None:
@@ -106,7 +108,7 @@ class Output:
 
     def result(self, result: Result) -> None:
         if self.json:
-            _write(self.stdout, _to_json(result.data))
+            _write(self.stdout, to_json(result.data))
         elif result.human:
             _write(self.stdout, _escape_lines(result.human) + "\n")
 
@@ -117,12 +119,28 @@ class Output:
     def error(self, err: TermctlError) -> None:
         """Errors always reach stderr (even with ``--quiet``); with ``--json`` stdout first."""
         if self.json:
-            _write(self.stdout, _to_json(err.envelope()))
+            _write(self.stdout, to_json(err.envelope()))
             # Flushed now so that it precedes the message when both go to one pipe or file.
             _flush(self.stdout)
         self._stderr(err.message)
+        if err.hook_stderr and not self.json:
+            self.hook_stderr(err.hook_stderr)
         if isinstance(err, UsageError) and err.usage and not self.json:
             _write(self.stderr, _escape_lines(err.usage))
+
+    def hook_stderr(self, text: str) -> None:
+        """A hook's stderr (untrusted), after the message it belongs to: each of its lines on
+        a line of its own behind the fixed prefix ``termctl: hook stderr: ``, escaped (a CR
+        included), so no line of it can pass for one of termctl's."""
+        if not text.strip():
+            return
+        for line in text.rstrip("\n").split("\n"):
+            self._stderr(f"{HOOK_STDERR_PREFIX}{line}")
+
+    def interrupted(self, message: str) -> None:
+        """termctl was stopped by a signal (exit 128 + the signal number): a short message,
+        even with ``--quiet``, and no error object."""
+        self._stderr(message)
 
     def warn(self, message: str) -> None:
         if not self.quiet:

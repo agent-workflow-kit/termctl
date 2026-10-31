@@ -1,0 +1,1 @@
+{"error": {"code": "tmux_missing", "message": "tmux not found: no executable tmux on PATH", "details": {"tmux_bin": "tmux"}}}

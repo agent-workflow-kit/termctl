@@ -2,6 +2,7 @@ from __future__ import annotations
 
 import io
 import json
+import signal
 import subprocess
 import sys
 import tomllib
@@ -13,11 +14,16 @@ import pytest
 from termctl import __version__, cli
 from termctl.cli import Context, Result, main, parse_args
 from termctl.errors import TermctlError, UsageError
+from termctl.gateway import Terminated
 
-from .fakes import FakeClock, FakeGateway
+from .fakes import TMUX, FakeClock, FakeGateway
 from .schemas import validate
 
 GOLDEN = Path(__file__).parent / "golden"
+# A config directory that does not exist, so tests never read the user's own config.
+NO_CONFIG = {"XDG_CONFIG_HOME": str(Path(__file__).parent / "no-config")}
+# The environment of a ``Run``: no config, and a PATH on which the fake gateway finds tmux.
+ENVIRON = {**NO_CONFIG, "PATH": "/usr/bin"}
 ID = "tc-abcdefgh"
 
 # The shortest valid invocation of every command in interface.md "Commands".
@@ -52,14 +58,19 @@ GLOBAL_DEFAULTS = {"json": False, "socket": None, "config": None, "verbose": Fal
 class Run:
     """The outcome of one ``main`` call."""
 
-    def __init__(self, argv: list[str], gateway: FakeGateway | None = None) -> None:
+    def __init__(
+        self,
+        argv: list[str],
+        gateway: FakeGateway | None = None,
+        environ: dict[str, str] | None = None,
+    ) -> None:
         self.gateway = gateway or FakeGateway()
         stdout, stderr = io.StringIO(), io.StringIO()
         self.code = main(
             argv,
             gateway=self.gateway,
             clock=FakeClock(),
-            environ={},
+            environ=ENVIRON if environ is None else environ,
             stdout=stdout,
             stderr=stderr,
         )
@@ -750,6 +761,25 @@ def test_unexpected_exception_is_internal(monkeypatch: pytest.MonkeyPatch) -> No
     }
 
 
+@pytest.mark.parametrize(
+    ("stop", "code", "message"),
+    [
+        (KeyboardInterrupt(), 130, "termctl: interrupted\n"),
+        (Terminated(signal.SIGTERM), 143, "termctl: terminated by signal 15\n"),
+        (Terminated(signal.SIGHUP), 129, "termctl: terminated by signal 1\n"),
+    ],
+)
+def test_a_stop_signal_exits_128_plus_its_number_without_a_traceback(
+    monkeypatch: pytest.MonkeyPatch, stop: BaseException, code: int, message: str
+) -> None:
+    def stopped(args: Any, ctx: Context) -> Result:
+        raise stop
+
+    monkeypatch.setattr(cli, "run_command", stopped)
+    run = Run(["--json", "--quiet", "placements"])
+    assert (run.code, run.stdout, run.stderr) == (code, "", message)
+
+
 def test_quiet_suppresses_warnings_but_not_errors(monkeypatch: pytest.MonkeyPatch) -> None:
     def warn_then_fail(args: Any, ctx: Context) -> Result:
         ctx.out.warn("careful")
@@ -797,7 +827,7 @@ def test_context_carries_injected_gateway_and_clock(monkeypatch: pytest.MonkeyPa
 # --- unimplemented commands ---------------------------------------------------------------------
 
 
-@pytest.mark.parametrize("command", sorted(MINIMAL))
+@pytest.mark.parametrize("command", sorted(set(MINIMAL) - {"placements"}))
 def test_unimplemented_command_is_internal_error(command: str) -> None:
     run = Run(["--json", *MINIMAL[command]])
     assert run.code == 1
@@ -807,7 +837,8 @@ def test_unimplemented_command_is_internal_error(command: str) -> None:
         "code": "internal",
         "message": f"termctl {command} is not implemented yet",
     }
-    assert run.gateway.calls == []
+    # Only the tmux checks ran.
+    assert run.gateway.calls == [[TMUX, "-V"]]
 
 
 def test_unimplemented_command_golden() -> None:
@@ -831,7 +862,12 @@ class Broken(io.StringIO):
 
 def run_with(argv: list[str], *, stdout: io.StringIO, stderr: io.StringIO) -> int:
     return main(
-        argv, gateway=FakeGateway(), clock=FakeClock(), environ={}, stdout=stdout, stderr=stderr
+        argv,
+        gateway=FakeGateway(),
+        clock=FakeClock(),
+        environ=ENVIRON,
+        stdout=stdout,
+        stderr=stderr,
     )
 
 
