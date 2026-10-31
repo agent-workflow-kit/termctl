@@ -98,6 +98,7 @@ def test_check_tmux_probes_only_once() -> None:
     out = Output(stdout=io.StringIO(), stderr=io.StringIO())
     ctx = Context(gateway=gateway, clock=FakeClock(), environ=ENVIRON, out=out)
     args = cli.parse_args(["show", ID])
+    cli.resolve_server(args, ctx)
     cli.check_tmux(args, ctx)
     first = ctx.tmux
     cli.check_tmux(args, ctx)

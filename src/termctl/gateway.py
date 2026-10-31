@@ -13,8 +13,17 @@ import selectors
 import subprocess
 import time
 from collections.abc import Mapping
+from dataclasses import dataclass
 from datetime import UTC, datetime
 from typing import NamedTuple, Protocol
+
+
+@dataclass(frozen=True)
+class FileInfo:
+    """What termctl reads from ``lstat``: the file type and permission bits, and the owner."""
+
+    mode: int
+    uid: int
 
 
 class BoundedOutput(NamedTuple):
@@ -67,6 +76,23 @@ class Gateway(Protocol):
 
     def is_executable_file(self, path: str) -> bool:
         """Whether ``path`` is a regular file (symlinks followed) the real uid may execute."""
+        ...
+
+    def real_uid(self) -> int:
+        """The real uid of the termctl process."""
+        ...
+
+    def lstat(self, path: str) -> FileInfo:
+        """``lstat`` of ``path`` (a symlink is not followed); raises ``OSError``."""
+        ...
+
+    def real_path(self, path: str) -> str:
+        """``path`` with every symlink resolved; raises ``OSError`` if any part of it is
+        missing or cannot be resolved."""
+        ...
+
+    def read_link(self, path: str) -> str:
+        """The target of the symlink ``path``, as stored; raises ``OSError``."""
         ...
 
     def stdin_isatty(self) -> bool:
@@ -162,6 +188,19 @@ class SystemGateway:
             return os.path.isfile(path) and os.access(path, os.X_OK)
         except ValueError:  # an embedded NUL
             return False
+
+    def real_uid(self) -> int:
+        return os.getuid()
+
+    def lstat(self, path: str) -> FileInfo:
+        st = os.lstat(path)
+        return FileInfo(mode=st.st_mode, uid=st.st_uid)
+
+    def real_path(self, path: str) -> str:
+        return os.path.realpath(path, strict=True)
+
+    def read_link(self, path: str) -> str:
+        return os.readlink(path)
 
     def stdin_isatty(self) -> bool:
         return os.isatty(0)

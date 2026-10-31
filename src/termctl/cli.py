@@ -14,7 +14,7 @@ from collections.abc import Mapping, Sequence
 from dataclasses import dataclass, field
 from typing import Any, NoReturn, TextIO
 
-from . import __version__, ids, placement, tmux_bin, validate
+from . import __version__, ids, placement, tmux_bin, tmux_socket, validate
 from . import config as config_module
 from .argv import Scan, scan
 from .config import Config
@@ -35,6 +35,9 @@ class Context:
     environ: Mapping[str, str]
     out: Output = field(repr=False)
     config: Config = field(default_factory=config_module.defaults)
+    # Set by step 2 (the resolved server) and step 3 (False when there is no server).
+    server: tmux_socket.Server | None = None
+    socket_present: bool | None = None
     # `open`'s resolved placement (Open order step 2); None for other commands.
     selection: placement.Selection | None = None
     # `tmux_bin` resolved to an absolute path, once: by `open`'s resolve step or the tmux checks.
@@ -409,7 +412,7 @@ def load_config(args: argparse.Namespace, ctx: Context) -> None:
 
 def resolve_server(args: argparse.Namespace, ctx: Context) -> None:
     """Step 2: resolve the server, without side effects."""
-    # TODO: socket resolution - issue #8
+    ctx.server = tmux_socket.resolve(args.socket, ctx.config.socket, ctx.environ, ctx.gateway)
 
 
 def resolve_placement(args: argparse.Namespace, ctx: Context) -> None:
@@ -438,11 +441,27 @@ def check_tmux(args: argparse.Namespace, ctx: Context) -> None:
             ctx.out.trace,
             path=ctx.tmux_path,
         )
-    # TODO: socket safety - issue #8
+    assert ctx.server is not None
+    ctx.socket_present = tmux_socket.check(ctx.server, ctx.gateway)
+    # TODO(#14): open re-checks the socket right before connecting, creates the default
+    # directory (default form only, mode 0700), and exits 12 for an explicit path whose parent
+    # is missing.
+    # TODO(#12): list prints an empty list and exists answers without a server.
+    # TODO(#11): a refused connection on an existing socket means no server; re-run the checks
+    # before connecting.
 
 
 def resolve_id(args: argparse.Namespace, ctx: Context) -> None:
     """Step 4: resolve the id to one managed pane (exit 10 or 21)."""
+    # A missing socket or parent directory is no server; `exists` then prints its normal
+    # output with exit 10 (TODO(#12)), and a refused connection is no server too (TODO(#11)).
+    if ctx.socket_present is False and args.command != "exists":
+        assert ctx.server is not None
+        raise TermctlError(
+            "no_server",
+            f"no tmux server is running on {validate.show(ctx.server.socket_path, 200)}",
+            details={"socket_path": ctx.server.socket_path},
+        )
     # TODO: read the managed panes (issue #11) and pick one with ids.resolve - issue #12
 
 

@@ -21,14 +21,15 @@ Status: planned, 2026-10-30. Implements [interface.md](interface.md) (normative)
 | `config.py` | 0 | YAML + `config.d` merge (maps deep, hook lists appended, other lists replaced), Pydantic models, `TERMCTL_*` scalars, load-time checks |
 | `validate.py` | 0 | grammars: ids, names, marker names and texts, labels, sessions, placement names, env names, durations, actor, decision ids, client names, socket names and paths, cwd |
 | `ids.py` | 0 | id generation, input normalization, prefix resolution (10/21, candidates) |
-| `gateway.py` | 0 | the only boundary: subprocess (tmux, `ps`), `/proc`, `stat`/`lstat`/`mkdir`, tty writes, `pidfd` |
+| `gateway.py` | 0 | the only boundary: subprocess (tmux, `ps`), `/proc`, `stat`/`lstat`/`mkdir`, tty writes, `pidfd` (config file reads in `config.py` are the documented exception, see design.md Internal architecture) |
 | `procs.py` | 0, 4 | process start time and parent PID (Linux `/proc`, macOS `ps`), zombie detection, the `close --force` signal sequence |
 | `jsonlog.py` | 0 | `log.jsonl` (level derived from result) and `audit.jsonl` |
 | `lock.py` | 0 | per-server `flock` with 10 s wait, canonical-path hashing |
 | `statedir.py` | 0 | state directory path and safe opening of its files (no symlinks, owner and mode checks) |
 | `hooks.py` | 0 | hook execution (process group, timeout, stdin payload, env vars, decision id parsing and validation), `--hook` and `--override-escalation` handling |
 | `tmux_bin.py` | 1 | `tmux_bin` resolution, the `tmux -V` version check |
-| `tmux_backend.py` | 1 | tmux argument builder (all tmux argument rules), guarded-write wrapper, socket resolution and safety checks, command chains |
+| `tmux_backend.py` | 1 | tmux argument builder (all tmux argument rules), guarded-write wrapper, command chains |
+| `tmux_socket.py` | 1 | server selection, the canonical socket path, socket safety checks |
 | `panes.py` | 1 | the single `list-panes -a` read, field sanitizing, ownership check, option validation, deduplication, in-process filters |
 | `backend.py` | 1 | the `Backend` protocol the commands use |
 | `placement.py` | 2 | placement and rule resolution, inheritance from `default`, `not_supported` |
