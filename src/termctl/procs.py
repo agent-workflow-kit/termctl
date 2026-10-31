@@ -91,8 +91,8 @@ def _read_ps(gateway: Gateway, pid: int) -> Process | None:
     except (OSError, subprocess.TimeoutExpired) as exc:
         raise ProcessError(f"cannot run {PS} for process {pid}: {exc}") from None
     text = result.stdout.strip()
-    if result.returncode != 0 and not text:
-        return None  # ps found no such process
+    if result.returncode != 0 and not text and not result.stderr.strip():
+        return None  # ps found no such process (it says nothing then)
     lines = text.splitlines()
     tokens = text.split()
     if result.returncode != 0 or len(lines) != 1 or len(tokens) != 7:
@@ -104,4 +104,7 @@ def _read_ps(gateway: Gateway, pid: int) -> Process | None:
         started = datetime.strptime(lstart, _LSTART_FORMAT).replace(tzinfo=UTC)
     except ValueError:
         raise ProcessError(f"unexpected start time from {PS} for process {pid}") from None
-    return Process(ppid=int(ppid), start=str(int(started.timestamp())), zombie=stat.startswith("Z"))
+    start = str(int(started.timestamp()))
+    if not _START.fullmatch(start):  # before the epoch: outside the @termctl_pid_start grammar
+        raise ProcessError(f"unexpected start time from {PS} for process {pid}")
+    return Process(ppid=int(ppid), start=start, zombie=stat.startswith("Z"))

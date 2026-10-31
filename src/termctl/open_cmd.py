@@ -360,6 +360,7 @@ def tag(
 def record(
     backend: Backend,
     gateway: Gateway,
+    socket_path: str,
     created: Created,
     termctl_id: str,
     query: tb.ProcessQuery | None,
@@ -367,16 +368,33 @@ def record(
 ) -> bool:
     """Open order step 7: record the pane's process in ``@termctl_pid`` and
     ``@termctl_pid_start``, only if the query of step 6's invocation answered, the pane was not
-    dead, and the process is alive (not a zombie) with the tmux server as its parent, so the PID
-    cannot belong to an unrelated process (spike E6). Whether it was recorded.
+    dead, on Linux the server at ``socket_path`` is the queried server as termctl's PID
+    namespace sees it, and the process is alive (not a zombie) with the tmux server as its
+    parent, so the PID cannot belong to an unrelated process (spike E6). Whether it was
+    recorded.
 
-    Otherwise both options stay empty (``pid: null``). Nothing here undoes the open: a process
-    that cannot be read, or a recording that tmux fails, only warns. A recording guard that no
-    longer matches (the pane died, closed or changed meanwhile) records nothing, silently: the
-    read for the output reports the pane's state.
+    Otherwise both options stay empty (``pid: null``). Nothing here undoes the open: a server
+    or process that cannot be checked, or a recording that tmux fails, only warns. A server
+    that is not the queried one (another PID namespace) and a recording guard that no longer
+    matches (the pane died, closed or changed meanwhile) record nothing, silently: the read for
+    the output reports the pane's state.
     """
     if query is None or query.dead:
         return False
+    if gateway.platform() != "darwin":
+        # #{pid} and #{pane_pid} are in the server's PID namespace, /proc in termctl's: the
+        # server's PID as the kernel shows it to termctl must be #{pid} (macOS has no PID
+        # namespaces). TODO(#23): close --force repeats this check before signaling.
+        try:
+            peer = gateway.socket_peer_pid(socket_path)
+        except OSError as err:
+            warn(
+                f"could not check the server of pane {created.pane_id}: "
+                f"{err.strerror or err}; its PID is not recorded"
+            )
+            return False
+        if peer != query.server_pid:
+            return False
     try:
         process = procs.read(gateway, query.pane_pid)
     except procs.ProcessError as err:

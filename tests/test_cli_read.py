@@ -5,6 +5,7 @@ Real-tmux end-to-end tests are in test_cli_read_integration.py."""
 from __future__ import annotations
 
 import json
+import os
 from collections.abc import Mapping, Sequence
 from pathlib import Path
 from typing import Any
@@ -388,6 +389,7 @@ def test_tmux_runs_with_the_filtered_environment() -> None:
         "LANG": "C.UTF-8",
         "LC_CTYPE": "C.UTF-8",
         "HOME": "/h",
+        "XDG_STATE_HOME": os.environ["XDG_STATE_HOME"],  # the test's private one (conftest)
     }
 
 

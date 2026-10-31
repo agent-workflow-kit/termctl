@@ -169,6 +169,10 @@ def test_macos_missing_process_is_none(result: subprocess.CompletedProcess[str])
         completed("77 S Vendredi Oct 30 23:25:20 2026\n"),
         completed("77 S Fri Oct 30 23:25:20 2026\n78 S Fri Oct 30 23:25:20 2026\n"),
         completed(""),
+        # ps failed rather than finding no such process (review round 1, R1-2).
+        completed("", stderr="ps: cannot read the process table\n", returncode=1),
+        # A start time before the epoch is outside the @termctl_pid_start grammar (R1-3).
+        completed("77 S Wed Dec 31 23:59:59 1969\n"),
         subprocess.TimeoutExpired(list(PS), 10),
         FileNotFoundError(errno.ENOENT, "No such file or directory", "/bin/ps"),
     ],

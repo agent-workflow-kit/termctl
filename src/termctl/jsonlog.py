@@ -15,8 +15,9 @@ failure to write raises ``StateDirError``; what a command does about it is the c
 decision.
 """
 
-# open's tag_failed record (cli._log_open_error) is the first caller: a write failure only
-# warns, since the action has already happened, and the exit code stays the command's.
+# open's tag_failed record (cli._log_open_error) is the first caller. interface.md "Audit and
+# log" ("Records"): a record that cannot be written produces a warning and does not change the
+# exit code.
 # TODO(#17): open's other records follow that rule, and #19-#24 too. Each command builds its
 # record with the builders below and appends it with the CLI context's environ and clock.
 

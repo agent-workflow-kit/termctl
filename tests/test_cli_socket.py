@@ -13,6 +13,7 @@ import pytest
 from termctl import cli
 from termctl.cli import Context, Result, main
 
+from .conftest import private_environ
 from .fakes import TMUX, UID, FakeClock, FakeGateway, directory, safe_default_server, socket_file
 from .schemas import validate
 
@@ -46,7 +47,7 @@ def run(
         ["--json", *argv],
         gateway=gateway,
         clock=FakeClock(),
-        environ={**ENVIRON, **(environ or {})},
+        environ=private_environ({**ENVIRON, **(environ or {})}),
         stdout=stdout,
         stderr=stderr,
     )

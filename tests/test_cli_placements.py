@@ -12,6 +12,7 @@ import yaml
 
 from termctl.cli import main
 
+from .conftest import private_environ
 from .fakes import FakeClock, FakeGateway
 from .schemas import validate
 
@@ -52,7 +53,7 @@ class Run:
             argv,
             gateway=self.gateway,
             clock=FakeClock(),
-            environ=environ,
+            environ=private_environ(environ),
             stdout=stdout,
             stderr=stderr,
         )

@@ -14,6 +14,7 @@ from termctl import __version__, cli
 from termctl.cli import Context, Result, main, parse_args
 from termctl.errors import TermctlError, UsageError
 
+from .conftest import private_environ
 from .fakes import TMUX, FakeClock, FakeGateway, is_list_panes, pane_row
 from .schemas import validate
 
@@ -68,7 +69,7 @@ class Run:
             argv,
             gateway=self.gateway,
             clock=FakeClock(),
-            environ=ENVIRON if environ is None else environ,
+            environ=private_environ(ENVIRON if environ is None else environ),
             stdout=stdout,
             stderr=stderr,
         )
@@ -879,7 +880,7 @@ def run_with(argv: list[str], *, stdout: io.StringIO, stderr: io.StringIO) -> in
         argv,
         gateway=FakeGateway(),
         clock=FakeClock(),
-        environ=ENVIRON,
+        environ=private_environ(ENVIRON),
         stdout=stdout,
         stderr=stderr,
     )
@@ -1142,6 +1143,8 @@ def test_standard_streams_use_backslashreplace(monkeypatch: pytest.MonkeyPatch) 
     stdout, stderr = strict_stream(), strict_stream()
     monkeypatch.setattr(sys, "stdout", stdout)
     monkeypatch.setattr(sys, "stderr", stderr)
-    code = main(["placements"], gateway=FakeGateway(), clock=FakeClock(), environ={})
+    code = main(
+        ["placements"], gateway=FakeGateway(), clock=FakeClock(), environ=private_environ({})
+    )
     assert code == 0
     assert stdout.buffer.getvalue() == b"\\xe9\n"  # type: ignore[attr-defined]

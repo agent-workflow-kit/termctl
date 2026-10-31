@@ -477,7 +477,7 @@ def check_tmux(args: argparse.Namespace, ctx: Context) -> None:
     """Step 3: tmux binary, version and socket safety checks (exit 12)."""
     if ctx.tmux is None:
         resolve_tmux_bin(ctx)
-        # TODO(#5): a version warning also gets a `warning` log record in logged commands.
+        # TODO(#17): a version warning also gets a `warning` log record in logged commands.
         ctx.tmux = tmux_bin.probe(
             ctx.config.tmux_bin,
             ctx.environ,
@@ -555,7 +555,7 @@ def read_panes(ctx: Context) -> PaneRead:
         else:
             ctx.pane_read = backend.read_panes()
         for warning in ctx.pane_read.warnings:
-            # TODO(#5): logged commands also write each warning as a `warning` log record.
+            # TODO(#17): logged commands also write each warning as a `warning` log record.
             ctx.out.warn(warning)
     return ctx.pane_read
 
@@ -646,7 +646,9 @@ def open_pane(args: argparse.Namespace, ctx: Context) -> Result:
         # tag_failed: the guarded cleanup ran in open_cmd.tag; no post-open hook runs.
         _log_open_error(args, ctx, err)
         raise
-    open_cmd.record(backend, ctx.gateway, created, ctx.open_id, query, ctx.out.warn)
+    open_cmd.record(
+        backend, ctx.gateway, ctx.server.socket_path, created, ctx.open_id, query, ctx.out.warn
+    )
     # TODO(#24): step 8, --focus;
     # TODO(#17): post-open hooks, the log record of every other outcome and the final output.
     return _opened(args, ctx, backend, created, created_at)
@@ -654,9 +656,15 @@ def open_pane(args: argparse.Namespace, ctx: Context) -> Result:
 
 def _log_open_error(args: argparse.Namespace, ctx: Context, err: TermctlError) -> None:
     """The ``log.jsonl`` record of an ``open`` that failed after its id was generated
-    (``result: error``; interface.md "Audit and log"). The open has already failed, so a log
-    that cannot be written only warns: the exit code stays the error's.
-    TODO(#17): the ids pre-open hooks returned follow the --decision-id values."""
+    (``result: error``; interface.md "Audit and log"). A record that cannot be written only
+    warns: the exit code stays the error's ("Records").
+    TODO(#17): the ids pre-open hooks returned follow the --decision-id values.
+    TODO(#17): resolve the actor once per run in shared context and reuse it here (warn once,
+    for the gate, audit and success records too); audit records for `--override-escalation`
+    runs must cover this tag_failed path (none is written yet).
+    TODO(#17): open-path warnings (the PID warnings of open_cmd.record, the unmanaged-window
+    warning of open_cmd.tag's cleanup, the `human:unknown` actor warning) also need their own
+    `event: warning` log records."""
     actor, warning = validate.resolve_actor(args.actor, ctx.gateway)
     if warning is not None:
         ctx.out.warn(warning)

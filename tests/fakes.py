@@ -147,6 +147,7 @@ class FakeGateway:
         mkdir_error: OSError | None = None,
         system: str = "linux",
         proc_stats: Mapping[int, str | None | BaseException] | None = None,
+        peer_pids: Mapping[str, int | BaseException] | None = None,
     ) -> None:
         # ``platform`` answers ``system``; ``read_proc_stat`` answers from ``proc_stats``
         # (text, None for no such process, or an exception to raise), and an unscripted PID
@@ -154,6 +155,10 @@ class FakeGateway:
         self.system = system
         self.proc_stats: dict[int, str | None | BaseException] = dict(proc_stats or {})
         self.proc_reads: list[int] = []
+        # ``socket_peer_pid`` answers from ``peer_pids`` (socket path to the peer's PID, or an
+        # exception to raise); an unscripted path fails the test.
+        self.peer_pids: dict[str, int | BaseException] = dict(peer_pids or {})
+        self.peer_checks: list[str] = []
         self.panes = None if panes is None else [dict(row) for row in panes]
         self.list_panes = list_panes
         self.responses: dict[tuple[str, ...], Response] = {
@@ -295,6 +300,15 @@ class FakeGateway:
         if pid not in self.proc_stats:
             raise AssertionError(f"unexpected /proc read: {pid}")
         answer = self.proc_stats[pid]
+        if isinstance(answer, BaseException):
+            raise answer
+        return answer
+
+    def socket_peer_pid(self, path: str) -> int:
+        self.peer_checks.append(path)
+        if path not in self.peer_pids:
+            raise AssertionError(f"unexpected socket peer check: {path}")
+        answer = self.peer_pids[path]
         if isinstance(answer, BaseException):
             raise answer
         return answer

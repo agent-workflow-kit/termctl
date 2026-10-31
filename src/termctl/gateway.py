@@ -10,6 +10,8 @@ from __future__ import annotations
 import os
 import pwd
 import selectors
+import socket
+import struct
 import subprocess
 import sys
 import time
@@ -17,6 +19,9 @@ from collections.abc import Mapping
 from dataclasses import dataclass
 from datetime import UTC, datetime
 from typing import NamedTuple, Protocol
+
+# How long connecting to a Unix socket may block (a listener with a full backlog).
+SOCKET_TIMEOUT = 10.0
 
 
 class BoundedOutput(NamedTuple):
@@ -117,6 +122,12 @@ class Gateway(Protocol):
         """The contents of ``/proc/<pid>/stat`` (Linux and WSL), decoded as UTF-8 with
         surrogateescape, or None when no such process exists (the file is missing, or the
         process went away while reading it). Raises ``OSError`` for any other failure."""
+        ...
+
+    def socket_peer_pid(self, path: str) -> int:
+        """Linux: connect to the Unix socket ``path`` and return the listener's PID from
+        ``SO_PEERCRED``, as the kernel translates it into termctl's PID namespace (0 when the
+        listener is not visible there). Sends nothing. Raises ``OSError`` if it cannot."""
         ...
 
 
@@ -246,6 +257,14 @@ class SystemGateway:
                 return stat_file.read().decode("utf-8", "surrogateescape")
         except (FileNotFoundError, ProcessLookupError):
             return None
+
+    def socket_peer_pid(self, path: str) -> int:
+        with socket.socket(socket.AF_UNIX, socket.SOCK_STREAM) as sock:
+            sock.settimeout(SOCKET_TIMEOUT)
+            sock.connect(path)
+            creds = sock.getsockopt(socket.SOL_SOCKET, socket.SO_PEERCRED, struct.calcsize("3i"))
+        pid, _uid, _gid = struct.unpack("3i", creds)
+        return pid
 
 
 def _kill(proc: subprocess.Popen[bytes]) -> None:

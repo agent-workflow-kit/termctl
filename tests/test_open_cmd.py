@@ -3,6 +3,7 @@
 
 from __future__ import annotations
 
+import errno
 import subprocess
 from collections.abc import Callable, Mapping
 from datetime import UTC, datetime, timedelta, timezone
@@ -536,18 +537,23 @@ def record(
 ) -> bool:
     backend = TmuxBackend(Tmux(gateway, TMUX, SOCK, env={}))
     return open_cmd.record(
-        backend, gateway, PANE, ID, query, (warnings if warnings is not None else []).append
+        backend, gateway, SOCK, PANE, ID, query, (warnings if warnings is not None else []).append
     )
 
 
 RUNNING = tb.ProcessQuery(4242, False, 77)
+# The server termctl reaches through the socket is the queried server (SO_PEERCRED).
+SERVER_PEER = {SOCK: 77}
 
 
 def test_a_running_child_of_the_server_is_recorded() -> None:
     # Spike E6: not dead, and its parent is the server, so the PID is the pane's process.
-    gateway = FakeGateway({RECORD: completed()}, proc_stats={4242: proc_stat()})
+    gateway = FakeGateway(
+        {RECORD: completed()}, proc_stats={4242: proc_stat()}, peer_pids=SERVER_PEER
+    )
     warnings: list[str] = []
     assert record(gateway, RUNNING, warnings) is True
+    assert gateway.peer_checks == [SOCK]
     assert gateway.proc_reads == [4242]
     assert gateway.calls == [list(RECORD)]
     assert warnings == []
@@ -569,7 +575,7 @@ def test_a_running_child_of_the_server_is_recorded() -> None:
 def test_nothing_is_recorded_unless_provably_the_servers_live_child(
     query: tb.ProcessQuery | None, stat: str | None
 ) -> None:
-    gateway = FakeGateway(proc_stats={4242: stat})
+    gateway = FakeGateway(proc_stats={4242: stat}, peer_pids=SERVER_PEER)
     warnings: list[str] = []
     assert record(gateway, query, warnings) is False
     assert gateway.calls == []
@@ -582,7 +588,7 @@ def test_nothing_is_recorded_unless_provably_the_servers_live_child(
     "stat", [PermissionError(13, "Permission denied"), "4242 (tool) S x\n"], ids=["eacces", "bad"]
 )
 def test_a_process_that_cannot_be_read_warns_and_records_nothing(stat: object) -> None:
-    gateway = FakeGateway(proc_stats={4242: stat})  # type: ignore[dict-item]
+    gateway = FakeGateway(proc_stats={4242: stat}, peer_pids=SERVER_PEER)  # type: ignore[dict-item]
     warnings: list[str] = []
     assert record(gateway, RUNNING, warnings) is False
     assert gateway.calls == []
@@ -591,7 +597,7 @@ def test_a_process_that_cannot_be_read_warns_and_records_nothing(stat: object) -
 
 def test_a_recording_whose_guard_no_longer_matches_is_silent() -> None:
     # The pane died, closed or changed between the query and the recording.
-    gateway = FakeGateway({RECORD: NOMATCH}, proc_stats={4242: proc_stat()})
+    gateway = FakeGateway({RECORD: NOMATCH}, proc_stats={4242: proc_stat()}, peer_pids=SERVER_PEER)
     warnings: list[str] = []
     assert record(gateway, RUNNING, warnings) is False
     assert warnings == []
@@ -603,7 +609,11 @@ def test_a_recording_whose_guard_no_longer_matches_is_silent() -> None:
     ids=["failed", "timeout"],
 )
 def test_a_failed_recording_warns_and_never_raises(result: object) -> None:
-    gateway = FakeGateway({RECORD: result}, proc_stats={4242: proc_stat()})  # type: ignore[dict-item]
+    gateway = FakeGateway(
+        {RECORD: result},  # type: ignore[dict-item]
+        proc_stats={4242: proc_stat()},
+        peer_pids=SERVER_PEER,
+    )
     warnings: list[str] = []
     assert record(gateway, RUNNING, warnings) is False
     assert len(warnings) == 1 and "%5" in warnings[0]
@@ -618,7 +628,30 @@ def test_macos_reads_the_parent_with_ps() -> None:
         system="darwin",
     )
     assert record(gateway, RUNNING) is True
+    assert gateway.peer_checks == []  # macOS has no PID namespaces
     assert gateway.calls == [list(ps), list(recorded)]
+
+
+# Review round 1 of #16, R1-8: #{pid} and #{pane_pid} are in the server's PID namespace, /proc
+# in termctl's; the server reached through the socket must be the queried one.
+@pytest.mark.parametrize("peer", [78, 0], ids=["other-server", "not-visible"])
+def test_a_server_in_another_pid_namespace_records_nothing(peer: int) -> None:
+    gateway = FakeGateway(proc_stats={4242: proc_stat()}, peer_pids={SOCK: peer})
+    warnings: list[str] = []
+    assert record(gateway, RUNNING, warnings) is False
+    assert gateway.proc_reads == []
+    assert gateway.calls == []
+    assert warnings == []
+
+
+def test_a_server_check_that_cannot_be_made_warns_and_records_nothing() -> None:
+    refused = ConnectionRefusedError(errno.ECONNREFUSED, "Connection refused")
+    gateway = FakeGateway(proc_stats={4242: proc_stat()}, peer_pids={SOCK: refused})
+    warnings: list[str] = []
+    assert record(gateway, RUNNING, warnings) is False
+    assert gateway.proc_reads == []
+    assert gateway.calls == []
+    assert len(warnings) == 1 and "%5" in warnings[0]
 
 
 # --- step 5: server and session -----------------------------------------------------------------

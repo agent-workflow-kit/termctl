@@ -4,6 +4,7 @@
 from __future__ import annotations
 
 import json
+import os
 from collections.abc import Mapping
 from pathlib import Path
 from typing import Any
@@ -462,7 +463,9 @@ def test_every_tmux_call_gets_the_filtered_environment() -> None:
     secrets = {"AWS_SECRET_ACCESS_KEY": "k", "SSH_AUTH_SOCK": "/s", "TMUX_PANE": "%1",
                "GITHUB_TOKEN": "t", "LANG": "C.UTF-8", "HOME": "/home/u"}  # fmt: skip
     assert run(["--", "true"], gateway, secrets).code == 0
-    expected = {**FILTERED, "LANG": "C.UTF-8", "HOME": "/home/u"}
+    # XDG_* is allowed by default: the test's private XDG_STATE_HOME (conftest) reaches tmux.
+    state_home = os.environ["XDG_STATE_HOME"]
+    expected = {**FILTERED, "LANG": "C.UTF-8", "HOME": "/home/u", "XDG_STATE_HOME": state_home}
     assert gateway.envs == [expected] * len(gateway.calls)
 
 
@@ -622,6 +625,7 @@ def test_open_records_the_servers_child_and_reports_its_pid() -> None:
     gateway = existing_session_flow(plan, completed("4242 0 77\n"), after=[new_row(**RECORDED)])
     gateway.responses[RECORD] = completed()
     gateway.proc_stats[4242] = proc_stat()
+    gateway.peer_pids[SOCK] = 77
     result = run(["--", "true"], gateway)
     assert result.code == 0, result.stderr
     out = result.json()
@@ -645,6 +649,7 @@ def test_open_records_no_pid_unless_provably_the_servers_live_child(
 ) -> None:
     gateway = existing_session_flow(make_plan(), completed(query))
     gateway.proc_stats[4242] = stat
+    gateway.peer_pids[SOCK] = 77
     result = run(["--", "true"], gateway)
     assert result.code == 0, result.stderr
     assert result.json()["pid"] is None
@@ -667,6 +672,7 @@ def test_a_failed_recording_does_not_undo_the_open() -> None:
     gateway = existing_session_flow(make_plan(), completed("4242 0 77\n"))
     gateway.responses[RECORD] = completed(stderr="boom\n", returncode=1)
     gateway.proc_stats[4242] = proc_stat()
+    gateway.peer_pids[SOCK] = 77
     result = run(["--", "true"], gateway)
     assert result.code == 0, result.stderr
     assert (result.json()["state"], result.json()["pid"]) == ("running", None)
@@ -725,6 +731,17 @@ def test_tag_failed_logs_the_default_actor(tmp_path: Path) -> None:
     result = run(["--", "true"], gateway, {"XDG_STATE_HOME": str(tmp_path)})
     error(result, "tag_failed", 12)
     assert log_lines(tmp_path)[0]["actor"] == "human:user"
+
+
+@pytest.mark.usefixtures("fixed_id")
+def test_tag_failed_logs_an_escalation_override(tmp_path: Path) -> None:
+    gateway = existing_session_flow(make_plan(), completed("termctl-nomatch\n"))
+    gateway.tty = True
+    argv = ["--actor", "human:x", "--override-escalation", "--", "true"]
+    error(run(argv, gateway, {"XDG_STATE_HOME": str(tmp_path)}), "tag_failed", 12)
+    [record] = log_lines(tmp_path)
+    validate(record, "termctl/log.json")
+    assert (record["actor"], record["escalation_override"]) == ("human:x", True)
 
 
 @pytest.mark.usefixtures("fixed_id")
