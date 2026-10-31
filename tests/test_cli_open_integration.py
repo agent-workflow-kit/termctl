@@ -566,3 +566,26 @@ def test_dry_run_starts_no_server(tmux_server: TmuxServer) -> None:
     assert out["session_exists"] is None
     assert out["tmux_commands"][0][3:5] == ["set", "-s"]
     assert not os.path.exists(tmux_server.socket_path)
+
+
+def test_dry_run_creates_no_default_directory(tmux_server: TmuxServer) -> None:
+    # A socket in default directory form whose directory does not exist yet: a real run would
+    # create the directory (Open order step 5), a dry run must not.
+    tmpdir = tmux_server.root / "t"
+    tmpdir.mkdir()
+    tmpdir.chmod(0o700)  # whatever the umask: the socket checks refuse a group-writable one
+    default_dir = tmpdir / f"tmux-{os.getuid()}"
+    socket_path = str(default_dir / "default")
+    stdout, stderr = io.StringIO(), io.StringIO()
+    code = main(
+        ["--socket", socket_path, "--json", "open", "--dry-run", "--", "true"],
+        environ={**tmux_server.env, "XDG_CONFIG_HOME": NO_CONFIG, "TMUX_TMPDIR": str(tmpdir)},
+        stdout=stdout,
+        stderr=stderr,
+    )
+    assert code == 0, stdout.getvalue() + stderr.getvalue()
+    out = json.loads(stdout.getvalue())
+    validate(out, "termctl/cli/open-dry-run.json")
+    assert out["socket_path"] == socket_path
+    assert out["session_exists"] is None
+    assert not default_dir.exists()

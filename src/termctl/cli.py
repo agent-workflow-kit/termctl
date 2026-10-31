@@ -42,7 +42,7 @@ from .gateway import (
     Terminated,
     stop_signals,
 )
-from .output import PROG, Output, Result, flush_standard_streams
+from .output import PROG, Output, Result, escape, flush_standard_streams
 from .panes import ManagedPane, PaneRead
 from .statedir import StateDirError
 from .tmux_backend import Tmux, WindowSpec
@@ -773,7 +773,10 @@ def _dry_run_open(args: argparse.Namespace, ctx: Context) -> Result:
         "override_escalation": bool(args.override_escalation),
         "tmux_commands": commands,
     }
-    return Result(data, "\n".join(shlex.join(argv) for argv in commands))
+    # One line per command: each is escaped as a whole, so a line break inside an argument
+    # (a filtered environment value in set-environment) prints as \x0a (interface.md "Human
+    # output").
+    return Result(data, "\n".join(escape(shlex.join(argv)) for argv in commands))
 
 
 def resolve_actor(args: argparse.Namespace, ctx: Context) -> str:

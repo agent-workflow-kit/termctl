@@ -241,6 +241,19 @@ def test_human_output_escapes_control_characters() -> None:
     assert len(result.stdout.splitlines()) == 2
 
 
+def test_human_output_keeps_one_line_per_command_with_a_newline_in_a_value() -> None:
+    # The no-session path passes the caller's filtered environment to set-environment; a raw
+    # line break in a value must not split its command across two lines.
+    gateway = FakeGateway({HAS: MISSING}, panes=[], executables=TRUE)
+    environ = {**ENVIRON, "LANG": "x\ny"}
+    result = Run(["open", "--dry-run", "--env", "LANG=hidden"], gateway, environ=environ)
+    assert result.code == 0, result.stderr
+    lines = result.stdout.splitlines()
+    assert len(lines) == 2
+    assert "new-session" in lines[0] and "set-environment" in lines[0]
+    assert "x\\x0ay" in lines[0]
+
+
 # --- tokens and --env values --------------------------------------------------------------------
 
 
