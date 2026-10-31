@@ -11,7 +11,7 @@ import io
 import os
 import signal
 import sys
-from collections.abc import Mapping, Sequence
+from collections.abc import Callable, Mapping, Sequence
 from dataclasses import dataclass, field
 from typing import Any, NoReturn, TextIO
 
@@ -43,7 +43,7 @@ from .gateway import (
     stop_signals,
 )
 from .output import PROG, Output, Result, flush_standard_streams
-from .pane_change import Change, change_pane
+from .pane_change import Change, Outcome, change_pane
 from .panes import ManagedPane, PaneRead
 from .statedir import StateDirError
 from .tmux_backend import Tmux, WindowSpec
@@ -96,8 +96,8 @@ class Context:
     audited: bool = False
     # A logged ``open``: its stop-signal handling (``gateway.stop_signals``).
     signals: RunSignals | None = None
-    # A pane change (``rename``) that changed nothing: no log record (interface.md "Audit and
-    # log").
+    # A pane change (``rename``, the label commands) that changed nothing: no log record
+    # (interface.md "Audit and log").
     no_op: bool = False
 
     def socket_path(self) -> str | None:
@@ -978,18 +978,12 @@ def _change_backend(ctx: Context) -> Backend:
     return backend
 
 
-def rename(args: argparse.Namespace, ctx: Context) -> Result:
-    """Set ``@termctl_name`` and recompute the displayed name, keeping a set marker; the
-    window is renamed only while termctl may (interface.md `rename`, "Names")."""
-    if args.dry_run:
-        # TODO(#22): rename --dry-run prints the pane as it would be (interface.md "Dry runs").
-        raise TermctlError("internal", f"{PROG} rename --dry-run is not implemented yet")
+def _apply_change(
+    ctx: Context, plan: Callable[[ManagedPane], Change]
+) -> tuple[dict[str, Any], Outcome]:
+    """Apply ``plan`` to the resolved pane under the lock; a change that changes nothing is a
+    no-op. Returns the pane-change ``--json`` object and the outcome."""
     assert ctx.pane is not None and ctx.tmux is not None
-
-    def plan(pane: ManagedPane) -> Change:
-        shown = display.displayed_name(args.name, pane.marker_text, ctx.config.marker_display)
-        return Change(options={"@termctl_name": args.name}, display_name=shown)
-
     outcome = change_pane(
         _change_backend(ctx),
         ctx.pane.id,
@@ -1007,7 +1001,49 @@ def rename(args: argparse.Namespace, ctx: Context) -> Result:
         "display_updated": outcome.display_updated,
         "dry_run": False,
     }
+    return data, outcome
+
+
+def rename(args: argparse.Namespace, ctx: Context) -> Result:
+    """Set ``@termctl_name`` and recompute the displayed name, keeping a set marker; the
+    window is renamed only while termctl may (interface.md `rename`, "Names")."""
+    if args.dry_run:
+        # TODO(#22): rename --dry-run prints the pane as it would be (interface.md "Dry runs").
+        raise TermctlError("internal", f"{PROG} rename --dry-run is not implemented yet")
+
+    def plan(pane: ManagedPane) -> Change:
+        shown = display.displayed_name(args.name, pane.marker_text, ctx.config.marker_display)
+        return Change(options={"@termctl_name": args.name}, display_name=shown)
+
+    data, outcome = _apply_change(ctx, plan)
     return Result(data, outcome.pane.display_name)
+
+
+def label_change(args: argparse.Namespace, ctx: Context) -> Result:
+    """``label add`` and ``label remove``: the pane's labels are a set of pairs, so adding a
+    present pair or removing an absent one changes nothing; they are written in canonical
+    form (sorted by code point, unique, single spaces) and the window is never renamed
+    (interface.md `label add` / `label remove`, "Labels")."""
+    if args.dry_run:
+        # TODO(#22): label --dry-run prints the pane as it would be (interface.md "Dry runs").
+        raise TermctlError("internal", f"{PROG} {args.command} --dry-run is not implemented yet")
+    pairs = set(validate.parse_labels(args.pairs))
+    adding = args.command == "label add"
+
+    def plan(pane: ManagedPane) -> Change:
+        current = set(pane.labels)
+        labels = sorted(current | pairs if adding else current - pairs)
+        # The limit applies to the labels read under the lock, after id resolution, so the
+        # failure is logged; a removal never grows the set.
+        if len(labels) > validate.MAX_LABELS:
+            raise UsageError(
+                f"managed pane {pane.id} would carry {len(labels)} labels "
+                f"(at most {validate.MAX_LABELS})"
+            )
+        return Change(options={"@termctl_labels": " ".join(labels)}, display_name=None)
+
+    data, outcome = _apply_change(ctx, plan)
+    return Result(data, " ".join(outcome.pane.labels))
 
 
 COMMAND_STEPS = {
@@ -1016,6 +1052,8 @@ COMMAND_STEPS = {
     "list": list_panes,
     "open": open_pane,
     "rename": rename,
+    "label add": label_change,
+    "label remove": label_change,
 }
 
 
@@ -1089,8 +1127,12 @@ def _logged_open(args: argparse.Namespace, ctx: Context) -> Result:
 
 
 # The pane-change commands, by their log.jsonl event (interface.md "Audit and log").
-# TODO(#20): mark, unmark; TODO(#21): label_add, label_remove.
-CHANGE_EVENTS = {"rename": "rename"}
+# TODO(#20): mark, unmark.
+CHANGE_EVENTS = {
+    "rename": "rename",
+    "label add": "label_add",
+    "label remove": "label_remove",
+}
 
 
 def _logged_change(args: argparse.Namespace, ctx: Context) -> Result:
