@@ -64,6 +64,7 @@ Terminal placement, tmux backend. Layer 1 (primitive), fully standalone (archite
 | Module | Responsibility |
 |---|---|
 | `cli.py` | argparse, global flags, output and error rendering, exit codes |
+| `errors.py` | error codes, their exit codes and the `{"error": {...}}` envelope; separate from `cli.py` so every module can raise them without importing the CLI |
 | `config.py` | Pydantic models, file and drop-in merge, `TERMCTL_*` scalars, validation |
 | `ids.py` | id generation and prefix resolution |
 | `validate.py` | name, label, marker, session, env-name and duration grammars |
@@ -72,7 +73,7 @@ Terminal placement, tmux backend. Layer 1 (primitive), fully standalone (archite
 | `tmux_backend.py` | the tmux argument builder ([tmux argument rules](interface.md#tmux-argument-rules)), guarded writes (`if-shell` wrapping, D28), format strings, command chains, version check, server env filtering, socket path resolution and socket directory checks (D26) |
 | `panes.py` | the pane reader: parses `list-panes -a -F` records, applies the ownership check and validates every `@termctl_*` value (D27) |
 | `procs.py` | process start time and parent check for the recorded PID, the `close --force` signal sequence |
-| `gateway.py` | the only module that runs subprocesses or touches the filesystem outside config and logs (tmux, `ps`, `/proc`, socket `stat`, BEL write) |
+| `gateway.py` | the only module that runs subprocesses or touches the filesystem outside config and logs (tmux, `ps`, `/proc`, socket `stat`, BEL write); also holds the injectable clock |
 | `hooks.py` | hook execution per the design guide |
 | `jsonlog.py` | `log.jsonl` and `audit.jsonl` |
 | `lock.py` | per-server `flock` (D20) |
@@ -187,6 +188,7 @@ Run on 2026-10-30 against tmux 3.5a and 3.2a, each on a private `-S` socket with
 ## Dependencies
 
 - Runtime: Python 3.12+, `pyyaml` (config), `pydantic` (config validation); tmux 3.2+ at run time.
+- Test-only: `jsonschema` and `referencing`, to validate golden `--json` outputs, hook payloads and log records against `schemas/` (resolved by `$id`).
 - No awkit tool dependencies.
 
 ## Testing

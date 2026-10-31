@@ -17,6 +17,7 @@ Status: planned, 2026-10-30. Implements [interface.md](interface.md) (normative)
 | Module | Stage | Responsibility |
 |---|---|---|
 | `cli.py` | 0 | argparse surface (global flags before or after the subcommand), dispatch, human and `--json` output, error envelopes, exit codes, check order |
+| `errors.py` | 0 | error codes, the exit code table and the error envelope |
 | `config.py` | 0 | YAML + `config.d` merge (maps deep, hook lists appended, other lists replaced), Pydantic models, `TERMCTL_*` scalars, load-time checks |
 | `validate.py` | 0 | grammars: ids, names, marker names and texts, labels, sessions, placement names, env names, durations, actor, decision ids, client names, socket names and paths, cwd |
 | `ids.py` | 0 | id generation, input normalization, prefix resolution (10/21, candidates) |
@@ -49,7 +50,7 @@ Status: planned, 2026-10-30. Implements [interface.md](interface.md) (normative)
 - hooks: order, veto stops later hooks (11), escalation lets later hooks run (13), timeout counts as veto, process-group kill on timeout, payload on stdin, `TERMCTL_HOOK`/`TERMCTL_ID`/`TERMCTL_OBJECT_TYPE`, decision ids from stdout validated (bad ones dropped with a warning), `--hook` name and timeout rules, `--override-escalation` gate (TTY or `--actor human:*`) and exit-13-as-allow.
 - `placements --label`: rule matching, `origin` values.
 
-**Status**: Not Started
+**Status**: In Progress
 
 ## Stage 1: tmux core and the read path (0.1)
 
