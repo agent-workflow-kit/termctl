@@ -1,0 +1,1 @@
+{"error": {"code": "usage", "message": "invalid --hook name 'pre-open': close takes pre-close or post-close"}}

@@ -68,6 +68,9 @@ ENV_KEYS = ("socket", "tmux_bin", "backend", "keep_on_exit", "close_grace", "mar
 
 PRE_HOOKS = ("pre-open", "pre-close")
 
+DEFAULT_HOOK_TIMEOUT_S = 30
+MAX_HOOK_TIMEOUT_S = 600
+
 
 class ConfigError(TermctlError):
     """Invalid config (exit 2, ``config_invalid``); ``details`` names the key, variable or file."""
@@ -121,7 +124,21 @@ def _integral(value: Any) -> Any:
 
 
 NonEmpty = Annotated[str, Field(min_length=1)]
+
+
+def _no_nul(value: str) -> str:
+    # A command line cannot hold a NUL, so such a hook could never be started.
+    if "\x00" in value:
+        raise ValueError("must not contain a NUL character")
+    return value
+
+
+HookCmd = Annotated[str, Field(min_length=1), AfterValidator(_no_nul)]
 PositiveInt = Annotated[int, BeforeValidator(_integral), Field(ge=1)]
+# A hook timeout in whole seconds (interface.md "Hooks"): at most 10 minutes, like every other
+# duration termctl accepts, which leaves room for a gate with agent checks (design guide
+# section 8 gives such a gate 600 s).
+HookTimeout = Annotated[int, BeforeValidator(_integral), Field(ge=1, le=MAX_HOOK_TIMEOUT_S)]
 Socket = Annotated[str, _problem(_config_socket_problem, "socket")]
 Duration = Annotated[str, _grammar(_is_duration, "duration (e.g. 10s, 500ms, 2m; at most 10m)")]
 MarkerName = Annotated[str, _grammar(validate.is_marker_name, "marker name")]
@@ -173,10 +190,8 @@ class Rule(_Model):
 
 
 class PreHook(_Model):
-    cmd: NonEmpty
-    # TODO(#6): bound hook timeout (schema allows arbitrarily large ints; clamp or add a schema
-    # maximum).
-    timeout: PositiveInt = 30
+    cmd: HookCmd
+    timeout: HookTimeout = DEFAULT_HOOK_TIMEOUT_S
 
 
 class PostHook(PreHook):
@@ -232,20 +247,33 @@ def config_path(environ: Mapping[str, str], explicit: str | None) -> Path:
     entry's home, which must be absolute)."""
     if explicit is not None:
         return Path(explicit)
-    xdg = environ.get("XDG_CONFIG_HOME", "")
-    if xdg and os.path.isabs(xdg):
-        base = Path(xdg)
-    else:
-        home = environ.get("HOME", "")
-        if not os.path.isabs(home):
-            try:
-                home = pwd.getpwuid(os.getuid()).pw_dir
-            except KeyError:
-                raise ConfigError(_HOME_UNKNOWN) from None
-            if not os.path.isabs(home):
-                raise ConfigError(_HOME_UNKNOWN)
-        base = Path(home) / ".config"
+    base = xdg_base(environ, "XDG_CONFIG_HOME", ".config")
+    if base is None:
+        raise ConfigError(_HOME_UNKNOWN)
     return base / "termctl" / "config.yaml"
+
+
+def home_dir(environ: Mapping[str, str]) -> Path | None:
+    """An absolute ``HOME``, else the passwd entry's home if it is absolute, else None."""
+    home = environ.get("HOME", "")
+    if not os.path.isabs(home):
+        try:
+            home = pwd.getpwuid(os.getuid()).pw_dir
+        except KeyError:
+            return None
+        if not os.path.isabs(home):
+            return None
+    return Path(home)
+
+
+def xdg_base(environ: Mapping[str, str], variable: str, fallback: str) -> Path | None:
+    """``$variable`` when it is set and absolute (XDG base directory spec), else
+    ``<home>/<fallback>``; None when the home directory cannot be determined."""
+    value = environ.get(variable, "")
+    if value and os.path.isabs(value):
+        return Path(value)
+    home = home_dir(environ)
+    return None if home is None else home / fallback
 
 
 def merge(base: Mapping[Any, Any], over: Mapping[Any, Any], path: tuple[Any, ...] = ()) -> Any:

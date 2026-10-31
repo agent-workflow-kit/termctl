@@ -11,6 +11,7 @@ import pytest
 
 from termctl import cli
 from termctl.cli import Context, Result, main
+from termctl.hooks import Hook
 
 from .fakes import FakeClock, FakeGateway
 from .schemas import validate
@@ -128,6 +129,18 @@ BAD: list[list[str]] = [
     ["label", "add", ID, "k"],
     ["label", "remove", ID, "k=v", "bad key=v"],
     ["placements", "--label", "k=é"],
+    ["open", "--hook", "pre-close=x"],
+    ["open", "--hook", "pre-open"],
+    ["open", "--hook", "pre-open="],
+    ["open", "--hook", "on-open=x"],
+    ["open", "--hook", "pre-open\x1b[2J=x"],
+    ["open", "--hook", "pre-open=x\udcff"],
+    ["close", ID, "--hook", "post-open=x"],
+    ["open", "--override-escalation"],
+    ["open", "--override-escalation", "--actor", "auto:policy"],
+    ["close", ID, "--override-escalation"],
+    ["close", ID, "--override-escalation", "--actor", "auto:human"],
+    ["close", ID, "--override-escalation", "--dry-run"],
 ]
 
 
@@ -165,6 +178,10 @@ GOOD: list[list[str]] = [
     # The 32-label limit of label add is checked after id resolution, not in step 1.
     ["label", "add", ID, *[f"k{i}=v" for i in range(33)]],
     ["placements", "--label", "team=a#b"],
+    ["open", "--hook", "pre-open=gate check --x=1", "--hook", "post-open=notify; true"],
+    ["close", ID, "--hook", "pre-close=x", "--hook", "post-close=y"],
+    ["open", "--override-escalation", "--actor", "human:me"],
+    ["close", ID, "--override-escalation", "--actor", "human:me"],
 ]
 
 
@@ -221,3 +238,48 @@ def test_open_without_cwd_needs_a_readable_current_dir(later_steps: list[str]) -
     assert code == 2
     assert "current directory" in stderr
     assert later_steps == []
+
+
+@pytest.mark.parametrize("argv", [["open"], ["close", ID]])
+def test_override_escalation_is_accepted_from_a_tty(
+    argv: list[str], later_steps: list[str]
+) -> None:
+    gateway = FakeGateway(dirs=DIRS, tty=True)
+    assert run([*argv, "--override-escalation"], gateway) == (0, "", "")
+    assert "run_command" in later_steps
+
+
+def test_flag_hooks_are_parsed_in_step_1(monkeypatch: pytest.MonkeyPatch) -> None:
+    seen: list[Any] = []
+
+    def handler(args: Any, ctx: Context) -> Result:
+        seen.append(args.flag_hooks)
+        return Result(data={}, human="")
+
+    for step in (
+        "load_config",
+        "resolve_server",
+        "resolve_tmux_bin",
+        "resolve_command",
+        "check_tmux",
+        "check_id_collision",
+        "resolve_id",
+    ):
+        monkeypatch.setattr(cli, step, lambda *_: None)
+    monkeypatch.setattr(cli, "run_command", handler)
+    assert run(["open", "--hook", "post-open=a", "--hook", "pre-open=b=c"])[0] == 0
+    assert seen == [[Hook("post-open", "a", 30), Hook("pre-open", "b=c", 30)]]
+
+
+@pytest.mark.parametrize(
+    ("argv", "golden"),
+    [
+        (["open", "--override-escalation"], "error-override-escalation-gate.json"),
+        (["close", ID, "--hook", "pre-open=x"], "error-hook-name.json"),
+    ],
+)
+def test_hook_flag_goldens(argv: list[str], golden: str) -> None:
+    code, stdout, _ = run(["--json", *argv])
+    expected = json.loads((GOLDEN / golden).read_text(encoding="utf-8"))
+    validate(expected, "termctl/cli/error.json")
+    assert (code, json.loads(stdout)) == (2, expected)

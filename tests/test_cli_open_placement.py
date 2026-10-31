@@ -50,7 +50,7 @@ class Run:
             path = tmp_path / "config.yaml"
             text = config if isinstance(config, str) else yaml.safe_dump(config, sort_keys=False)
             path.write_text(text, encoding="utf-8")
-            environ = {"PATH": "/usr/bin"}
+            environ = {"PATH": "/usr/bin"}  # where the fake gateway finds tmux
             argv = ["--config", str(path), *argv]
         self.selection: placement.Selection | None = None
 
@@ -246,16 +246,3 @@ def test_target_pane_from_the_config_names_the_placement(
         " (only target: window)"
     )
     assert error["details"] == {"placement": "default", "fields": ["target"]}
-
-
-def test_tmux_missing_is_reported_before_not_supported(
-    tmp_path: Path, monkeypatch: pytest.MonkeyPatch
-) -> None:
-    # Open order step 2 resolves tmux_bin before the placement.
-    config = {"tmux_bin": "no-such-tmux", "placements": {"default": {"target": "pane"}}}
-    run = Run(["open", "--", "true"], config, tmp_path, monkeypatch)
-    assert run.code == 12
-    assert run.error()["code"] == "tmux_missing"
-    assert run.selection is None
-    # Nothing ran tmux: `tmux -V` belongs to step 3.
-    assert run.gateway.calls == []

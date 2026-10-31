@@ -19,7 +19,7 @@ import pytest
 
 from termctl.cli import main
 
-from .conftest import TMUX_VERSION, TmuxServer, wait_for
+from .conftest import TMUX_PRINTS_RAW, TMUX_VERSION, TmuxServer, wait_for
 from .schemas import validate
 from .test_panes_integration import ID, OTHER_ID, new_window, tag
 
@@ -155,6 +155,9 @@ def test_a_forged_invalid_pane_is_ignored_with_an_escaped_warning(tmux_server: T
     )
 
 
+@pytest.mark.skipif(
+    TMUX_PRINTS_RAW, reason="tmux 3.6 prints control bytes raw instead of escaping them"
+)
 def test_a_raw_control_byte_in_an_option_is_read_as_tmux_escape_text(
     tmux_server: TmuxServer,
 ) -> None:
