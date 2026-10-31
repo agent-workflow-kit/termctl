@@ -83,9 +83,13 @@ def test_command_not_found_comes_before_any_tmux_call() -> None:
 
 
 def test_command_found_on_the_filtered_path_passes_the_check() -> None:
-    gateway = FakeGateway(executables={TMUX, "/opt/bin/tool"}, list_panes=completed(""))
+    gateway = FakeGateway(
+        {key(tb.has_session(SESSION)): completed()},
+        executables={TMUX, "/opt/bin/tool"},
+        list_panes=completed(""),
+    )
     result = run(["--dry-run", "--", "tool"], gateway, {"PATH": "/usr/bin:/opt/bin"})
-    error(result, "internal", 1)
+    assert result.code == 0, result.stderr
     assert "/opt/bin/tool" in gateway.executable_checks
 
 
@@ -145,17 +149,17 @@ def scripted(sequence: list[str], monkeypatch: pytest.MonkeyPatch) -> list[str]:
 
 def test_id_collision_generates_another(monkeypatch: pytest.MonkeyPatch) -> None:
     left = scripted([ID, ID, OTHER, "tc-aaaaaaaa"], monkeypatch)
-    gateway = FakeGateway(panes=[pane_row(tc_id=ID)])
-    error(run(["--dry-run"], gateway), "internal", 1)
+    gateway = FakeGateway({key(tb.has_session(SESSION)): completed()}, panes=[pane_row(tc_id=ID)])
+    assert run(["--dry-run"], gateway).json()["id"] == OTHER
     assert left == ["tc-aaaaaaaa"]
-    assert calls(gateway) == ["-V", "list-panes"]
+    assert calls(gateway) == ["-V", "list-panes", "has-session -t"]
 
 
 def test_dry_run_stops_after_step_3_and_creates_nothing() -> None:
-    gateway = FakeGateway(panes=[], executables=TRUE)
-    err = error(run(["--dry-run", "--", "true"], gateway), "internal", 1)
-    assert "dry-run" in err["message"]
-    assert calls(gateway) == ["-V", "list-panes"]
+    # Only read-only queries: more in test_cli_open_dry_run.py.
+    gateway = FakeGateway({key(tb.has_session(SESSION)): completed()}, panes=[], executables=TRUE)
+    assert run(["--dry-run", "--", "true"], gateway).code == 0
+    assert calls(gateway) == ["-V", "list-panes", "has-session -t"]
 
 
 def test_the_id_is_generated_in_step_2(monkeypatch: pytest.MonkeyPatch) -> None:
@@ -177,8 +181,10 @@ def test_the_id_is_generated_in_step_2(monkeypatch: pytest.MonkeyPatch) -> None:
 
 def test_an_id_without_a_collision_is_kept(monkeypatch: pytest.MonkeyPatch) -> None:
     left = scripted([ID, OTHER], monkeypatch)
-    gateway = FakeGateway(panes=[pane_row(tc_id=OTHER)])
-    error(run(["--dry-run"], gateway), "internal", 1)
+    gateway = FakeGateway(
+        {key(tb.has_session(SESSION)): completed()}, panes=[pane_row(tc_id=OTHER)]
+    )
+    assert run(["--dry-run"], gateway).json()["id"] == ID
     assert left == [OTHER]
 
 
