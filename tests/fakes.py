@@ -173,6 +173,7 @@ class FakeGateway:
         system: str = "linux",
         proc_stats: Mapping[int, str | None | BaseException] | None = None,
         peer_pids: Mapping[str, int | BaseException] | None = None,
+        ttys: Mapping[str, OSError | None] | None = None,
     ) -> None:
         # ``platform`` answers ``system``; ``read_proc_stat`` answers from ``proc_stats``
         # (text, None for no such process, or an exception to raise), and an unscripted PID
@@ -184,6 +185,10 @@ class FakeGateway:
         # exception to raise); an unscripted path fails the test.
         self.peer_pids: dict[str, int | BaseException] = dict(peer_pids or {})
         self.peer_checks: list[str] = []
+        # ``write_tty`` answers from ``ttys`` (None: written, or an exception to raise) and
+        # records each write in ``tty_writes``; an unscripted path fails the test.
+        self.ttys: dict[str, OSError | None] = dict(ttys or {})
+        self.tty_writes: list[tuple[str, bytes]] = []
         self.panes = None if panes is None else [dict(row) for row in panes]
         self.list_panes = list_panes
         self.responses: dict[tuple[str, ...], Response] = {
@@ -394,6 +399,14 @@ class FakeGateway:
         if isinstance(answer, BaseException):
             raise answer
         return answer
+
+    def write_tty(self, path: str, data: bytes) -> None:
+        if path not in self.ttys:
+            raise AssertionError(f"unexpected tty write: {path}")
+        error = self.ttys[path]
+        if error is not None:
+            raise error
+        self.tty_writes.append((path, data))
 
     def _resolve(self, path: str, *, depth: int) -> str:
         if depth > 40:

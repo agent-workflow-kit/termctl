@@ -1234,6 +1234,36 @@ def is_session_missing(result: subprocess.CompletedProcess[str], name: str) -> b
     return _first_line_is(result, f"can't find session: {name}")
 
 
+# --- mark: the bell's terminal (interface.md "Markers") -----------------------------------------
+
+# The pane's id, ownership, id, liveness and terminal, read in one query so the terminal is
+# known to belong to the managed pane it was read for.
+TTY_QUERY = fields("pane_id", "@termctl_pane", "@termctl_id", "pane_dead", "pane_tty")
+# The pseudo-terminal device paths termctl writes BEL to: Linux, WSL and the BSDs (/dev/pts/N)
+# and macOS (/dev/ttysN). Anything else is never opened.
+_TTY = re.compile(r"/dev/(?:pts/[0-9]{1,10}|ttys[0-9]{1,10})")
+
+
+def tty_query(pane_id: str) -> Invocation:
+    """``display -p -t %N`` of ``TTY_QUERY``: read-only, so unguarded."""
+    query = command("display").flag("-p").target(pane(pane_id)).format_arg(TTY_QUERY)
+    return Invocation.of(query.build())
+
+
+def parse_tty_query(stdout: str, pane_id: str, termctl_id: str) -> str | None:
+    """The terminal device of ``pane_id`` when the query shows it still managed as
+    ``termctl_id`` and running, with a pseudo-terminal path; None for anything else (``display``
+    of a missing pane prints empty fields, spike E6)."""
+    line = stdout.removesuffix("\n")
+    values = line.split(" ")
+    if "\n" in line or len(values) != 5:
+        return None
+    shown_pane, owner, shown_id, dead, tty = values
+    if (shown_pane, owner, shown_id, dead) != (pane_id, pane_id, termctl_id, "0"):
+        return None
+    return tty if _TTY.fullmatch(tty) else None
+
+
 # --- the runner ---------------------------------------------------------------------------------
 
 

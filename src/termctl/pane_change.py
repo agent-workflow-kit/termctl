@@ -1,6 +1,6 @@
-"""The read-modify-write of a managed pane's options and window name: ``rename``, and
-TODO(#20) ``mark`` and ``unmark`` and TODO(#21) ``label add`` and ``label remove`` reuse
-``change_pane`` with their own plan (interface.md "Names", "Markers", "Labels", "Audit and log"
+"""The read-modify-write of a managed pane's options and window name: ``rename``, ``mark`` and
+``unmark``, and TODO(#21) ``label add`` and ``label remove``, run ``change_pane`` with their own
+plan (interface.md "Names", "Markers", "Labels", "Audit and log"
 Locking; design.md D20, D28, D29).
 
 ``change_pane`` holds the per-server lock (``lock.server_lock``) while it reads the pane again

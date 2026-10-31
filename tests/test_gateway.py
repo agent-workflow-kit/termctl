@@ -1017,3 +1017,90 @@ def test_watchdog_kills_the_hook_on_a_stop_signal_while_it_starts(tmp_path: Path
     )
     assert proc.returncode == 1, proc.stderr
     assert wait_gone(int(read_when_ready(marker)))
+
+
+# --- tty writes (the bell, #20) -----------------------------------------------------------------
+
+
+def test_write_tty_writes_to_a_terminal() -> None:
+    master, slave = os.openpty()
+    try:
+        SystemGateway().write_tty(os.ttyname(slave), b"\a")
+        assert os.read(master, 16) == b"\a"
+    finally:
+        os.close(master)
+        os.close(slave)
+
+
+def test_write_tty_opens_write_only_without_a_controlling_terminal_or_blocking(
+    monkeypatch: pytest.MonkeyPatch,
+) -> None:
+    opened: list[int] = []
+    real_open = os.open
+
+    def recording_open(path: str, flags: int, *args: Any) -> int:
+        opened.append(flags)
+        return real_open(path, flags, *args)
+
+    monkeypatch.setattr(os, "open", recording_open)
+    master, slave = os.openpty()
+    try:
+        SystemGateway().write_tty(os.ttyname(slave), b"\a")
+    finally:
+        os.close(master)
+        os.close(slave)
+    [flags] = opened
+    assert flags & os.O_ACCMODE == os.O_WRONLY
+    for flag in (os.O_NOCTTY, os.O_NONBLOCK, os.O_CLOEXEC, os.O_NOFOLLOW):
+        assert flags & flag
+    assert not flags & (os.O_CREAT | os.O_TRUNC | os.O_APPEND)
+
+
+def test_write_tty_never_writes_to_a_regular_file(tmp_path: Path) -> None:
+    path = tmp_path / "file"
+    path.write_bytes(b"content")
+    with pytest.raises(OSError, match="not a character device"):
+        SystemGateway().write_tty(str(path), b"\a")
+    assert path.read_bytes() == b"content"
+
+
+def test_write_tty_never_creates_a_file(tmp_path: Path) -> None:
+    with pytest.raises(FileNotFoundError):
+        SystemGateway().write_tty(str(tmp_path / "missing"), b"\a")
+    assert not (tmp_path / "missing").exists()
+
+
+def test_write_tty_refuses_a_directory(tmp_path: Path) -> None:
+    with pytest.raises(OSError):
+        SystemGateway().write_tty(str(tmp_path), b"\a")
+
+
+def test_write_tty_never_blocks_on_a_fifo_without_a_reader(tmp_path: Path) -> None:
+    path = tmp_path / "fifo"
+    os.mkfifo(path)
+    start = time.monotonic()
+    with pytest.raises(OSError):
+        SystemGateway().write_tty(str(path), b"\a")
+    assert time.monotonic() - start < 5
+
+
+def test_write_tty_never_writes_to_a_fifo_with_a_reader(tmp_path: Path) -> None:
+    path = tmp_path / "fifo"
+    os.mkfifo(path)
+    reader = os.open(path, os.O_RDONLY | os.O_NONBLOCK)
+    try:
+        with pytest.raises(OSError, match="not a character device"):
+            SystemGateway().write_tty(str(path), b"\a")
+        # The writer is closed again with nothing written: end of file, not a BEL.
+        assert os.read(reader, 16) == b""
+    finally:
+        os.close(reader)
+
+
+def test_write_tty_follows_no_trailing_symlink_to_a_regular_file(tmp_path: Path) -> None:
+    target = tmp_path / "file"
+    target.write_bytes(b"content")
+    (tmp_path / "link").symlink_to(target)
+    with pytest.raises(OSError):
+        SystemGateway().write_tty(str(tmp_path / "link"), b"\a")
+    assert target.read_bytes() == b"content"

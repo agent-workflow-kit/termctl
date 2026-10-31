@@ -12,8 +12,9 @@ implements it:
 - ``tag_pane`` and ``cleanup_pane``: ``open``'s pane (Open order step 6, ``open_cmd.tag``).
 - ``record_process``: ``open``'s PID recording (Open order step 7, ``open_cmd.record``).
 - ``write_pane`` and ``byte_lengths``: the guarded read-modify-write of a managed pane's
-  options and window name (``pane_change.py``); ``rename`` uses them, and TODO(#20) ``mark``
-  and ``unmark`` and TODO(#21) label changes reuse them.
+  options and window name (``pane_change.py``); ``rename``, ``mark`` and ``unmark`` use them,
+  and TODO(#21) label changes reuse them.
+- ``pane_tty``: the terminal a ``bell`` marker writes BEL to (``display.ring_bell``).
 - TODO(#23): ``close``; TODO(#24): ``focus``.
 """
 
@@ -139,6 +140,11 @@ class Backend(Protocol):
     def byte_lengths(self, pane_id: str, names: Sequence[str]) -> tuple[int, ...] | None:
         """The stored length in bytes of each named field or option of ``pane_id`` (read-only),
         or None when tmux does not answer with one number per name."""
+        ...
+
+    def pane_tty(self, pane: ManagedPane) -> str | None:
+        """The pseudo-terminal device of ``pane`` while it is still the managed pane resolved
+        and running (read-only), or None otherwise or when it cannot be read."""
         ...
 
 
@@ -296,3 +302,12 @@ class TmuxBackend:
         if len(values) != len(names) or not all(_LENGTH.fullmatch(v) for v in values):
             return None
         return tuple(int(v) for v in values)
+
+    def pane_tty(self, pane: ManagedPane) -> str | None:
+        try:
+            result = self.tmux.run(tb.tty_query(pane.pane_id), utf8=True)
+        except TermctlError:
+            return None
+        if result.returncode != 0:
+            return None
+        return tb.parse_tty_query(result.stdout, pane.pane_id, pane.id)
