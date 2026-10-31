@@ -14,13 +14,16 @@ from collections.abc import Mapping, Sequence
 from dataclasses import dataclass, field
 from typing import Any, NoReturn, TextIO
 
-from . import __version__, ids, tmux_bin, tmux_socket, validate
+from . import __version__, ids, panes, tmux_bin, tmux_socket, validate
 from . import config as config_module
 from .argv import Scan, scan
+from .backend import Backend, TmuxBackend
 from .config import Config
 from .errors import TermctlError, UsageError
 from .gateway import Clock, Gateway, SystemClock, SystemGateway
 from .output import PROG, Output, Result, flush_standard_streams
+from .panes import ManagedPane, PaneRead
+from .tmux_backend import Tmux
 from .tmux_bin import TmuxBinary
 
 __all__ = ["Context", "Output", "Result", "main", "parse_args"]
@@ -42,6 +45,10 @@ class Context:
     tmux_path: str | None = None
     # The resolved tmux binary and version, set by the tmux checks (step 3) after `tmux -V`.
     tmux: TmuxBinary | None = None
+    # The one pane read of this invocation (``read_panes``) and, for a command that takes an
+    # id, the pane it resolved to (step 4; None for ``exists`` when nothing matched).
+    pane_read: PaneRead | None = None
+    pane: ManagedPane | None = None
 
 
 # --- argument parsing ---------------------------------------------------------------------------
@@ -429,32 +436,122 @@ def check_tmux(args: argparse.Namespace, ctx: Context) -> None:
         )
     assert ctx.server is not None
     ctx.socket_present = tmux_socket.check(ctx.server, ctx.gateway)
+    # A missing socket or parent directory (False) is no server: `list` and `exists` still
+    # answer, and step 4 exits 10 for the other commands. `read_panes` re-runs these checks
+    # before it connects.
     # TODO(#14): open re-checks the socket right before connecting, creates the default
     # directory (default form only, mode 0700), and exits 12 for an explicit path whose parent
     # is missing.
-    # TODO(#12): list prints an empty list and exists answers without a server.
-    # TODO(#12): a refused connection on an existing socket means no server; re-run the checks
-    # before connecting.
+
+
+def connect(ctx: Context) -> Backend | None:
+    """The backend for the resolved server, or None when no server runs there.
+
+    The socket checks run again immediately before connecting, whatever step 3 found, so a
+    *no server* result is never followed by a connect without them (interface.md "Residual
+    risks", socket path races), and a socket replaced since step 3 is checked as it is now.
+    """
+    assert ctx.server is not None and ctx.tmux is not None
+    if not tmux_socket.check(ctx.server, ctx.gateway):
+        return None
+    # TODO(#15): run tmux with the environment filtered by server_env_allow; until then only
+    # the caller's locale, as for `tmux -V`.
+    env = tmux_bin.locale_env(ctx.environ)
+    tmux = Tmux(ctx.gateway, ctx.tmux.path, ctx.server.socket_path, env=env, trace=ctx.out.trace)
+    return TmuxBackend(tmux)
+
+
+def read_panes(ctx: Context) -> PaneRead:
+    """Every managed pane of the server, read once per invocation; ``server_running`` is
+    false when no server runs (no tmux call is made when the socket checks find none).
+
+    Each reader warning is printed (escaped, like all stderr output).
+    """
+    if ctx.pane_read is None:
+        backend = connect(ctx)
+        if backend is None:
+            ctx.pane_read = PaneRead(server_running=False, panes=(), warnings=())
+        else:
+            ctx.pane_read = backend.read_panes()
+        for warning in ctx.pane_read.warnings:
+            # TODO(#5): logged commands also write each warning as a `warning` log record.
+            ctx.out.warn(warning)
+    return ctx.pane_read
+
+
+def _socket_path(ctx: Context) -> str:
+    assert ctx.server is not None
+    return ctx.server.socket_path
 
 
 def resolve_id(args: argparse.Namespace, ctx: Context) -> None:
-    """Step 4: resolve the id to one managed pane (exit 10 or 21)."""
-    # A missing socket or parent directory is no server; `exists` then prints its normal
-    # output with exit 10 (TODO(#12)), and a refused connection is no server too (TODO(#12)).
-    if ctx.socket_present is False and args.command != "exists":
-        assert ctx.server is not None
+    """Step 4: resolve the id to one managed pane (exit 10 or 21).
+
+    No server is ``no_server`` (exit 10), and no match ``not_found``, except for ``exists``,
+    which answers both with its normal output (``ctx.pane`` None). Several matches, two panes
+    carrying the same full id included, are ``ambiguous`` (exit 21) for every command.
+    """
+    read = read_panes(ctx)
+    if not read.server_running:
+        if args.command == "exists":
+            return
+        path = _socket_path(ctx)
         raise TermctlError(
             "no_server",
-            f"no tmux server is running on {validate.show(ctx.server.socket_path, 200)}",
-            details={"socket_path": ctx.server.socket_path},
+            f"no tmux server is running on {validate.show(path, 200)}",
+            details={"socket_path": path},
         )
-    # TODO(#12): read the managed panes with backend.TmuxBackend.read_panes (no server: exit 10,
-    # no_server) and pick one with ids.resolve.
+    try:
+        ctx.pane = ids.resolve(ids.parse(args.id), read.panes)
+    except TermctlError as err:
+        if err.code != "not_found" or args.command != "exists":
+            raise
+
+
+# --- the read commands --------------------------------------------------------------------------
+
+
+def _pane_line(pane: ManagedPane) -> str:
+    """The human line of a pane: id, state, session and displayed name (escaped on output)."""
+    return f"{pane.id} {pane.state} {pane.session} {pane.display_name}"
+
+
+def show(args: argparse.Namespace, ctx: Context) -> Result:
+    assert ctx.pane is not None
+    return Result(ctx.pane.pane_object(_socket_path(ctx)), _pane_line(ctx.pane))
+
+
+def exists(args: argparse.Namespace, ctx: Context) -> Result:
+    """Exit 0 or 10, both with this output and no error object (interface.md `exists`)."""
+    data = {
+        "input": args.id,
+        "id": None if ctx.pane is None else ctx.pane.id,
+        "exists": ctx.pane is not None,
+        "socket_path": _socket_path(ctx),
+    }
+    return Result(data, "", exit_code=0 if ctx.pane is not None else 10)
+
+
+def list_panes(args: argparse.Namespace, ctx: Context) -> Result:
+    """Without a server, an empty list and exit 0."""
+    labels = validate.parse_labels(args.labels)
+    chosen = panes.select(
+        read_panes(ctx).panes, labels=labels, session=args.session, dead=args.dead
+    )
+    socket_path = _socket_path(ctx)
+    data = {"socket_path": socket_path, "panes": [p.pane_object(socket_path) for p in chosen]}
+    return Result(data, "\n".join(_pane_line(p) for p in chosen))
+
+
+COMMAND_STEPS = {"show": show, "exists": exists, "list": list_panes}
 
 
 def run_command(args: argparse.Namespace, ctx: Context) -> Result:
     """Step 5: the command's own steps."""
-    # TODO: each command lands in its own issue (#7, #12-#24).
+    step = COMMAND_STEPS.get(args.command)
+    if step is not None:
+        return step(args, ctx)
+    # TODO: each remaining command lands in its own issue (#7, #13-#24).
     raise TermctlError("internal", f"{PROG} {args.command} is not implemented yet")
 
 

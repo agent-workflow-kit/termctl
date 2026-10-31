@@ -86,7 +86,7 @@ def _quote(output: bytes) -> str:
     return "'" + output.decode("utf-8", errors="replace").strip()[:_QUOTED] + "'"
 
 
-def _locale(environ: Mapping[str, str]) -> dict[str, str]:
+def locale_env(environ: Mapping[str, str]) -> dict[str, str]:
     """The caller's ``LANG`` and ``LC_*`` variables: tmux exits at once without a UTF-8
     locale, and the default filtered environment passes these."""
     return {k: v for k, v in environ.items() if k == "LANG" or k.startswith("LC_")}
@@ -137,7 +137,7 @@ def check_version(
     try:
         # TODO(#15): run with the full filtered environment; until then only the locale.
         result = gateway.run_bounded(
-            argv, env=_locale(environ), timeout=VERSION_TIMEOUT, limit=OUTPUT_LIMIT
+            argv, env=locale_env(environ), timeout=VERSION_TIMEOUT, limit=OUTPUT_LIMIT
         )
     except subprocess.TimeoutExpired:
         raise _missing(tmux_bin, f"cannot run {path} -V: timed out", path) from None

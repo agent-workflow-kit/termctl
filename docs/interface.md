@@ -251,7 +251,7 @@ Exit codes: 0; 1; 2; 11; 12 (`tmux_missing`, `tmux_too_old`, `server_unavailable
 
 ### `show`
 
-`termctl show <id>`: prints the pane object (`schemas/cli/show.json`, which is `schemas/cli/pane.json`). Human output: one line with the id, state, session and displayed name. Exit 0, 1, 2, 10, 12, 21.
+`termctl show <id>`: prints the pane object (`schemas/cli/show.json`, which is `schemas/cli/pane.json`). Human output: one line with the id, state, session and displayed name, separated by single spaces. Exit 0, 1, 2, 10, 12, 21.
 
 ### `exists`
 
@@ -259,7 +259,7 @@ Exit codes: 0; 1; 2; 11; 12 (`tmux_missing`, `tmux_too_old`, `server_unavailable
 
 ### `list`
 
-`termctl list [--label k=v]... [--session SESSION] [--dead]`: managed panes of the resolved server, ordered by `created`, then `id`. `--label` filters are ANDed; a filter matches when the pane has that pair. `--session` takes any non-empty string and matches any session the pane's window is linked into. `--dead` lists only dead panes. termctl applies these filters itself to its single `list-panes -a` read, never as tmux `-f` filters. Human output: one line per pane (id, state, session, displayed name). `--json`: `{"socket_path", "panes": [<pane object>...]}` (`schemas/cli/list.json`). No server running: an empty list, exit 0. Exit 0, 1, 2, 12.
+`termctl list [--label k=v]... [--session SESSION] [--dead]`: managed panes of the resolved server, ordered by `created`, then `id`. `--label` filters are ANDed; a filter matches when the pane has that pair. `--session` takes any non-empty string and matches any session the pane's window is linked into. `--dead` lists only dead panes. termctl applies these filters itself to its single `list-panes -a` read, never as tmux `-f` filters. Human output: one line per pane (id, state, session, displayed name, separated by single spaces, as for `show`). `--json`: `{"socket_path", "panes": [<pane object>...]}` (`schemas/cli/list.json`). No server running: an empty list, exit 0. Exit 0, 1, 2, 12.
 
 ### `rename`
 

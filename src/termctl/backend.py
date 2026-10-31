@@ -6,7 +6,7 @@ so that they never build tmux commands themselves; each operation lands with the
 implements it:
 
 - ``read_panes``: every managed pane of the server (``panes.py``); ``show``, ``exists`` and
-  ``list`` (#12) and id resolution (``cli.resolve_id``, #12) use it.
+  ``list`` and id resolution use it through ``cli.read_panes``.
 - TODO(#14, #15, #16, #17): ``open`` (server and session, pane creation, PID recording).
 - TODO(#19): ``rename``; TODO(#20): ``mark`` and ``unmark``; TODO(#21): label changes.
 - TODO(#23): ``close``; TODO(#24): ``focus``.
