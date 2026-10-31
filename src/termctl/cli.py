@@ -14,13 +14,14 @@ from collections.abc import Mapping, Sequence
 from dataclasses import dataclass, field
 from typing import Any, NoReturn, TextIO
 
-from . import __version__, ids, placement, validate
+from . import __version__, ids, placement, tmux_bin, validate
 from . import config as config_module
 from .argv import Scan, scan
 from .config import Config
 from .errors import TermctlError, UsageError
 from .gateway import Clock, Gateway, SystemClock, SystemGateway
 from .output import PROG, Output, Result, flush_standard_streams
+from .tmux_bin import TmuxBinary
 
 __all__ = ["Context", "Output", "Result", "main", "parse_args"]
 
@@ -34,6 +35,10 @@ class Context:
     environ: Mapping[str, str]
     out: Output = field(repr=False)
     config: Config = field(default_factory=config_module.defaults)
+    # `tmux_bin` resolved to an absolute path, once: by `open`'s resolve step or the tmux checks.
+    tmux_path: str | None = None
+    # The resolved tmux binary and version, set by the tmux checks (step 3) after `tmux -V`.
+    tmux: TmuxBinary | None = None
 
 
 # --- argument parsing ---------------------------------------------------------------------------
@@ -407,7 +412,19 @@ def resolve_server(args: argparse.Namespace, ctx: Context) -> None:
 
 def check_tmux(args: argparse.Namespace, ctx: Context) -> None:
     """Step 3: tmux binary, version and socket safety checks (exit 12)."""
-    # TODO: tmux binary and version - issue #10; socket safety - issue #8
+    if ctx.tmux is None:
+        if ctx.tmux_path is None:
+            ctx.tmux_path = tmux_bin.resolve(ctx.config.tmux_bin, ctx.environ, ctx.gateway)
+        # TODO(#5): a version warning also gets a `warning` log record in logged commands.
+        ctx.tmux = tmux_bin.probe(
+            ctx.config.tmux_bin,
+            ctx.environ,
+            ctx.gateway,
+            ctx.out.warn,
+            ctx.out.trace,
+            path=ctx.tmux_path,
+        )
+    # TODO: socket safety - issue #8
 
 
 def resolve_id(args: argparse.Namespace, ctx: Context) -> None:
@@ -420,7 +437,7 @@ def run_command(args: argparse.Namespace, ctx: Context) -> Result:
     if args.command == "placements":
         labels = validate.parse_labels(args.labels) if args.labels else None
         return placement.report(ctx.config, labels)
-    # TODO: each command lands in its own issue (#12-#24).
+    # TODO: each command lands in its own issue (#7, #12-#24).
     raise TermctlError("internal", f"{PROG} {args.command} is not implemented yet")
 
 

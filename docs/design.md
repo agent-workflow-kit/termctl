@@ -70,7 +70,8 @@ Terminal placement, tmux backend. Layer 1 (primitive), fully standalone (archite
 | `validate.py` | input grammars: name, label, marker, session, placement, env-name, duration, actor (and its default), decision-id, client, socket and cwd |
 | `placement.py` | placement and rule resolution |
 | `backend.py` | the `Backend` protocol (open, close, list, rename, mark, focus, labels) |
-| `tmux_backend.py` | the tmux argument builder ([tmux argument rules](interface.md#tmux-argument-rules)), guarded writes (`if-shell` wrapping, D28), format strings, command chains, version check, server env filtering, socket path resolution and socket directory checks (D26) |
+| `tmux_backend.py` | the tmux argument builder ([tmux argument rules](interface.md#tmux-argument-rules)), guarded writes (`if-shell` wrapping, D28), format strings, command chains, server env filtering, socket path resolution and socket directory checks (D26) |
+| `tmux_bin.py` | `tmux_bin` resolution to an absolute path on the caller's `PATH` and the `tmux -V` version check (3.2 floor) |
 | `panes.py` | the pane reader: parses `list-panes -a -F` records, applies the ownership check and validates every `@termctl_*` value (D27) |
 | `procs.py` | process start time and parent check for the recorded PID, the `close --force` signal sequence |
 | `gateway.py` | the only module that runs subprocesses or touches the filesystem outside config and logs (tmux, `ps`, `/proc`, socket `stat`, the cwd check, stdin TTY test and OS user name, BEL write); also holds the injectable clock |
@@ -78,7 +79,7 @@ Terminal placement, tmux backend. Layer 1 (primitive), fully standalone (archite
 | `jsonlog.py` | `log.jsonl` and `audit.jsonl` |
 | `lock.py` | per-server `flock` (D20) |
 
-Data flow for `open`: `cli` → `config` + `validate` → `placement` → `tmux_backend` + `panes` (socket checks, version check, id-collision check) → `hooks` (pre) → `tmux_backend` (session, placeholder pane, options, respawn) → `procs` (record PID) → `hooks` (post) → `jsonlog`. All tmux reads use one `list-panes -a -F` call with tab-separated fields, free-text fields sanitized in the format string and an end-of-record sentinel (spike A8). Targets are always exact ids (`=session:`, `@N`, `%N`), never names or indexes (spike A6, B7).
+Data flow for `open`: `cli` → `config` + `validate` → `placement` → `tmux_bin` (resolution, version check) → `tmux_backend` + `panes` (socket checks, id-collision check) → `hooks` (pre) → `tmux_backend` (session, placeholder pane, options, respawn) → `procs` (record PID) → `hooks` (post) → `jsonlog`. All tmux reads use one `list-panes -a -F` call with tab-separated fields, free-text fields sanitized in the format string and an end-of-record sentinel (spike A8). Targets are always exact ids (`=session:`, `@N`, `%N`), never names or indexes (spike A6, B7).
 
 Error handling: usage and config problems are detected before any tmux call; tmux failures map to exit 12 codes; a pane that vanished mid-command or a guard non-match maps to exit 10 (D28), except in `open` (D35) and in `close`, where a pane gone at the guarded kill counts as closed (exit 0, [`close`](interface.md#close)); a partially created pane is killed under the ownership guard (D28, [Open order](interface.md#open-order)).
 
@@ -196,5 +197,6 @@ Run on 2026-10-30 against tmux 3.5a and 3.2a, each on a private `-S` socket with
 
 - Unit tests with a fake gateway for every module.
 - Integration tests against real tmux in CI (tmux from apt, in termctl's own `tmux` job with `TERMCTL_REQUIRE_TMUX` set, since the shared awkit-ci workflow cannot install packages; its `verify` job runs them too when the runner image ships tmux): each test pre-starts its own server with `tmux -f /dev/null -S <path>` on a private socket path and passes `--socket <path>` to termctl, so the server never loads a user's config; a `make verify-floor` target runs them with tmux 3.2 when available locally.
+- Tests marked `tmux` run a real tmux binary; without tmux on `PATH` they are skipped, unless `TERMCTL_REQUIRE_TMUX` is set to a non-empty value, which makes a missing tmux a test failure (for CI, which installs tmux; D18).
 - Golden `--json` files, validated against `schemas/`.
 - No `live` tests: nothing termctl touches needs credentials or a model.
