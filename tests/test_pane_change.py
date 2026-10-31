@@ -411,11 +411,20 @@ def test_a_preview_reports_the_pane_as_it_would_be_and_writes_nothing() -> None:
     assert backend.writes == []
 
 
-def test_a_preview_takes_no_lock_and_reads_no_panes(tmp_path: Path) -> None:
+def test_a_preview_takes_no_lock_and_makes_no_reads_or_writes(
+    monkeypatch: pytest.MonkeyPatch,
+) -> None:
+    attempts: list[str] = []
+
+    def no_lock(socket_path: str, **_: object) -> None:
+        attempts.append(socket_path)
+        raise AssertionError("a preview took the lock")
+
+    monkeypatch.setattr(pane_change, "server_lock", no_lock)
     backend = FakeBackend([read(managed())])
     preview(backend, managed(), renamed("new"))
+    assert attempts == []
     assert backend.lock_held_during == []
-    assert not lock.held()
 
 
 def test_a_preview_of_an_ineligible_window_keeps_the_current_window_name() -> None:

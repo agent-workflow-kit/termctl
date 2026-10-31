@@ -16,8 +16,8 @@ callers keep the ``with`` block around the read-modify-write only, and the hook 
 close-on-exec, so no child inherits it.
 """
 
-# pane_change.change_pane takes the lock for rename and the label commands (and, through it,
-# #20 mark/unmark), with environ and clock from the CLI context.
+# pane_change.change_pane takes the lock for rename, mark, unmark, label add and label remove,
+# with environ and clock from the CLI context.
 
 from __future__ import annotations
 

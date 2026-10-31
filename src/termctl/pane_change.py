@@ -135,8 +135,9 @@ def preview_change(
 ) -> Outcome:
     """What ``change_pane`` would do to ``pane`` (as read in step 4), without the lock and
     without writing: ``pane`` as it would be afterwards, its ``display_name`` the computed one
-    when the window would be renamed and the current one otherwise. Errors of ``plan``
-    propagate as in a real run."""
+    when the window would be renamed and the current one otherwise. The computed name can
+    differ from the form tmux reports after the real run, which stores some characters
+    escaped (interface.md "Names"). Errors of ``plan`` propagate as in a real run."""
     change = _checked(plan(pane))
     if _is_no_op(backend, pane, change, version):
         return Outcome(pane=pane, changed=False, display_updated=False)

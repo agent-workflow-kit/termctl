@@ -96,7 +96,8 @@ class Context:
     audited: bool = False
     # A logged ``open``: its stop-signal handling (``gateway.stop_signals``).
     signals: RunSignals | None = None
-    # A pane change (``rename``, the label commands) that changed nothing: no log record
+    # A pane change (``rename``, ``mark``, ``unmark``, ``label add``, ``label remove``) that
+    # changed nothing: no log record
     # (interface.md "Audit and log").
     no_op: bool = False
 
