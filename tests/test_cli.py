@@ -852,7 +852,7 @@ def test_context_carries_injected_gateway_and_clock(monkeypatch: pytest.MonkeyPa
 # --- unimplemented commands ---------------------------------------------------------------------
 
 
-IMPLEMENTED = {"show", "exists", "list", "placements", "open"}
+IMPLEMENTED = {"show", "exists", "list", "placements", "open", "focus"}
 UNIMPLEMENTED = sorted(set(MINIMAL) - IMPLEMENTED)
 
 

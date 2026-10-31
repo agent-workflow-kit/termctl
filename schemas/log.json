@@ -62,7 +62,7 @@
     },
     "exit_code": {
       "type": "integer",
-      "description": "Invocations that fail the usage check are not logged; a label limit checked after id resolution is (exit 2), and so are open's exit 2 from step 2 of its open order, its exit 1 (internal) and its exit 128 plus the signal number when a signal stopped it."
+      "description": "Invocations that fail the usage check are not logged; a label limit checked after id resolution is (exit 2), and so are open's exit 2 from step 2 of its open order, its exit 128 plus the signal number when a signal stopped it, and the exit 1 (internal) of open and focus. Absent when not known: the record a focus without --json writes before it execs tmux (the exit status is then tmux's)."
     },
     "actor": {
       "$ref": "defs.json#/$defs/actor",
@@ -83,7 +83,7 @@
         "switched",
         "attach"
       ],
-      "description": "focus only; attach is logged before the exec."
+      "description": "focus only; switched also when focus failed before choosing an action. attach is logged before the exec; if the exec itself fails, a second record (result error, attach_failed) follows, the one exception to one record per invocation."
     },
     "hooks": {
       "type": "array",

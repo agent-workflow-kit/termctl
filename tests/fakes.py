@@ -9,7 +9,7 @@ import subprocess
 from collections.abc import Callable, Mapping, Sequence
 from dataclasses import dataclass
 from datetime import UTC, datetime, timedelta
-from typing import Any
+from typing import Any, NoReturn
 
 from termctl import panes as panes_module
 from termctl.gateway import BoundedOutput, FileInfo, GroupRun
@@ -44,6 +44,7 @@ PANE_VALUES: dict[str, str] = {
     "pane_dead_signal": "",
     "pane_pid": "4242",
     "window_panes": "1",
+    "session_id": "$1",
     "session_name": "termctl",
     "window_name": "KEY-12",
     "@termctl_pane": "%3",
@@ -141,6 +142,11 @@ def group_run(
     return GroupRun(pgid, returncode, stdout, stderr, False, False)
 
 
+class Execed(BaseException):
+    """What the fake raises for ``exec_replace``: the real one never returns. A
+    ``BaseException`` so that termctl's own handlers cannot mistake it for a failure."""
+
+
 class FakeGateway:
     """Records every call and answers from a table of scripted results.
 
@@ -173,7 +179,15 @@ class FakeGateway:
         system: str = "linux",
         proc_stats: Mapping[int, str | None | BaseException] | None = None,
         peer_pids: Mapping[str, int | BaseException] | None = None,
+        stderr_tty: bool | None = None,
+        exec_error: OSError | None = None,
     ) -> None:
+        # ``stderr_isatty`` answers ``stderr_tty`` (``tty`` when not given). ``exec_replace``
+        # records the call in ``execs`` and raises ``Execed`` (the process would be gone), or
+        # ``exec_error`` when given.
+        self.stderr_tty = tty if stderr_tty is None else stderr_tty
+        self.exec_error = exec_error
+        self.execs: list[tuple[list[str], dict[str, str]]] = []
         # ``platform`` answers ``system``; ``read_proc_stat`` answers from ``proc_stats``
         # (text, None for no such process, or an exception to raise), and an unscripted PID
         # fails the test.
@@ -335,6 +349,15 @@ class FakeGateway:
 
     def stdin_isatty(self) -> bool:
         return self.tty
+
+    def stderr_isatty(self) -> bool:
+        return self.stderr_tty
+
+    def exec_replace(self, argv: list[str], env: Mapping[str, str]) -> NoReturn:
+        self.execs.append((list(argv), dict(env)))
+        if self.exec_error is not None:
+            raise self.exec_error
+        raise Execed(argv)
 
     def user_name(self) -> str | None:
         return self.user
