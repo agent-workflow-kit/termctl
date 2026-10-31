@@ -1194,6 +1194,26 @@ def record_process(pane_id: str, termctl_id: str, pid: str, start: str) -> Invoc
     )
 
 
+# --- close (interface.md `close`) ---------------------------------------------------------------
+
+
+def query_process(pane_id: str, termctl_id: str) -> Invocation:
+    """``close --force`` before the kill: ``PROCESS_QUERY`` of the pane, guarded by its being
+    managed as ``termctl_id`` (``owned``). Read-only."""
+    target = pane(pane_id)
+    return Invocation.of(guarded(target, owned(termctl_id), _process_query(target)))
+
+
+def kill_pane(pane_id: str, termctl_id: str, *, query: bool) -> Invocation:
+    """``kill-pane`` of the pane, never its window (spike D5), guarded by its being managed as
+    ``termctl_id`` (``owned``). With ``query`` (``close --force`` of a running pane) the same
+    invocation first prints ``PROCESS_QUERY``, so the PID read is the one killed."""
+    target = pane(pane_id)
+    inner = [_process_query(target)] if query else []
+    inner.append(command("kill-pane").target(target).build())
+    return Invocation.of(guarded(target, owned(termctl_id), *inner))
+
+
 def cleanup_kill(pane_id: str, window_id: str) -> Invocation:
     """The kill after a failed tagging (Open order): the pane by its exact id, only while it
     is in ``window_id`` and its ``@termctl_pane`` is empty or its own id (``cleanup``)."""
