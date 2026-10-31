@@ -11,6 +11,7 @@ import os
 import pwd
 import selectors
 import subprocess
+import sys
 import time
 from collections.abc import Mapping
 from dataclasses import dataclass
@@ -39,7 +40,7 @@ class FileInfo:
 
 
 class Gateway(Protocol):
-    """External effects termctl needs. Later stages add `/proc`, `stat` and tty writes here."""
+    """External effects termctl needs. Later stages add tty writes here."""
 
     def run(
         self,
@@ -106,6 +107,16 @@ class Gateway(Protocol):
     def make_dir(self, path: str, mode: int) -> None:
         """``mkdir`` of ``path`` with ``mode`` (less the umask); never creates parents. Raises
         ``FileExistsError`` if ``path`` exists (a symlink included) and ``OSError`` otherwise."""
+        ...
+
+    def platform(self) -> str:
+        """``sys.platform``: ``darwin`` on macOS, ``linux`` on Linux and WSL."""
+        ...
+
+    def read_proc_stat(self, pid: int) -> str | None:
+        """The contents of ``/proc/<pid>/stat`` (Linux and WSL), decoded as UTF-8 with
+        surrogateescape, or None when no such process exists (the file is missing, or the
+        process went away while reading it). Raises ``OSError`` for any other failure."""
         ...
 
 
@@ -225,6 +236,16 @@ class SystemGateway:
 
     def make_dir(self, path: str, mode: int) -> None:
         os.mkdir(path, mode)
+
+    def platform(self) -> str:
+        return sys.platform
+
+    def read_proc_stat(self, pid: int) -> str | None:
+        try:
+            with open(f"/proc/{int(pid)}/stat", "rb") as stat_file:
+                return stat_file.read().decode("utf-8", "surrogateescape")
+        except (FileNotFoundError, ProcessLookupError):
+            return None
 
 
 def _kill(proc: subprocess.Popen[bytes]) -> None:

@@ -3,6 +3,7 @@
 
 from __future__ import annotations
 
+import json
 from collections.abc import Mapping
 from pathlib import Path
 from typing import Any
@@ -600,3 +601,145 @@ def test_a_tagging_that_found_no_server_has_no_cleanup() -> None:
     error(run(["--", "true"], gateway), "tag_failed", 12)
     assert calls(gateway)[-1] == "if-shell -F"
     assert list(key(tb.cleanup_kill("%5", "@3"))) not in gateway.calls
+
+
+# --- step 7: the process ------------------------------------------------------------------------
+
+RECORD = key(tb.record_process("%5", ID, "4242", "823520334"))
+STAT_TAIL = "0 -1 4194304 131 0 0 0 0 0 0 0 20 0 1 0 823520334 3436544 70 18446744073709551615 0"
+
+
+def proc_stat(state: str = "S", ppid: int = 77) -> str:
+    return f"4242 (true) {state} {ppid} 4242 4242 {STAT_TAIL}\n"
+
+
+RECORDED = {"@termctl_pid": "4242", "@termctl_pid_start": "823520334", "pane_pid": "4242"}
+
+
+@pytest.mark.usefixtures("fixed_id")
+def test_open_records_the_servers_child_and_reports_its_pid() -> None:
+    plan = make_plan()
+    gateway = existing_session_flow(plan, completed("4242 0 77\n"), after=[new_row(**RECORDED)])
+    gateway.responses[RECORD] = completed()
+    gateway.proc_stats[4242] = proc_stat()
+    result = run(["--", "true"], gateway)
+    assert result.code == 0, result.stderr
+    out = result.json()
+    validate(out, "termctl/cli/open.json")
+    assert (out["pid"], out["state"]) == (4242, "running")
+    assert calls(gateway) == ["-V", "list-panes", "has-session -t", "new-window -d", "if-shell -F",
+                              "if-shell -F", "list-panes"]  # fmt: skip
+    assert gateway.calls[-2] == list(RECORD)
+    assert result.stderr == ""
+
+
+@pytest.mark.usefixtures("fixed_id")
+@pytest.mark.parametrize(
+    ("query", "stat"),
+    [("4242 1 77\n", proc_stat()), ("4242 0 77\n", proc_stat(ppid=78)),
+     ("4242 0 77\n", proc_stat(state="Z")), ("4242 0 77\n", None)],
+    ids=["dead", "other-parent", "zombie", "gone"],
+)  # fmt: skip
+def test_open_records_no_pid_unless_provably_the_servers_live_child(
+    query: str, stat: str | None
+) -> None:
+    gateway = existing_session_flow(make_plan(), completed(query))
+    gateway.proc_stats[4242] = stat
+    result = run(["--", "true"], gateway)
+    assert result.code == 0, result.stderr
+    assert result.json()["pid"] is None
+    assert RECORD not in [tuple(c) for c in gateway.calls]
+
+
+@pytest.mark.usefixtures("fixed_id")
+def test_a_failed_query_takes_the_state_from_the_follow_up_read() -> None:
+    dead = new_row(**{"pane_dead": "1", "pane_dead_status": "3", "@termctl_keep": "always"})
+    gateway = existing_session_flow(make_plan(keep="always"), completed("  \n"), after=[dead])
+    result = run(["--keep-on-exit", "always", "--", "true"], gateway)
+    assert result.code == 0, result.stderr
+    out = result.json()
+    assert (out["state"], out["exit_status"], out["pid"]) == ("dead", 3, None)
+    assert gateway.proc_reads == []
+
+
+@pytest.mark.usefixtures("fixed_id")
+def test_a_failed_recording_does_not_undo_the_open() -> None:
+    gateway = existing_session_flow(make_plan(), completed("4242 0 77\n"))
+    gateway.responses[RECORD] = completed(stderr="boom\n", returncode=1)
+    gateway.proc_stats[4242] = proc_stat()
+    result = run(["--", "true"], gateway)
+    assert result.code == 0, result.stderr
+    assert (result.json()["state"], result.json()["pid"]) == ("running", None)
+    assert "warning: could not record the PID of pane %5" in result.stderr
+    assert list(key(tb.cleanup_kill("%5", "@3"))) not in gateway.calls
+
+
+@pytest.mark.usefixtures("fixed_id")
+def test_a_failed_query_and_a_failed_read_report_gone_with_a_warning() -> None:
+    plan = make_plan()
+    gateway = existing_session_flow(plan, completed("garbage\n"))
+    gateway.after = None
+    failed_read = completed(stderr="boom\n", returncode=1)
+    gateway.effects[tag_key(plan)] = lambda g: setattr(g, "list_panes", failed_read)
+    result = run(["--", "true"], gateway)
+    assert result.code == 0, result.stderr
+    assert (result.json()["state"], result.json()["pid"]) == ("gone", None)
+    assert "warning: could not read pane" in result.stderr
+
+
+# --- tag_failed: the log record -----------------------------------------------------------------
+
+
+def log_lines(state: Path) -> list[Any]:
+    path = state / "termctl" / "log.jsonl"
+    return [json.loads(line) for line in path.read_text(encoding="utf-8").splitlines()]
+
+
+@pytest.mark.usefixtures("fixed_id")
+@pytest.mark.parametrize(
+    "tag_result",
+    [completed("termctl-nomatch\n"), completed(stderr="can't find pane: %5\n", returncode=1),
+     completed(stderr=f"no server running on {SOCK}\n", returncode=1)],
+    ids=["nomatch", "failed", "no-server"],
+)  # fmt: skip
+def test_tag_failed_is_logged_with_result_error(tag_result: Any, tmp_path: Path) -> None:
+    gateway = existing_session_flow(make_plan(), tag_result)
+    argv = ["--actor", "auto:policy", "--decision-id", "d-1", "--", "true"]
+    result = run(argv, gateway, {"XDG_STATE_HOME": str(tmp_path)})
+    err = error(result, "tag_failed", 12)
+    [record] = log_lines(tmp_path)
+    validate(record, "termctl/log.json")
+    assert record == {
+        "ts": CREATED_AT, "level": "error", "event": "open", "id": ID, "socket_path": SOCK,
+        "result": "error", "exit_code": 12, "message": err["message"], "actor": "auto:policy",
+        "decision_ids": ["d-1"], "escalation_override": False,
+    }  # fmt: skip
+    # No post-open hook runs and no read for an output follows.
+    assert calls(gateway).count("list-panes") == 1
+
+
+@pytest.mark.usefixtures("fixed_id")
+def test_tag_failed_logs_the_default_actor(tmp_path: Path) -> None:
+    gateway = existing_session_flow(make_plan(), completed("termctl-nomatch\n"))
+    gateway.tty = True
+    result = run(["--", "true"], gateway, {"XDG_STATE_HOME": str(tmp_path)})
+    error(result, "tag_failed", 12)
+    assert log_lines(tmp_path)[0]["actor"] == "human:user"
+
+
+@pytest.mark.usefixtures("fixed_id")
+def test_a_log_that_cannot_be_written_warns_and_keeps_tag_failed(tmp_path: Path) -> None:
+    blocker = tmp_path / "file"
+    blocker.write_text("", encoding="utf-8")
+    gateway = existing_session_flow(make_plan(), completed("termctl-nomatch\n"))
+    result = run(["--", "true"], gateway, {"XDG_STATE_HOME": str(blocker)})
+    error(result, "tag_failed", 12)
+    assert "warning: could not write the log record" in result.stderr
+
+
+@pytest.mark.usefixtures("fixed_id")
+def test_a_successful_open_writes_no_log_record_yet(tmp_path: Path) -> None:
+    # TODO(#17) owns the success record; until then only tag_failed is logged.
+    gateway = existing_session_flow(make_plan())
+    assert run(["--", "true"], gateway, {"XDG_STATE_HOME": str(tmp_path)}).code == 0
+    assert not (tmp_path / "termctl" / "log.jsonl").exists()

@@ -90,6 +90,7 @@ Error handling: usage and config problems are detected before any tmux call; tmu
 
 ## Implementation notes
 
+- Process reading (`procs.py`): Linux and WSL parse `/proc/<pid>/stat` after the last `)` (the command name may contain anything); a state of `Z`, `X` or `x` is a zombie. macOS runs `/bin/ps -o ppid= -o stat= -o lstart= -p <pid>` with `LC_ALL=C` and `TZ=UTC0` and converts `lstart` to seconds since the epoch; that path is not run in CI (manual macOS checklist, plan stage 4). The PID options are written by a second invocation, after the parent check, guarded by the pane being managed, not dead and still running that PID, both options in one invocation so a reader never sees one without the other.
 - Signaling (`procs.py`): on Linux termctl opens a `pidfd_open` handle on the recorded PID before `kill-pane`, verifies the start time, and signals through `pidfd_send_signal`, so a PID reused after the handle was opened is never signaled. A zombie counts as exited.
 - BEL (`bell` marker, `gateway.py`): the pane's tty is opened with `O_WRONLY|O_NOCTTY|O_NONBLOCK` and must be a character device; anything else is not written to.
 

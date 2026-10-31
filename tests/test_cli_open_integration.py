@@ -368,6 +368,54 @@ def test_verbose_without_argv_shows_env_names_never_values(tmux_server: TmuxServ
     assert "set-environment" in result.stderr
 
 
+# --- step 7: the process ------------------------------------------------------------------------
+
+
+def proc_stat_fields(pid: int) -> list[str]:
+    """Fields 3 on of ``/proc/<pid>/stat`` (index 0 is the state, 1 the parent, 19 the start)."""
+    return Path(f"/proc/{pid}/stat").read_text().rsplit(")", 1)[1].split()
+
+
+@needs_proc
+def test_e6_the_real_commands_pid_is_recorded_with_its_start_time(tmux_server: TmuxServer) -> None:
+    out = opened(tmux_server, "--", "sleep", "61")
+    pane = out["pane_id"]
+    pid = out["pid"]
+    assert out["state"] == "running"
+    # The query ran after respawn-pane: the PID is the real command, never the placeholder.
+    assert isinstance(pid, int) and str(pid) == fmt(tmux_server, pane, "#{pane_pid}")
+    assert Path(f"/proc/{pid}/cmdline").read_bytes().split(b"\0")[:2] == [b"sleep", b"61"]
+    fields = proc_stat_fields(pid)
+    assert fields[1] == fmt(tmux_server, pane, "#{pid}")  # its parent is the server
+    recorded = fmt(tmux_server, pane, "#{@termctl_pid} #{@termctl_pid_start}")
+    assert recorded == f"{pid} {fields[19]}"
+    shown = termctl(tmux_server, "--json", "show", out["id"]).json()
+    assert shown["pid"] == pid
+
+
+@needs_proc
+def test_e6_without_argv_the_login_shells_pid_is_recorded(tmux_server: TmuxServer) -> None:
+    out = opened(tmux_server)
+    pid = out["pid"]
+    assert isinstance(pid, int) and str(pid) == fmt(tmux_server, out["pane_id"], "#{pane_pid}")
+    assert proc_stat_fields(pid)[1] == fmt(tmux_server, out["pane_id"], "#{pid}")
+
+
+def test_e6_a_pane_dead_at_the_recording_gets_no_pid(tmux_server: TmuxServer) -> None:
+    # A command that has exited by the time termctl checks its process is never recorded: the
+    # pane is dead, or its process a zombie or reaped (keep always keeps the dead pane).
+    out = opened(tmux_server, "--keep-on-exit", "always", "--", "true")
+    assert wait_for(lambda: fmt(tmux_server, out["pane_id"], "#{pane_dead}") == "1")
+    pid, start = fmt(tmux_server, out["pane_id"], "#{@termctl_pid} #{@termctl_pid_start}").split(
+        " "
+    )
+    if out["pid"] is None:
+        assert (pid, start) == ("", "")
+    else:
+        # A slow host may still have seen `true` running: then both options are set.
+        assert pid == str(out["pid"]) and start != ""
+
+
 # --- failure ------------------------------------------------------------------------------------
 
 
@@ -384,6 +432,12 @@ def test_a_forged_global_ownership_marker_fails_the_tagging(tmux_server: TmuxSer
     # Review round 1, R1-7: the cleanup guard cannot match either, so the window stays (its
     # placeholder ends within 30 s) and a warning names it.
     assert "warning:" in result.stderr and "unmanaged" in result.stderr
+    # Logged with result error (interface.md "Audit and log"), under the private HOME.
+    log = tmux_server.root / ".local" / "state" / "termctl" / "log.jsonl"
+    [record] = [json.loads(line) for line in log.read_text().splitlines()]
+    validate(record, "termctl/log.json")
+    assert (record["event"], record["result"], record["exit_code"]) == ("open", "error", 12)
+    assert record["socket_path"] == tmux_server.socket_path
 
 
 def test_r1_4_a_failing_inner_command_of_the_tagging_removes_the_pane(

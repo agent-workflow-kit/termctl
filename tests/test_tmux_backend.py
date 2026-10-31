@@ -1672,21 +1672,88 @@ def test_tag_pane_shape_with_respawn() -> None:
         "'set' '-p' '-t' '%5' '--' 'remain-on-exit' 'failed'",
         "'respawn-pane' '-k' '-t' '%5' '-c' '/w' '-e' 'A=1' '--' '/usr/bin/env' '--'"
         " 'PATH=/opt/bin' 'tool' '-x'",
+        # Open order step 7: the query ends the invocation (spike E6).
+        "'display' '-p' '-t' '%5' '--' '#{pane_pid} #{pane_dead} #{pid}'",
     ]
     assert argv[10] == "'display' '-p' '--' 'termctl-nomatch'"
     assert len(argv) == 11
 
 
-def test_tag_pane_without_respawn_only_sets_options() -> None:
+def test_tag_pane_without_respawn_sets_options_then_queries() -> None:
     argv = tb.tag_pane("%5", "@2", OPTIONS, "off", None).argv(TMUX, SOCK)
     assert "respawn-pane" not in argv[9]
-    assert argv[9].endswith("'remain-on-exit' 'off'")
+    inner = argv[9].split(" ; ")
+    assert inner[-2].endswith("'remain-on-exit' 'off'")
+    assert inner[-1] == "'display' '-p' '-t' '%5' '--' '#{pane_pid} #{pane_dead} #{pid}'"
+
+
+@pytest.mark.parametrize(
+    ("stdout", "expected"),
+    [
+        ("4242 0 77\n", tb.ProcessQuery(4242, False, 77)),
+        ("4242 1 77", tb.ProcessQuery(4242, True, 77)),
+        ("9999999999 0 1\n", tb.ProcessQuery(9999999999, False, 1)),
+        ("", None),
+        ("\n", None),
+        ("  \n", None),  # display of a missing pane: empty fields (spike E6)
+        (" 0 \n", None),
+        ("0 0 77\n", None),
+        ("4242 0 0\n", None),
+        ("04242 0 77\n", None),
+        ("4242 2 77\n", None),
+        ("4242 0 77\n4242 0 77\n", None),
+        ("termctl-nomatch\n", None),
+        ("12345678901 0 77\n", None),
+        ("4242  0 77\n", None),
+        ("4242 0 77 \n", None),
+        ("٤٢ 0 77\n", None),
+        ("hook output\n4242 0 77\n", None),
+    ],
+)
+def test_parse_process_query(stdout: str, expected: tb.ProcessQuery | None) -> None:
+    assert tb.parse_process_query(stdout) == expected
+
+
+def test_record_process_writes_both_options_in_one_guard() -> None:
+    argv = tb.record_process("%5", "tc-abcdefgh", "4242", "823520334").argv(TMUX, SOCK)
+    assert argv[3:] == [
+        "if-shell", "-F", "-t", "%5", "--",
+        "#{&&:#{&&:#{==:#{@termctl_pane},#{pane_id}},#{==:#{@termctl_id},tc-abcdefgh}},"
+        "#{&&:#{==:#{pane_dead},0},#{==:#{pane_pid},4242}}}",
+        "'set' '-p' '-t' '%5' '--' '@termctl_pid' '4242' ; "
+        "'set' '-p' '-t' '%5' '--' '@termctl_pid_start' '823520334'",
+        "'display' '-p' '--' 'termctl-nomatch'",
+    ]  # fmt: skip
+
+
+@pytest.mark.parametrize(
+    ("termctl_id", "pid", "start"),
+    [
+        ("tc-abcdefgh", "0", "1"),
+        ("tc-abcdefgh", "01", "1"),
+        ("tc-abcdefgh", "12345678901", "1"),
+        ("tc-abcdefgh", "1,2", "1"),
+        ("tc-abcdefgh", "1}", "1"),
+        ("tc-abcdefgh", "#{pid}", "1"),
+        ("tc-abcdefgh", "1", ""),
+        ("tc-abcdefgh", "1", "1" * 21),
+        ("tc-abcdefgh", "1", "1;"),
+        ("tc-abcdefgh", "1", "-1"),
+        ("tc-ABCDEFGH", "1", "1"),
+        ("tc-abc}defg", "1", "1"),
+    ],
+)
+def test_record_process_refuses_values_outside_the_grammars(
+    termctl_id: str, pid: str, start: str
+) -> None:
+    with pytest.raises(ValueError):
+        tb.record_process("%5", termctl_id, pid, start)
 
 
 def test_respawn_without_path_runs_argv_after_usr_bin_env() -> None:
     respawn = tb.Respawn(cwd="/w", argv=("A=b-is-an-argument", "x"))
     argv = tb.tag_pane("%5", "@2", OPTIONS, "on", respawn).argv(TMUX, SOCK)
-    assert argv[9].split(" ; ")[-1].endswith("'--' '/usr/bin/env' '--' 'A=b-is-an-argument' 'x'")
+    assert argv[9].split(" ; ")[-2].endswith("'--' '/usr/bin/env' '--' 'A=b-is-an-argument' 'x'")
 
 
 def test_tag_pane_shows_env_names_never_values() -> None:

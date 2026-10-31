@@ -505,6 +505,122 @@ def test_tag_failed_never_echoes_env_values() -> None:
     assert "value-not-to-print" not in caught.value.message
 
 
+def test_tag_returns_the_answer_of_the_step_7_query() -> None:
+    p = plan()
+    gateway = FakeGateway({tag_key(p): completed("4242 0 77\n")})
+    backend = TmuxBackend(Tmux(gateway, TMUX, SOCK, env={}))
+    assert open_cmd.tag(backend, PANE, ID, p, AT, [].append) == tb.ProcessQuery(4242, False, 77)
+
+
+@pytest.mark.parametrize("stdout", ["", "  \n", "garbage\n", "4242 0\n"])
+def test_tag_returns_none_when_the_query_failed(stdout: str) -> None:
+    p = plan()
+    gateway = FakeGateway({tag_key(p): completed(stdout)})
+    backend = TmuxBackend(Tmux(gateway, TMUX, SOCK, env={}))
+    assert open_cmd.tag(backend, PANE, ID, p, AT, [].append) is None
+    assert gateway.calls == [list(tag_key(p))]
+
+
+# --- step 7: the process --------------------------------------------------------------------------
+
+RECORD = tuple(tb.record_process("%5", ID, "4242", "823520334").argv(TMUX, SOCK))
+TAIL = "0 -1 4194304 131 0 0 0 0 0 0 0 20 0 1 0 823520334 3436544 70 18446744073709551615 0"
+
+
+def proc_stat(state: str = "S", ppid: int = 77) -> str:
+    return f"4242 (tool) {state} {ppid} 4242 4242 {TAIL}\n"
+
+
+def record(
+    gateway: FakeGateway, query: tb.ProcessQuery | None, warnings: list[str] | None = None
+) -> bool:
+    backend = TmuxBackend(Tmux(gateway, TMUX, SOCK, env={}))
+    return open_cmd.record(
+        backend, gateway, PANE, ID, query, (warnings if warnings is not None else []).append
+    )
+
+
+RUNNING = tb.ProcessQuery(4242, False, 77)
+
+
+def test_a_running_child_of_the_server_is_recorded() -> None:
+    # Spike E6: not dead, and its parent is the server, so the PID is the pane's process.
+    gateway = FakeGateway({RECORD: completed()}, proc_stats={4242: proc_stat()})
+    warnings: list[str] = []
+    assert record(gateway, RUNNING, warnings) is True
+    assert gateway.proc_reads == [4242]
+    assert gateway.calls == [list(RECORD)]
+    assert warnings == []
+
+
+@pytest.mark.parametrize(
+    ("query", "stat"),
+    [
+        (None, None),
+        (tb.ProcessQuery(4242, True, 77), proc_stat()),
+        (RUNNING, proc_stat(ppid=78)),
+        (RUNNING, proc_stat(ppid=1)),
+        (RUNNING, proc_stat(state="Z")),
+        (RUNNING, proc_stat(state="X")),
+        (RUNNING, None),
+    ],
+    ids=["query-failed", "dead", "other-parent", "reparented", "zombie", "reaped", "gone"],
+)
+def test_nothing_is_recorded_unless_provably_the_servers_live_child(
+    query: tb.ProcessQuery | None, stat: str | None
+) -> None:
+    gateway = FakeGateway(proc_stats={4242: stat})
+    warnings: list[str] = []
+    assert record(gateway, query, warnings) is False
+    assert gateway.calls == []
+    assert warnings == []
+    if query is None or query.dead:
+        assert gateway.proc_reads == []
+
+
+@pytest.mark.parametrize(
+    "stat", [PermissionError(13, "Permission denied"), "4242 (tool) S x\n"], ids=["eacces", "bad"]
+)
+def test_a_process_that_cannot_be_read_warns_and_records_nothing(stat: object) -> None:
+    gateway = FakeGateway(proc_stats={4242: stat})  # type: ignore[dict-item]
+    warnings: list[str] = []
+    assert record(gateway, RUNNING, warnings) is False
+    assert gateway.calls == []
+    assert len(warnings) == 1 and "%5" in warnings[0]
+
+
+def test_a_recording_whose_guard_no_longer_matches_is_silent() -> None:
+    # The pane died, closed or changed between the query and the recording.
+    gateway = FakeGateway({RECORD: NOMATCH}, proc_stats={4242: proc_stat()})
+    warnings: list[str] = []
+    assert record(gateway, RUNNING, warnings) is False
+    assert warnings == []
+
+
+@pytest.mark.parametrize(
+    "result",
+    [completed(stderr="boom\n", returncode=1), subprocess.TimeoutExpired(["tmux"], 30)],
+    ids=["failed", "timeout"],
+)
+def test_a_failed_recording_warns_and_never_raises(result: object) -> None:
+    gateway = FakeGateway({RECORD: result}, proc_stats={4242: proc_stat()})  # type: ignore[dict-item]
+    warnings: list[str] = []
+    assert record(gateway, RUNNING, warnings) is False
+    assert len(warnings) == 1 and "%5" in warnings[0]
+
+
+def test_macos_reads_the_parent_with_ps() -> None:
+    ps = ("/bin/ps", "-o", "ppid=", "-o", "stat=", "-o", "lstart=", "-p", "4242")
+    start = "1793402720"  # 2026-10-30T23:25:20Z
+    recorded = tuple(tb.record_process("%5", ID, "4242", start).argv(TMUX, SOCK))
+    gateway = FakeGateway(
+        {ps: completed("77 S Fri Oct 30 23:25:20 2026\n"), recorded: completed()},
+        system="darwin",
+    )
+    assert record(gateway, RUNNING) is True
+    assert gateway.calls == [list(ps), list(recorded)]
+
+
 # --- step 5: server and session -----------------------------------------------------------------
 
 SPEC = spec("/w", "KEY-12")
