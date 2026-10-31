@@ -799,7 +799,7 @@ def test_context_carries_injected_gateway_and_clock(monkeypatch: pytest.MonkeyPa
 # --- unimplemented commands ---------------------------------------------------------------------
 
 
-@pytest.mark.parametrize("command", sorted(MINIMAL))
+@pytest.mark.parametrize("command", sorted(set(MINIMAL) - {"placements"}))
 def test_unimplemented_command_is_internal_error(command: str) -> None:
     run = Run(["--json", *MINIMAL[command]])
     assert run.code == 1
