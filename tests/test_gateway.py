@@ -2,6 +2,7 @@ from __future__ import annotations
 
 import os
 import pwd
+import stat
 import sys
 from datetime import UTC
 from pathlib import Path
@@ -96,3 +97,33 @@ def test_system_gateway_user_name_none_without_passwd_entry(
 
     monkeypatch.setattr(pwd, "getpwuid", missing)
     assert SystemGateway().user_name() is None
+
+
+def test_system_gateway_real_uid(monkeypatch: pytest.MonkeyPatch) -> None:
+    monkeypatch.setattr(os, "getuid", lambda: 4242)
+    assert SystemGateway().real_uid() == 4242
+
+
+def test_system_gateway_lstat_does_not_follow_symlinks(tmp_path: Path) -> None:
+    (tmp_path / "dir").mkdir(mode=0o750)
+    (tmp_path / "dir").chmod(0o750)
+    (tmp_path / "link").symlink_to(tmp_path / "dir")
+    gateway = SystemGateway()
+    info = gateway.lstat(str(tmp_path / "dir"))
+    assert (stat.S_ISDIR(info.mode), stat.S_IMODE(info.mode)) == (True, 0o750)
+    assert info.uid == os.getuid()
+    assert stat.S_ISLNK(gateway.lstat(str(tmp_path / "link")).mode)
+    with pytest.raises(FileNotFoundError):
+        gateway.lstat(str(tmp_path / "missing"))
+
+
+def test_system_gateway_real_path_is_strict(tmp_path: Path) -> None:
+    (tmp_path / "dir").mkdir()
+    (tmp_path / "link").symlink_to(tmp_path / "dir")
+    (tmp_path / "dangling").symlink_to(tmp_path / "nowhere")
+    gateway = SystemGateway()
+    assert gateway.real_path(str(tmp_path / "link")) == os.path.realpath(tmp_path / "dir")
+    with pytest.raises(OSError):
+        gateway.real_path(str(tmp_path / "dangling"))
+    with pytest.raises(OSError):
+        gateway.real_path(str(tmp_path / "missing" / ".."))

@@ -12,8 +12,17 @@ import pwd
 import subprocess
 import time
 from collections.abc import Mapping
+from dataclasses import dataclass
 from datetime import UTC, datetime
 from typing import Protocol
+
+
+@dataclass(frozen=True)
+class FileInfo:
+    """What termctl reads from ``lstat``: the file type and permission bits, and the owner."""
+
+    mode: int
+    uid: int
 
 
 class Gateway(Protocol):
@@ -42,6 +51,19 @@ class Gateway(Protocol):
 
     def user_name(self) -> str | None:
         """The real uid's user name from the password database, or None if it has none."""
+        ...
+
+    def real_uid(self) -> int:
+        """The real uid of the termctl process."""
+        ...
+
+    def lstat(self, path: str) -> FileInfo:
+        """``lstat`` of ``path`` (a symlink is not followed); raises ``OSError``."""
+        ...
+
+    def real_path(self, path: str) -> str:
+        """``path`` with every symlink resolved; raises ``OSError`` if any part of it is
+        missing or cannot be resolved."""
         ...
 
 
@@ -95,6 +117,16 @@ class SystemGateway:
             return pwd.getpwuid(os.getuid()).pw_name
         except KeyError:
             return None
+
+    def real_uid(self) -> int:
+        return os.getuid()
+
+    def lstat(self, path: str) -> FileInfo:
+        st = os.lstat(path)
+        return FileInfo(mode=st.st_mode, uid=st.st_uid)
+
+    def real_path(self, path: str) -> str:
+        return os.path.realpath(path, strict=True)
 
 
 class SystemClock:

@@ -1,0 +1,655 @@
+"""Server selection, the canonical socket_path and the socket safety checks
+(interface.md "Server selection", design.md D12 and D26)."""
+
+from __future__ import annotations
+
+import os
+import shutil
+import socket
+import tempfile
+from collections.abc import Iterator, Mapping
+from pathlib import Path
+
+import pytest
+
+from termctl import tmux_socket
+from termctl.errors import TermctlError
+from termctl.gateway import FileInfo, SystemGateway
+from termctl.tmux_socket import Server
+
+from .fakes import (
+    UID,
+    FakeGateway,
+    directory,
+    regular_file,
+    safe_default_server,
+    socket_file,
+)
+
+DEFAULT = f"/tmp/tmux-{UID}/default"
+
+
+def resolve(
+    flag: str | None = None,
+    configured: str | None = None,
+    environ: Mapping[str, str] | None = None,
+    gateway: FakeGateway | None = None,
+) -> Server:
+    return tmux_socket.resolve(flag, configured, environ or {}, gateway or FakeGateway())
+
+
+def resolve_error(
+    flag: str | None = None,
+    configured: str | None = None,
+    environ: Mapping[str, str] | None = None,
+    gateway: FakeGateway | None = None,
+) -> TermctlError:
+    with pytest.raises(TermctlError) as caught:
+        resolve(flag, configured, environ, gateway)
+    return caught.value
+
+
+# --- server selection order ---------------------------------------------------------------------
+
+
+def test_default_is_the_default_socket_in_the_default_directory() -> None:
+    server = resolve()
+    assert server.socket_path == DEFAULT
+    assert server.source == "default"
+    assert server.default_form
+
+
+def test_tmux_names_the_server_by_its_first_field() -> None:
+    server = resolve(environ={"TMUX": "/srv/tmux/s1,1234,0"})
+    assert (server.socket_path, server.source) == ("/srv/tmux/s1", "TMUX")
+    assert not server.default_form
+
+
+def test_config_wins_over_tmux() -> None:
+    server = resolve(configured="work", environ={"TMUX": "/srv/tmux/s1,1,0"})
+    assert (server.socket_path, server.source) == (f"/tmp/tmux-{UID}/work", "config")
+
+
+def test_termctl_socket_wins_over_tmux_and_is_reported_as_the_variable() -> None:
+    # config.load has already put TERMCTL_SOCKET over the config file's `socket`.
+    environ = {"TERMCTL_SOCKET": "/srv/env", "TMUX": "/srv/tmux/s1,1,0"}
+    server = resolve(configured="/srv/env", environ=environ)
+    assert (server.socket_path, server.source) == ("/srv/env", "TERMCTL_SOCKET")
+
+
+def test_flag_wins_over_everything() -> None:
+    environ = {"TERMCTL_SOCKET": "/srv/env", "TMUX": "/srv/tmux/s1,1,0"}
+    server = resolve("/srv/flag", "/srv/env", environ)
+    assert (server.socket_path, server.source) == ("/srv/flag", "--socket")
+
+
+def test_flag_name_resolves_into_the_default_directory() -> None:
+    server = resolve("work")
+    assert server.socket_path == f"/tmp/tmux-{UID}/work"
+    assert server.default_form
+
+
+def test_name_uses_tmux_tmpdir_and_the_real_uid() -> None:
+    gateway = FakeGateway(uid=4242, files=safe_default_server(4242, "/run/t"))
+    server = resolve("work", environ={"TMUX_TMPDIR": "/run/t"}, gateway=gateway)
+    assert server.socket_path == "/run/t/tmux-4242/work"
+    assert server.default_dir == "/run/t/tmux-4242"
+    assert server.default_form
+
+
+def test_empty_tmux_tmpdir_means_tmp() -> None:
+    assert resolve(environ={"TMUX_TMPDIR": ""}).socket_path == DEFAULT
+
+
+def test_empty_tmux_is_not_inside_tmux() -> None:
+    server = resolve(environ={"TMUX": ""})
+    assert (server.socket_path, server.source) == (DEFAULT, "default")
+
+
+def test_relative_flag_is_resolved_against_the_current_directory() -> None:
+    gateway = FakeGateway(cwd="/home/u", files={"/": directory(), "/home": directory()})
+    gateway.files["/home/u"] = directory(uid=UID)
+    assert resolve("sockets/s", gateway=gateway).socket_path == "/home/u/sockets/s"
+
+
+def test_relative_flag_without_a_current_directory_is_a_usage_error() -> None:
+    err = resolve_error("rel/s", gateway=FakeGateway(cwd=None))
+    assert err.code == "usage"
+
+
+def test_socket_args_always_use_dash_s() -> None:
+    server = resolve("work")
+    assert tmux_socket.socket_args(server) == ["-S", f"/tmp/tmux-{UID}/work"]
+
+
+def test_resolution_runs_nothing() -> None:
+    gateway = FakeGateway()
+    resolve("/srv/x", gateway=gateway)
+    resolve(environ={"TMUX": "/a/b,1,0"}, gateway=gateway)
+    assert gateway.calls == []
+
+
+def test_tmux_is_not_read_when_a_socket_is_given() -> None:
+    # An invalid TMUX does not matter when a higher-precedence source names the server.
+    assert resolve("work", environ={"TMUX": "relative,1,0"}).source == "--socket"
+
+
+# --- invalid environment values -----------------------------------------------------------------
+
+
+@pytest.mark.parametrize(
+    "value",
+    [
+        ",1,0",  # empty socket path
+        "relative/s,1,0",  # not absolute
+        "name,1,0",  # not a path
+        "/a/\x01b,1,0",  # control character
+        "/a/\udcff,1,0",  # not valid Unicode
+        "/a/b;,1,0",  # ends in ';'
+        "/a/..,1,0",  # basename '..'
+        "/a/,1,0",  # trailing '/'
+        "/" + "a" * 100 + ",1,0",  # over 100 bytes as given
+    ],
+)
+def test_invalid_tmux_is_config_invalid(value: str) -> None:
+    err = resolve_error(environ={"TMUX": value})
+    assert (err.code, err.exit_code) == ("config_invalid", 2)
+    assert err.details == {"variable": "TMUX"}
+
+
+@pytest.mark.parametrize("value", ["relative", "/a,b", "/a/\x07", "/a/\udc80", "/" + "x" * 95])
+def test_invalid_tmux_tmpdir_is_config_invalid(value: str) -> None:
+    err = resolve_error("/srv/explicit", environ={"TMUX_TMPDIR": value})
+    assert err.code == "config_invalid"
+    assert err.details == {"variable": "TMUX_TMPDIR"}
+
+
+# --- the canonical socket_path ------------------------------------------------------------------
+
+
+def test_symlinked_ancestors_are_resolved() -> None:
+    gateway = FakeGateway(
+        files={"/": directory(), "/real": directory(), "/real/dir": directory(uid=UID)},
+        links={"/link": "/real"},
+    )
+    assert resolve("/link/dir/s", gateway=gateway).socket_path == "/real/dir/s"
+
+
+def test_relative_symlink_target() -> None:
+    gateway = FakeGateway(
+        files={"/": directory(), "/a": directory(), "/a/real": directory()},
+        links={"/a/link": "real"},
+    )
+    assert resolve("/a/link/s", gateway=gateway).socket_path == "/a/real/s"
+
+
+def test_missing_components_are_kept_after_the_deepest_existing_ancestor() -> None:
+    gateway = FakeGateway(files={"/": directory(), "/real": directory()}, links={"/link": "/real"})
+    server = resolve("/link/missing/deeper/s", gateway=gateway)
+    assert server.socket_path == "/real/missing/deeper/s"
+
+
+def test_dotdot_after_a_missing_component_is_kept() -> None:
+    # The kernel fails at the missing component, so it must not be cancelled out.
+    gateway = FakeGateway(files={"/": directory(), "/a": directory()})
+    assert resolve("/a/missing/../s", gateway=gateway).socket_path == "/a/missing/../s"
+
+
+def test_dotdot_after_an_existing_directory_is_resolved() -> None:
+    gateway = FakeGateway(
+        files={"/": directory(), "/a": directory(), "/a/b": directory(), "/real": directory()},
+        links={"/l": "/a/b"},
+    )
+    # /l/.. is the parent of the link's target, as the kernel resolves it.
+    assert resolve("/l/../s", gateway=gateway).socket_path == "/a/s"
+
+
+def test_dotdot_after_a_file_is_not_cancelled() -> None:
+    gateway = FakeGateway(files={"/": directory(), "/a": directory(), "/a/f": regular_file()})
+    assert resolve("/a/f/../s", gateway=gateway).socket_path == "/a/f/../s"
+
+
+def test_dot_and_empty_components_are_dropped() -> None:
+    gateway = FakeGateway(files={"/": directory(), "/a": directory()})
+    assert resolve("//a/./b//s", gateway=gateway).socket_path == "/a/b/s"
+
+
+def test_socket_basename_is_never_resolved() -> None:
+    gateway = FakeGateway(
+        files={"/": directory(), "/a": directory(), "/a/real": socket_file()},
+        links={"/a/s": "real"},
+    )
+    assert resolve("/a/s", gateway=gateway).socket_path == "/a/s"
+
+
+def test_socket_in_root() -> None:
+    assert resolve("/s", gateway=FakeGateway(files={"/": directory()})).socket_path == "/s"
+
+
+def test_dangling_symlink_is_kept_unresolved() -> None:
+    gateway = FakeGateway(files={"/": directory()}, links={"/dangling": "/nowhere"})
+    assert resolve("/dangling/s", gateway=gateway).socket_path == "/dangling/s"
+
+
+def long_target_gateway() -> FakeGateway:
+    target = "/" + "d" * 98
+    return FakeGateway(files={"/": directory(), target: directory()}, links={"/l": target})
+
+
+def test_canonical_path_over_100_bytes_from_the_flag_is_usage() -> None:
+    err = resolve_error("/l/s", gateway=long_target_gateway())
+    assert (err.code, err.exit_code) == ("usage", 2)
+    assert "100 bytes" in err.message
+
+
+def test_canonical_path_over_100_bytes_from_termctl_socket() -> None:
+    err = resolve_error(None, "/l/s", {"TERMCTL_SOCKET": "/l/s"}, gateway=long_target_gateway())
+    assert err.code == "config_invalid"
+    assert err.details == {"variable": "TERMCTL_SOCKET"}
+
+
+def test_canonical_path_over_100_bytes_from_config() -> None:
+    err = resolve_error(None, "/l/s", gateway=long_target_gateway())
+    assert err.code == "config_invalid"
+    assert err.details == {"key": "socket"}
+
+
+def test_canonical_path_over_100_bytes_from_tmux() -> None:
+    err = resolve_error(environ={"TMUX": "/l/s,1,0"}, gateway=long_target_gateway())
+    assert err.details == {"variable": "TMUX"}
+
+
+def test_canonical_default_socket_over_100_bytes_names_tmux_tmpdir() -> None:
+    tmpdir = "/" + "t" * 85
+    gateway = FakeGateway(files={"/": directory()}, links={"/t": tmpdir})
+    gateway.files[tmpdir] = directory(0o1777)
+    err = resolve_error(environ={"TMUX_TMPDIR": "/t"}, gateway=gateway)
+    assert err.code == "config_invalid"
+    assert err.details == {"variable": "TMUX_TMPDIR"}
+
+
+def test_exactly_100_bytes_is_accepted() -> None:
+    path = "/" + "s" * 99
+    assert len(path.encode()) == 100
+    assert resolve(path, gateway=FakeGateway(files={"/": directory()})).socket_path == path
+
+
+@pytest.mark.parametrize("target", ["/a,b", "/a\x1bb", "/a\u0085b"])
+def test_canonical_path_must_follow_the_socket_rules(target: str) -> None:
+    gateway = FakeGateway(files={"/": directory(), target: directory()}, links={"/l": target})
+    err = resolve_error("/l/s", gateway=gateway)
+    assert err.code == "usage"
+
+
+# --- the default directory form -----------------------------------------------------------------
+
+
+def test_explicit_path_in_the_default_directory_is_default_form() -> None:
+    assert resolve(f"/tmp/tmux-{UID}/other").default_form
+
+
+def test_tmux_path_in_the_default_directory_is_default_form() -> None:
+    assert resolve(environ={"TMUX": f"/tmp/tmux-{UID}/default,1,0"}).default_form
+
+
+def test_path_reaching_the_default_directory_through_a_symlink_is_default_form() -> None:
+    gateway = FakeGateway(links={"/home": f"/tmp/tmux-{UID}"})
+    server = resolve("/home/s", gateway=gateway)
+    assert server.socket_path == f"/tmp/tmux-{UID}/s"
+    assert server.default_form
+
+
+def test_symlinked_tmpdir_is_compared_canonically() -> None:
+    # As on macOS, where /tmp is a symlink to /private/tmp.
+    files = safe_default_server(UID, "/private/tmp")
+    gateway = FakeGateway(files=files, links={"/tmp": "/private/tmp"})
+    server = resolve(environ={"TMUX": f"/private/tmp/tmux-{UID}/default,1,0"}, gateway=gateway)
+    assert server.default_dir == f"/private/tmp/tmux-{UID}"
+    assert server.default_form
+    assert resolve(gateway=gateway).socket_path == f"/private/tmp/tmux-{UID}/default"
+
+
+def test_other_uid_directory_is_not_default_form() -> None:
+    assert not resolve("/tmp/tmux-0/default").default_form
+
+
+# --- safety checks on a fake filesystem (owners the test user cannot create) --------------------
+
+
+def check(server: Server, gateway: FakeGateway) -> bool:
+    return tmux_socket.check(server, gateway)
+
+
+def check_error(path: str, gateway: FakeGateway) -> TermctlError:
+    server = resolve(path, gateway=gateway)
+    with pytest.raises(TermctlError) as caught:
+        check(server, gateway)
+    assert (caught.value.code, caught.value.exit_code) == ("server_unavailable", 12)
+    assert caught.value.details is not None
+    assert caught.value.details["socket_path"] == server.socket_path
+    return caught.value
+
+
+def test_safe_default_server_passes() -> None:
+    gateway = FakeGateway()
+    assert check(resolve(gateway=gateway), gateway) is True
+    assert gateway.calls == []
+
+
+def other_path_files(**parent: int) -> dict[str, FileInfo]:
+    return {
+        "/": directory(),
+        "/srv": directory(),
+        "/srv/t": directory(parent.get("mode", 0o755), parent.get("uid", UID)),
+        "/srv/t/s": socket_file(),
+    }
+
+
+def test_other_path_owned_by_root_passes() -> None:
+    gateway = FakeGateway(files=other_path_files(uid=0))
+    assert check(resolve("/srv/t/s", gateway=gateway), gateway) is True
+
+
+def test_other_path_owned_by_another_user_fails() -> None:
+    err = check_error("/srv/t/s", FakeGateway(files=other_path_files(uid=UID + 1)))
+    assert err.details is not None and err.details["path"] == "/srv/t"
+
+
+def test_default_directory_owned_by_root_fails() -> None:
+    files = safe_default_server()
+    files[f"/tmp/tmux-{UID}"] = directory(0o700, 0)
+    check_error(DEFAULT, FakeGateway(files=files))
+
+
+def test_ancestor_owned_by_another_user_fails() -> None:
+    files = other_path_files()
+    files["/srv"] = directory(0o755, UID + 1)
+    err = check_error("/srv/t/s", FakeGateway(files=files))
+    assert err.details is not None and err.details["path"] == "/srv"
+
+
+def test_root_owned_group_writable_ancestor_without_sticky_fails() -> None:
+    files = other_path_files()
+    files["/srv"] = directory(0o775, 0)
+    check_error("/srv/t/s", FakeGateway(files=files))
+
+
+def test_root_owned_sticky_world_writable_ancestor_passes() -> None:
+    files = other_path_files()
+    files["/srv"] = directory(0o1777, 0)
+    gateway = FakeGateway(files=files)
+    assert check(resolve("/srv/t/s", gateway=gateway), gateway) is True
+
+
+def test_root_directory_is_checked_too() -> None:
+    files = other_path_files()
+    files["/"] = directory(0o777, 0)
+    err = check_error("/srv/t/s", FakeGateway(files=files))
+    assert err.details is not None and err.details["path"] == "/"
+
+
+def test_socket_owned_by_another_user_fails() -> None:
+    files = other_path_files()
+    files["/srv/t/s"] = socket_file(uid=UID + 1)
+    check_error("/srv/t/s", FakeGateway(files=files))
+
+
+def test_socket_owned_by_root_fails() -> None:
+    files = other_path_files()
+    files["/srv/t/s"] = socket_file(uid=0)
+    check_error("/srv/t/s", FakeGateway(files=files))
+
+
+def test_parent_turned_symlink_after_resolution_fails() -> None:
+    gateway = FakeGateway(files=other_path_files())
+    server = resolve("/srv/t/s", gateway=gateway)
+    del gateway.files["/srv/t"]
+    gateway.links["/srv/t"] = "/elsewhere"
+    with pytest.raises(TermctlError) as caught:
+        check(server, gateway)
+    assert caught.value.code == "server_unavailable"
+
+
+def test_missing_socket_is_no_server() -> None:
+    files = other_path_files()
+    del files["/srv/t/s"]
+    gateway = FakeGateway(files=files)
+    assert check(resolve("/srv/t/s", gateway=gateway), gateway) is False
+
+
+def test_missing_parent_is_no_server_and_stops_the_walk() -> None:
+    gateway = FakeGateway(files={"/": directory(), "/srv": directory()})
+    assert check(resolve("/srv/t/u/s", gateway=gateway), gateway) is False
+    assert gateway.lstats[-1] == "/srv/t"
+
+
+def test_missing_default_directory_is_no_server() -> None:
+    gateway = FakeGateway(files={"/": directory(), "/tmp": directory(0o1777)})
+    assert check(resolve(gateway=gateway), gateway) is False
+
+
+def test_unsafe_ancestor_fails_before_a_missing_parent() -> None:
+    files = {"/": directory(), "/srv": directory(0o777, 0)}
+    err = check_error("/srv/missing/s", FakeGateway(files=files))
+    assert err.details is not None and err.details["path"] == "/srv"
+
+
+def test_dotdot_reached_in_the_walk_fails() -> None:
+    gateway = FakeGateway(files={"/": directory(), "/a": directory()})
+    server = resolve("/a/m/../s", gateway=gateway)
+    gateway.files["/a/m"] = directory()  # created after resolution
+    with pytest.raises(TermctlError) as caught:
+        check(server, gateway)
+    assert caught.value.code == "server_unavailable"
+
+
+# --- safety checks on the real filesystem -------------------------------------------------------
+
+
+class RealFs(SystemGateway):
+    """The real filesystem, with a real uid the test can change to play another user."""
+
+    def __init__(self, uid: int | None = None) -> None:
+        self.uid = os.getuid() if uid is None else uid
+
+    def real_uid(self) -> int:
+        return self.uid
+
+
+@pytest.fixture
+def base() -> Iterator[Path]:
+    """A short directory under /tmp (a sticky, root-owned ancestor), so socket paths fit in
+    100 bytes; pytest's tmp_path can be longer."""
+    path = Path(tempfile.mkdtemp(prefix="tc-", dir="/tmp"))
+    try:
+        yield path
+    finally:
+        for root, dirs, _ in os.walk(path):
+            for name in dirs:
+                if not os.path.islink(os.path.join(root, name)):
+                    os.chmod(os.path.join(root, name), 0o700)
+        shutil.rmtree(path)
+
+
+def make_socket(path: Path) -> Path:
+    sock = socket.socket(socket.AF_UNIX, socket.SOCK_STREAM)
+    sock.bind(str(path))
+    sock.close()
+    return path
+
+
+def real_check(path: str | None, environ: Mapping[str, str], gw: RealFs | None = None) -> bool:
+    gateway = gw or RealFs()
+    server = tmux_socket.resolve(path, None, environ, gateway)
+    return tmux_socket.check(server, gateway)
+
+
+def real_error(path: str | None, environ: Mapping[str, str], gw: RealFs | None = None) -> str:
+    with pytest.raises(TermctlError) as caught:
+        real_check(path, environ, gw)
+    assert caught.value.code == "server_unavailable"
+    return caught.value.message
+
+
+def default_dir(base: Path, mode: int = 0o700) -> Path:
+    path = base / f"tmux-{os.getuid()}"
+    path.mkdir()
+    path.chmod(mode)
+    return path
+
+
+def test_real_default_server_passes(base: Path) -> None:
+    make_socket(default_dir(base) / "default")
+    assert real_check(None, {"TMUX_TMPDIR": str(base)}) is True
+
+
+@pytest.mark.parametrize("mode", [0o700, 0o750, 0o740, 0o710])
+def test_real_default_directory_modes_accepted(base: Path, mode: int) -> None:
+    make_socket(default_dir(base, mode) / "default")
+    assert real_check("default", {"TMUX_TMPDIR": str(base)}) is True
+
+
+@pytest.mark.parametrize("mode", [0o720, 0o770, 0o701, 0o704, 0o702, 0o1770, 0o777])
+def test_real_default_directory_modes_rejected(base: Path, mode: int) -> None:
+    make_socket(default_dir(base, mode) / "default")
+    real_error("default", {"TMUX_TMPDIR": str(base)})
+
+
+def test_real_default_directory_symlink_fails(base: Path) -> None:
+    target = base / "target"
+    target.mkdir(mode=0o700)
+    make_socket(target / "default")
+    (base / f"tmux-{os.getuid()}").symlink_to(target)
+    message = real_error(None, {"TMUX_TMPDIR": str(base)})
+    assert "symlink" in message
+
+
+def test_real_default_directory_of_another_user_fails(base: Path) -> None:
+    make_socket(default_dir(base) / "default")
+    other = RealFs(os.getuid() + 1)
+    # The other user's default directory is tmux-<their uid>, which is ours renamed.
+    (base / f"tmux-{os.getuid()}").rename(base / f"tmux-{other.uid}")
+    real_error(None, {"TMUX_TMPDIR": str(base)}, other)
+
+
+def test_real_missing_default_directory_is_no_server_and_not_created(base: Path) -> None:
+    assert real_check(None, {"TMUX_TMPDIR": str(base)}) is False
+    assert list(base.iterdir()) == []
+
+
+@pytest.mark.parametrize("mode", [0o755, 0o750, 0o700, 0o555])
+def test_real_other_path_modes_accepted(base: Path, mode: int) -> None:
+    parent = base / "p"
+    parent.mkdir()
+    make_socket(parent / "s")
+    parent.chmod(mode)
+    assert real_check(str(parent / "s"), {}) is True
+
+
+@pytest.mark.parametrize("mode", [0o775, 0o757, 0o1777, 0o1775, 0o3777])
+def test_real_other_path_writable_parent_rejected_even_when_sticky(base: Path, mode: int) -> None:
+    parent = base / "p"
+    parent.mkdir()
+    make_socket(parent / "s")
+    parent.chmod(mode)
+    real_error(str(parent / "s"), {})
+
+
+def test_real_sticky_writable_ancestor_is_accepted(base: Path) -> None:
+    (base / "shared").mkdir()
+    (base / "shared").chmod(0o1777)
+    parent = base / "shared" / "p"
+    parent.mkdir(mode=0o700)
+    make_socket(parent / "s")
+    assert real_check(str(parent / "s"), {}) is True
+
+
+@pytest.mark.parametrize("mode", [0o777, 0o775, 0o757])
+def test_real_writable_ancestor_without_sticky_fails(base: Path, mode: int) -> None:
+    (base / "shared").mkdir()
+    (base / "shared").chmod(mode)
+    parent = base / "shared" / "p"
+    parent.mkdir(mode=0o700)
+    make_socket(parent / "s")
+    message = real_error(str(parent / "s"), {})
+    assert "shared" in message
+
+
+def test_real_ancestor_owned_by_another_user_fails(base: Path) -> None:
+    parent = base / "p"
+    parent.mkdir(mode=0o700)
+    make_socket(parent / "s")
+    # Played as another user, `base` (ours) is an ancestor owned by someone else.
+    message = real_error(str(parent / "s"), {}, RealFs(os.getuid() + 1))
+    assert str(base) in message
+
+
+def test_real_unsafe_ancestor_fails_even_without_a_socket(base: Path) -> None:
+    (base / "shared").mkdir()
+    (base / "shared").chmod(0o777)
+    real_error(str(base / "shared" / "missing" / "s"), {})
+
+
+def test_real_symlinked_ancestor_is_checked_at_its_target(base: Path) -> None:
+    (base / "shared").mkdir()
+    (base / "shared").chmod(0o777)
+    parent = base / "shared" / "p"
+    parent.mkdir(mode=0o700)
+    make_socket(parent / "s")
+    (base / "safe-looking").symlink_to(base / "shared")
+    real_error(str(base / "safe-looking" / "p" / "s"), {})
+
+
+def test_real_socket_symlink_fails(base: Path) -> None:
+    parent = base / "p"
+    parent.mkdir(mode=0o700)
+    make_socket(parent / "real")
+    (parent / "s").symlink_to(parent / "real")
+    real_error(str(parent / "s"), {})
+
+
+def test_real_regular_file_socket_fails(base: Path) -> None:
+    parent = base / "p"
+    parent.mkdir(mode=0o700)
+    (parent / "s").write_text("")
+    message = real_error(str(parent / "s"), {})
+    assert "not a socket" in message
+
+
+def test_real_parent_is_a_file_fails(base: Path) -> None:
+    (base / "f").write_text("")
+    real_error(str(base / "f" / "s"), {})
+
+
+def test_real_dangling_symlink_in_the_path_fails(base: Path) -> None:
+    (base / "dangling").symlink_to(base / "nowhere")
+    real_error(str(base / "dangling" / "s"), {})
+
+
+def test_real_symlink_loop_in_the_path_fails(base: Path) -> None:
+    (base / "loop").symlink_to(base / "loop")
+    real_error(str(base / "loop" / "s"), {})
+
+
+def test_real_missing_socket_and_parent_are_no_server(base: Path) -> None:
+    (base / "p").mkdir(mode=0o700)
+    assert real_check(str(base / "p" / "s"), {}) is False
+    assert real_check(str(base / "missing" / "s"), {}) is False
+    assert not (base / "missing").exists()
+
+
+def test_real_unsearchable_directory_fails(base: Path) -> None:
+    if os.getuid() == 0:
+        pytest.skip("root bypasses directory permissions")
+    parent = base / "p" / "q"
+    parent.mkdir(parents=True, mode=0o700)
+    (base / "p").chmod(0o000)
+    message = real_error(str(parent / "s"), {})
+    assert "cannot" in message
+
+
+def test_real_tmp_is_an_accepted_sticky_ancestor() -> None:
+    info = os.lstat("/tmp")
+    if info.st_uid != 0 or not info.st_mode & 0o1000:
+        pytest.skip("/tmp is not a root-owned sticky directory here")
+    assert real_check("/tmp/tc-no-such-dir-for-termctl-tests/s", {}) is False

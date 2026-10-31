@@ -14,7 +14,7 @@ from collections.abc import Mapping, Sequence
 from dataclasses import dataclass, field
 from typing import Any, NoReturn, TextIO
 
-from . import __version__, ids, validate
+from . import __version__, ids, tmux_socket, validate
 from . import config as config_module
 from .argv import Scan, scan
 from .config import Config
@@ -34,6 +34,9 @@ class Context:
     environ: Mapping[str, str]
     out: Output = field(repr=False)
     config: Config = field(default_factory=config_module.defaults)
+    # Set by step 2 (the resolved server) and step 3 (False when there is no server).
+    server: tmux_socket.Server | None = None
+    socket_present: bool | None = None
 
 
 # --- argument parsing ---------------------------------------------------------------------------
@@ -402,16 +405,27 @@ def load_config(args: argparse.Namespace, ctx: Context) -> None:
 
 def resolve_server(args: argparse.Namespace, ctx: Context) -> None:
     """Step 2: resolve the server, without side effects."""
-    # TODO: socket resolution - issue #8
+    ctx.server = tmux_socket.resolve(args.socket, ctx.config.socket, ctx.environ, ctx.gateway)
 
 
 def check_tmux(args: argparse.Namespace, ctx: Context) -> None:
     """Step 3: tmux binary, version and socket safety checks (exit 12)."""
-    # TODO: tmux binary and version - issue #10; socket safety - issue #8
+    # TODO(#10): the tmux binary and version checks, before the socket checks.
+    assert ctx.server is not None
+    ctx.socket_present = tmux_socket.check(ctx.server, ctx.gateway)
 
 
 def resolve_id(args: argparse.Namespace, ctx: Context) -> None:
     """Step 4: resolve the id to one managed pane (exit 10 or 21)."""
+    # A missing socket or parent directory is no server; `exists` then prints its normal
+    # output with exit 10 (TODO(#12)), and a refused connection is no server too (TODO(#11)).
+    if ctx.socket_present is False and args.command != "exists":
+        assert ctx.server is not None
+        raise TermctlError(
+            "no_server",
+            f"no tmux server is running on {validate.show(ctx.server.socket_path, 200)}",
+            details={"socket_path": ctx.server.socket_path},
+        )
     # TODO: read the managed panes (issue #11) and pick one with ids.resolve - issue #12
 
 
