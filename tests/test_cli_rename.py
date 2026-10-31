@@ -16,6 +16,7 @@ import pytest
 from termctl import cli, lock
 from termctl import tmux_backend as tb
 from termctl.cli import main
+from termctl.gateway import Terminated
 from termctl.tmux_backend import Invocation, command
 
 from .fakes import TMUX, UID, FakeClock, FakeGateway, completed, is_list_panes, pane_row
@@ -52,7 +53,14 @@ def options_only(name: str) -> tuple[str, ...]:
 
 def lengths(*names: str) -> tuple[str, ...]:
     probe = command("display").flag("-p").target(tb.pane(PANE))
-    return _argv(probe.format_arg(tb.byte_lengths(*names)).build())
+    return _argv(probe.format_arg(tb.length_probe(*names)).build())
+
+
+def measured(*values: int, tab: bool = False) -> subprocess.CompletedProcess[str]:
+    """The length probe's answer for the pane of ``pane_row()``: its identity, ``values``
+    and, last, whether the window name holds a tab or newline."""
+    shown = " ".join(str(v) for v in values)
+    return completed(f"{PANE} @2 {PANE} {ID} {shown} {int(tab)}\n")
 
 
 class Server(FakeGateway):
@@ -281,7 +289,7 @@ def test_renaming_to_the_current_name_is_a_no_op(state: Path) -> None:
 def test_a_no_op_with_a_doubled_backslash_window_name(state: Path) -> None:
     gateway = Server(
         [pane_row(overrides={"@termctl_name": "a\\b", "window_name": "a\\\\b"})],
-        responses={lengths("@termctl_name", "window_name"): completed("3 4\n")},
+        responses={lengths("@termctl_name", "window_name"): measured(3, 4)},
     )
     result = run(["--json", "rename", ID, "a\\b"], gateway, state)
     assert result.code == 0
@@ -296,7 +304,7 @@ def test_a_forged_control_byte_is_not_a_no_op(state: Path) -> None:
     gateway = Server(
         [pane_row(overrides={"@termctl_name": printed, "window_name": "n\\\\033x"})],
         writes={combined(printed): (completed(), {"window_name": "n\\\\033x"})},
-        responses={lengths("@termctl_name", "window_name"): completed("3 7\n")},
+        responses={lengths("@termctl_name", "window_name"): measured(3, 7)},
     )
     result = run(["--json", "rename", ID, printed], gateway, state)
     assert result.code == 0
@@ -420,11 +428,14 @@ def test_usage_errors_are_not_logged(state: Path, argv: list[str]) -> None:
     assert result.log() == []
 
 
-def test_a_server_resolution_error_is_not_logged(state: Path) -> None:
+def test_a_server_resolution_error_is_logged_without_an_id_or_socket(state: Path) -> None:
     # Step 2: a TMUX whose first field is not an absolute socket path exits 2 (config_invalid).
     result = run(["rename", ID, "n"], renaming(), state, environ={"TMUX": "rel/sock,1,0"})
     assert result.code == 2
-    assert result.log() == []
+    [record] = result.log()
+    validate(record, "termctl/log.json")
+    assert (record["event"], record["result"], record["exit_code"]) == ("rename", "error", 2)
+    assert (record["id"], record["socket_path"]) == (None, None)
 
 
 def test_a_tmux_check_failure_is_logged_without_an_id(state: Path) -> None:
@@ -452,6 +463,106 @@ def test_a_reader_warning_gets_a_warning_record(state: Path) -> None:
     assert (warning["event"], warning["result"], warning["level"]) == ("warning", "warning", "warn")
     assert warning["id"] is None and "ignoring managed pane %9" in warning["message"]
     assert done["event"] == "rename"
+
+
+def test_a_no_op_writes_no_warning_record(state: Path) -> None:
+    bad = pane_row(pane_id="%9", tc_id="tc-zzzzzzzz", overrides={"@termctl_keep": "sometimes"})
+    gateway = Server([pane_row(), bad])
+    gateway.responses[(TMUX, "-V")] = completed("tmux master\n")
+    result = run(["--json", "rename", ID, "KEY-12"], gateway, state)
+    assert (result.code, result.json()["changed"]) == (0, False)
+    assert "ignoring managed pane %9" in result.stderr
+    assert not (state / "termctl" / "log.jsonl").exists()
+
+
+def test_warnings_are_logged_before_the_record_of_a_change(state: Path) -> None:
+    bad = pane_row(pane_id="%9", tc_id="tc-zzzzzzzz", overrides={"@termctl_keep": "sometimes"})
+    gateway = Server(
+        [pane_row(), bad],
+        writes={combined("new"): (completed(), {"@termctl_name": "new", "window_name": "new"})},
+    )
+    gateway.responses[(TMUX, "-V")] = completed("tmux master\n")
+    result = run(["rename", ID, "new"], gateway, state)
+    assert result.code == 0
+    records = result.log()
+    assert [r["event"] for r in records] == ["warning", "warning", "rename"]
+    assert "ignoring managed pane %9" in records[1]["message"]
+
+
+def test_warnings_are_logged_before_the_record_of_a_failure(state: Path) -> None:
+    bad = pane_row(pane_id="%9", tc_id="tc-zzzzzzzz", overrides={"@termctl_keep": "sometimes"})
+    gateway = Server([pane_row(), bad], writes={combined("new"): (NOMATCH, {})})
+    gateway.responses[options_only("new")] = NOMATCH
+    result = run(["rename", ID, "new"], gateway, state)
+    assert result.code == 10
+    assert [(r["event"], r["result"]) for r in result.log()] == [
+        ("warning", "warning"),
+        ("rename", "error"),
+    ]
+
+
+class Invalidating(Server):
+    """Makes the pane invalid (a bad ``@termctl_keep``) after the step-4 read, as if someone
+    changed it while termctl waited for the lock."""
+
+    def _respond(self, argv: list[str], env: Mapping[str, str] | None) -> Any:
+        response = super()._respond(argv, env)
+        if is_list_panes(argv):
+            assert self.panes is not None
+            self.panes[0]["@termctl_keep"] = "sometimes"
+        return response
+
+
+def test_a_pane_turned_invalid_under_the_lock_is_gone_with_its_warning(state: Path) -> None:
+    gateway = Invalidating([pane_row()])
+    result = run(["rename", ID, "new"], gateway, state)
+    assert result.code == 10
+    assert result.stderr.count(f"ignoring managed pane {PANE}") == 1
+    warning, error = result.log()
+    assert (warning["event"], error["event"], error["exit_code"]) == ("warning", "rename", 10)
+    assert f"ignoring managed pane {PANE}" in warning["message"]
+    assert writes(gateway) == []
+
+
+class Stopping(Server):
+    """Raises ``stop`` right after the guarded write landed, as a signal would."""
+
+    def __init__(self, stop: BaseException) -> None:
+        super().__init__(
+            [pane_row()],
+            writes={combined("new"): (completed(), {"@termctl_name": "new", "window_name": "new"})},
+        )
+        self.stop = stop
+
+    def _respond(self, argv: list[str], env: Mapping[str, str] | None) -> Any:
+        response = super()._respond(argv, env)
+        if tuple(argv) == combined("new"):
+            raise self.stop
+        return response
+
+
+@pytest.mark.parametrize(
+    ("stop", "code", "message"),
+    [
+        (KeyboardInterrupt(), 130, "interrupted"),
+        (Terminated(15), 143, "terminated by signal 15"),
+    ],
+)
+def test_a_signal_after_the_write_is_logged_with_its_exit_code(
+    state: Path, stop: BaseException, code: int, message: str
+) -> None:
+    bad = pane_row(pane_id="%9", tc_id="tc-zzzzzzzz", overrides={"@termctl_keep": "sometimes"})
+    gateway = Stopping(stop)
+    assert gateway.panes is not None
+    gateway.panes.append(bad)
+    result = run(["rename", ID, "new"], gateway, state)
+    assert result.code == code
+    warning, record = result.log()
+    validate(record, "termctl/log.json")
+    assert warning["event"] == "warning"
+    assert (record["event"], record["result"], record["exit_code"]) == ("rename", "error", code)
+    assert (record["id"], record["message"]) == (ID, message)
+    assert gateway.panes[0]["@termctl_name"] == "new"  # the change landed
 
 
 def test_a_tmux_version_warning_gets_a_warning_record(state: Path) -> None:

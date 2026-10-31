@@ -17,13 +17,19 @@ tmux prints them, and tmux prints a control byte or invalid UTF-8 as backslash e
 (``\\033``), which cannot be told from a literal backslash (interface.md "Residual risks",
 forged control bytes). So a compared value that holds a backslash counts as equal only when
 its stored length in bytes, read with ``#{n:...}``, is that of the text as printed; escape text
-is always longer than the byte it stands for. Otherwise the change is written again, which
-replaces a forged value.
+is always longer than the byte it stands for. The window name is read with every tab and
+newline shown as a space (``panes``), so a compared window name that holds a space is measured
+too, and the same probe proves it holds no tab or newline. The probe also checks that the pane
+answering is still the one read (``Backend.byte_lengths``). Otherwise the change is written
+again, which replaces a forged value.
+
+**Warnings.** The reads under the lock report their warnings through ``warn``, each once and
+none that step 4 already reported (``seen``).
 """
 
 from __future__ import annotations
 
-from collections.abc import Callable, Mapping, Sequence
+from collections.abc import Callable, Iterable, Mapping, Sequence
 from dataclasses import dataclass
 from typing import Protocol
 
@@ -57,7 +63,7 @@ class PaneWriter(Protocol):
         self, pane: ManagedPane, options: Mapping[str, str], window_name: str | None
     ) -> bool: ...
 
-    def byte_lengths(self, pane_id: str, names: Sequence[str]) -> tuple[int, ...] | None: ...
+    def byte_lengths(self, pane: ManagedPane, names: Sequence[str]) -> tuple[int, ...] | None: ...
 
 
 @dataclass(frozen=True)
@@ -87,13 +93,26 @@ def change_pane(
     version: TmuxVersion | None,
     environ: Mapping[str, str],
     clock: Clock,
+    warn: Callable[[str], None],
+    seen: Iterable[str] = (),
 ) -> Outcome:
     """Apply ``plan(pane)`` to the managed pane carrying the full id ``termctl_id`` under the
     server lock. Raises ``locked`` (exit 12) when the lock cannot be had, ``not_found`` (10)
     when the pane is gone or no longer the one resolved, ``ambiguous`` (21) when two panes now
-    carry the id, and the tmux failures of ``Backend.write_pane``."""
+    carry the id, and the tmux failures of ``Backend.write_pane``. Reader warnings not in
+    ``seen`` go to ``warn``, once each."""
+    reported = set(seen)
+
+    def read() -> PaneRead:
+        result = backend.read_panes()
+        for warning in result.warnings:
+            if warning not in reported:
+                reported.add(warning)
+                warn(warning)
+        return result
+
     with server_lock(backend.socket_path, environ=environ, clock=clock):
-        pane = _resolve(backend, termctl_id)
+        pane = _resolve(read(), termctl_id)
         change = plan(pane)
         unknown = set(change.options) - set(_CURRENT)
         if unknown:
@@ -103,12 +122,11 @@ def change_pane(
         rename = change.display_name is not None and may_rename_window(pane)
         window_name = change.display_name if rename else None
         updated = backend.write_pane(pane, change.options, window_name)
-        return Outcome(pane=_resolve(backend, termctl_id), changed=True, display_updated=updated)
+        return Outcome(pane=_resolve(read(), termctl_id), changed=True, display_updated=updated)
 
 
-def _resolve(backend: PaneWriter, termctl_id: str) -> ManagedPane:
-    """The pane carrying exactly ``termctl_id``, read now."""
-    read = backend.read_panes()
+def _resolve(read: PaneRead, termctl_id: str) -> ManagedPane:
+    """The pane carrying exactly ``termctl_id`` in ``read``."""
     if not read.server_running:
         raise TermctlError(
             "not_found", f"managed pane {termctl_id} is gone (no tmux server is running)"
@@ -135,9 +153,13 @@ def _is_no_op(
         if not shows(pane.display_name, change.display_name, version):
             return False
         compared["window_name"] = pane.display_name
-    measured = {name: value for name, value in compared.items() if "\\" in value}
+    measured = {
+        name: value
+        for name, value in compared.items()
+        if "\\" in value or (name == "window_name" and " " in value)
+    }
     if not measured:
         return True
-    lengths = backend.byte_lengths(pane.pane_id, list(measured))
+    lengths = backend.byte_lengths(pane, list(measured))
     printed = tuple(len(value.encode("utf-8", "surrogateescape")) for value in measured.values())
     return lengths == printed

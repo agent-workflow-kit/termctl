@@ -136,9 +136,12 @@ class Backend(Protocol):
         resolved exits 10 (``not_found``)."""
         ...
 
-    def byte_lengths(self, pane_id: str, names: Sequence[str]) -> tuple[int, ...] | None:
-        """The stored length in bytes of each named field or option of ``pane_id`` (read-only),
-        or None when tmux does not answer with one number per name."""
+    def byte_lengths(self, pane: ManagedPane, names: Sequence[str]) -> tuple[int, ...] | None:
+        """The stored length in bytes of each named field or option of ``pane``, or None when
+        tmux does not answer with one number per name, when the pane that answers is not
+        ``pane`` (its pane id, window id, ``@termctl_pane`` and ``@termctl_id``), or when
+        ``window_name`` is among the names and holds a tab or newline. The probe is read-only:
+        a mismatch can only turn a no-op into a guarded rewrite."""
         ...
 
 
@@ -259,10 +262,10 @@ class TmuxBackend:
         ``rename-window`` under ``owned_single_pane_window``, so both happen or neither. If that
         guard does not match (the window was split, or the pane moved, since it was read; or
         the pane is gone), the options alone under ``owned``; if that does not match either,
-        the pane is gone or no longer the one resolved: exit 10. Without options, the second
-        guard runs only a ``display -p`` of the pane id, to tell those cases apart."""
-        if not options and window_name is None:
-            raise ValueError("write_pane needs options or a window name")
+        the pane is gone or no longer the one resolved: exit 10. ``options`` must not be
+        empty: every pane change writes at least one option."""
+        if not options:
+            raise ValueError("write_pane needs options")
         target = tb.pane(pane.pane_id)
         sets = [
             command("set").flag("-p").target(target).arg(name).arg(value).build()
@@ -277,22 +280,26 @@ class TmuxBackend:
                 raise tmux_failure(result, pane.id, self.socket_path)
             if outcome is GuardOutcome.MATCHED:
                 return True
-        inner = sets or [
-            command("display").flag("-p").target(target).format_arg(tb.fields("pane_id")).build()
-        ]
-        guard = tb.guarded(target, tb.owned(pane.id), *inner)
+        guard = tb.guarded(target, tb.owned(pane.id), *sets)
         check_guard(self.tmux.run(Invocation.of(guard), utf8=True), pane.id, self.socket_path)
         return False
 
-    def byte_lengths(self, pane_id: str, names: Sequence[str]) -> tuple[int, ...] | None:
-        probe = command("display").flag("-p").target(tb.pane(pane_id))
+    def byte_lengths(self, pane: ManagedPane, names: Sequence[str]) -> tuple[int, ...] | None:
+        probe = command("display").flag("-p").target(tb.pane(pane.pane_id))
         result = self.tmux.run(
-            Invocation.of(probe.format_arg(tb.byte_lengths(*names)).build()), utf8=True
+            Invocation.of(probe.format_arg(tb.length_probe(*names)).build()), utf8=True
         )
         lines = result.stdout.splitlines()
         if result.returncode != 0 or len(lines) != 1:
             return None
         values = lines[0].split(" ")
-        if len(values) != len(names) or not all(_LENGTH.fullmatch(v) for v in values):
+        identity = [pane.pane_id, pane.window_id, pane.pane_id, pane.id]
+        flags = ["0"] if "window_name" in names else []
+        if len(values) != len(identity) + len(names) + len(flags):
             return None
-        return tuple(int(v) for v in values)
+        lengths = values[len(identity) : len(identity) + len(names)]
+        if values[: len(identity)] != identity or values[len(values) - len(flags) :] != flags:
+            return None
+        if not all(_LENGTH.fullmatch(v) for v in lengths):
+            return None
+        return tuple(int(v) for v in lengths)
