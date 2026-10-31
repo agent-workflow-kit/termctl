@@ -9,7 +9,8 @@ implements it:
   ``list`` and id resolution use it through ``cli.read_panes``.
 - ``session_state``, ``create_session`` and ``create_window``: ``open``'s server and session
   (``open_cmd.create_window`` runs them in the order of interface.md "Open order" step 5).
-- TODO(#15, #16, #17): the rest of ``open`` (tagging and respawn, PID recording).
+- ``tag_pane`` and ``cleanup_pane``: ``open``'s pane (Open order step 6, ``open_cmd.tag``).
+- TODO(#16, #17): the rest of ``open`` (PID recording, hooks).
 - TODO(#19): ``rename``; TODO(#20): ``mark`` and ``unmark``; TODO(#21): label changes.
 - TODO(#23): ``close``; TODO(#24): ``focus``.
 """
@@ -18,7 +19,7 @@ from __future__ import annotations
 
 import enum
 import subprocess
-from collections.abc import Callable
+from collections.abc import Callable, Sequence
 from typing import NamedTuple, Protocol
 
 from . import panes
@@ -74,6 +75,23 @@ class Backend(Protocol):
         exits 12 (``server_unavailable``)."""
         ...
 
+    def tag_pane(
+        self,
+        created: Created,
+        options: Sequence[tuple[str, str]],
+        remain_on_exit: str,
+        respawn: tb.Respawn | None,
+    ) -> None:
+        """Tag the pane step 5 created, guarded by its being untagged and in the window step 5
+        reported, and, with ``respawn``, replace its placeholder with the real command. A guard
+        that does not match or a failing tmux call exits 12 (``tag_failed``)."""
+        ...
+
+    def cleanup_pane(self, created: Created) -> bool:
+        """Kill the pane after a failed tagging, guarded (``tmux_backend.cleanup_kill``);
+        whether the guarded kill ran. Never raises for a tmux failure."""
+        ...
+
 
 class TmuxBackend:
     """The tmux backend. ``tmux`` carries the resolved ``tmux_bin`` (#10), the checked socket
@@ -113,6 +131,37 @@ class TmuxBackend:
         if tb.is_session_missing(result, session) or tb.is_no_server(result, self.socket_path):
             return None
         return self._created(result)
+
+    def tag_pane(
+        self,
+        created: Created,
+        options: Sequence[tuple[str, str]],
+        remain_on_exit: str,
+        respawn: tb.Respawn | None,
+    ) -> None:
+        invocation = tb.tag_pane(
+            created.pane_id, created.window_id, options, remain_on_exit, respawn
+        )
+        result = self.tmux.run(invocation)
+        outcome = tb.guard_outcome(result)
+        if outcome is tb.GuardOutcome.FAILED:
+            raise TermctlError(
+                "tag_failed",
+                f"tagging pane {created.pane_id} failed: {tb.tmux_message(result)}",
+            )
+        if outcome is tb.GuardOutcome.NOMATCH:
+            raise TermctlError(
+                "tag_failed",
+                f"pane {created.pane_id} was gone, moved or already tagged before termctl"
+                " could tag it",
+            )
+
+    def cleanup_pane(self, created: Created) -> bool:
+        try:
+            result = self.tmux.run(tb.cleanup_kill(created.pane_id, created.window_id))
+        except TermctlError:
+            return False
+        return tb.guard_outcome(result) is tb.GuardOutcome.MATCHED
 
     def _created(self, result: subprocess.CompletedProcess[str]) -> Created:
         """The ids a successful creation printed. A failed chain is never taken as created,

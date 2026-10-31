@@ -1023,6 +1023,86 @@ def new_session(name: str, spec: WindowSpec, *, start_server: bool) -> Invocatio
     return Invocation.of(*commands)
 
 
+# --- open: the pane (interface.md "Open order" step 6, "Command") -------------------------------
+
+# Every command termctl runs in a pane starts with this, so tmux always receives at least two
+# arguments and executes them directly (tmux runs a single argument through ``sh -c``).
+COMMAND_PREFIX = ("/usr/bin/env", "--")
+
+
+@dataclass(frozen=True)
+class Respawn:
+    """The real command that replaces the placeholder (``respawn-pane -k``): ``argv`` run as
+    ``/usr/bin/env -- [PATH=<path>] <argv...>`` in ``cwd``, with the ``--env`` variables
+    ``env`` as ``-e`` (``PATH`` excluded: tmux ignores ``-e PATH``, spike C7, so it reaches the
+    program through ``env`` instead, spike G4)."""
+
+    cwd: str
+    argv: tuple[str, ...]
+    env: tuple[tuple[str, str], ...] = ()
+    path: str | None = None
+
+
+def _respawn(target: Target, respawn: Respawn) -> Command:
+    if not respawn.argv:
+        raise ValueError("a respawn needs a command")
+    if not os.path.isabs(respawn.cwd):
+        raise ValueError(f"the working directory must be absolute: {respawn.cwd!r}")
+    builder = command("respawn-pane").flag("-k").target(target).option("-c", respawn.cwd)
+    for name, value in respawn.env:
+        if name == "PATH":
+            raise ValueError("PATH is passed through /usr/bin/env, never as -e")
+        builder.env(name, value)
+    for element in COMMAND_PREFIX:
+        builder.arg(element)
+    if respawn.path is not None:
+        builder.env_arg("PATH", respawn.path)
+    for element in respawn.argv:
+        builder.arg(element)
+    return builder.build()
+
+
+def tag_pane(
+    pane_id: str,
+    window_id: str,
+    options: Sequence[tuple[str, str]],
+    remain_on_exit: str,
+    respawn: Respawn | None,
+) -> Invocation:
+    """The tagging invocation of Open order step 6, guarded by ``untagged_in_window``: the
+    pane options ``options`` (each written with ``set -p``, an empty value as ``''``), the
+    window options ``automatic-rename off`` and ``allow-rename off``, the pane option
+    ``remain-on-exit``, then, with argv, ``respawn-pane -k`` with the real command.
+
+    TODO(#16): the query of step 7 (``display -p '#{pane_pid} #{pane_dead} #{pid}'``) ends
+    this invocation.
+    """
+    if remain_on_exit not in ("off", "failed", "on"):
+        raise ValueError(f"invalid remain-on-exit value: {remain_on_exit!r}")
+    target = pane(pane_id)
+    inner = [
+        command("set").flag("-p").target(target).arg(name).arg(value).build()
+        for name, value in options
+    ]
+    for name in ("automatic-rename", "allow-rename"):
+        inner.append(command("set").flag("-w").target(target).arg(name).arg("off").build())
+    inner.append(
+        command("set").flag("-p").target(target).arg("remain-on-exit").arg(remain_on_exit).build()
+    )
+    if respawn is not None:
+        inner.append(_respawn(target, respawn))
+    return Invocation.of(guarded(target, untagged_in_window(window_id), *inner))
+
+
+def cleanup_kill(pane_id: str, window_id: str) -> Invocation:
+    """The kill after a failed tagging (Open order): the pane by its exact id, only while it
+    is in ``window_id`` and its ``@termctl_pane`` is empty or its own id (``cleanup``)."""
+    target = pane(pane_id)
+    return Invocation.of(
+        guarded(target, cleanup(window_id), command("kill-pane").target(target).build())
+    )
+
+
 def parse_created(stdout: str) -> tuple[str, str] | None:
     """The pane and window ids that ``-P -F CREATED_FORMAT`` printed, or None for anything but
     exactly one such line."""

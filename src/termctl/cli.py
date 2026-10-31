@@ -16,9 +16,8 @@ from typing import Any, NoReturn, TextIO
 
 from . import __version__, ids, open_cmd, panes, placement, tmux_bin, tmux_socket, validate
 from . import config as config_module
-from . import tmux_backend as tb
 from .argv import Scan, scan
-from .backend import Backend, TmuxBackend
+from .backend import Backend, Created, TmuxBackend
 from .config import Config
 from .errors import TermctlError, UsageError
 from .gateway import Clock, Gateway, SystemClock, SystemGateway
@@ -52,7 +51,9 @@ class Context:
     pane: ManagedPane | None = None
     # `open`'s resolved placement (Open order step 2); None for other commands.
     selection: placement.Selection | None = None
-    # `open`'s window and id (Open order step 2; step 3 replaces the id on a collision).
+    # `open`'s plan, its window and its id (Open order step 2; step 3 replaces the id on a
+    # collision).
+    plan: open_cmd.Plan | None = None
     window: WindowSpec | None = None
     open_id: str | None = None
 
@@ -371,9 +372,9 @@ def check_args(args: argparse.Namespace, ctx: Context) -> None:
     config (a marker or placement being defined) or the pane list (the label limit of
     ``label add``) belong to later steps. Some step-1 checks are not here yet (see the TODO).
     """
-    # TODO: remaining step-1 usage checks, owned by later issues: an argv[0] containing '='
-    # and --env PATH=... without argv (#15); the --override-escalation gate (TTY or a human:
-    # actor) and --hook name validity (#6, #17); the `close --force` gate (#23).
+    # TODO: remaining step-1 usage checks, owned by later issues: the --override-escalation
+    # gate (TTY or a human: actor) and --hook name validity (#6, #17); the `close --force`
+    # gate (#23).
     if args.socket is not None:
         validate.check_socket_flag(args.socket)
     command = args.command
@@ -396,7 +397,7 @@ def check_args(args: argparse.Namespace, ctx: Context) -> None:
             validate.check_name(args.name)
         if args.cwd is not None:
             validate.check_cwd_flag(args.cwd)
-        validate.parse_env(args.env)
+        open_cmd.check_argv(args.argv, validate.parse_env(args.env))
         if args.placement is not None:
             validate.check_placement_name(args.placement)
         if args.session is not None:
@@ -453,13 +454,20 @@ def resolve_command(args: argparse.Namespace, ctx: Context) -> None:
         path = open_cmd.command_path(env, ctx.environ, ctx.config.server_env_allow)
         open_cmd.check_command(args.argv[0], args.cwd, path, ctx.gateway)
     name = args.name if args.name is not None else open_cmd.default_name(args.argv)
-    ctx.window = open_cmd.window_spec(name, args.cwd)
-    # TODO(#15): also the tagging and respawn invocation of step 6, which carries argv and the
-    # --env values; until then the new-session invocation of step 5 is the largest.
-    largest = tb.new_session(ctx.selection.session, ctx.window, start_server=True)
-    open_cmd.check_size([largest], ctx.tmux_path, ctx.server.socket_path)
-    # The id; step 3 checks it against the managed panes.
+    ctx.plan = open_cmd.Plan(
+        name=name,
+        cwd=args.cwd,
+        argv=tuple(args.argv),
+        env=tuple(env.items()),
+        labels=tuple(validate.parse_labels(args.labels)),
+        placement=ctx.selection.name,
+        keep_on_exit=args.keep_on_exit or ctx.config.keep_on_exit,
+    )
+    ctx.window = ctx.plan.window
+    # The id; step 3 checks it against the managed panes (a replacement has the same length).
     ctx.open_id = ids.generate()
+    invocations = open_cmd.size_invocations(ctx.selection.session, ctx.plan, ctx.open_id)
+    open_cmd.check_size(invocations, ctx.tmux_path, ctx.server.socket_path)
 
 
 def check_tmux(args: argparse.Namespace, ctx: Context) -> None:
@@ -474,6 +482,7 @@ def check_tmux(args: argparse.Namespace, ctx: Context) -> None:
             ctx.out.warn,
             ctx.out.trace,
             path=ctx.tmux_path,
+            env=server_env(ctx),
         )
     assert ctx.server is not None
     ctx.socket_present = tmux_socket.check(ctx.server, ctx.gateway)
@@ -512,19 +521,22 @@ def unchecked_backend(ctx: Context) -> TmuxBackend:
     """The backend for the resolved server, without the socket checks: only for a caller that
     runs them itself immediately before each connect (``open_cmd.create_window``)."""
     assert ctx.server is not None and ctx.tmux is not None
-    # TODO(#15): run tmux with the environment filtered by server_env_allow, through
-    # `open_cmd.allowed`, the single server_env_allow matcher (never a second one); until then
-    # only the caller's locale, as for `tmux -V`.
-    env = tmux_bin.locale_env(ctx.environ)
     tmux = Tmux(
         ctx.gateway,
         ctx.tmux.path,
         ctx.server.socket_path,
-        env=env,
+        env=server_env(ctx),
         trace=ctx.out.trace,
         configured_bin=ctx.config.tmux_bin,
     )
     return TmuxBackend(tmux)
+
+
+def server_env(ctx: Context) -> dict[str, str]:
+    """The environment every tmux command runs with: the caller's, filtered by
+    ``server_env_allow`` through ``open_cmd.allowed``, the single matcher (interface.md
+    "Environment"). It becomes the server's global environment when a command starts one."""
+    return open_cmd.filtered_env(ctx.environ, ctx.config.server_env_allow)
 
 
 def read_panes(ctx: Context) -> PaneRead:
@@ -617,16 +629,67 @@ def open_pane(args: argparse.Namespace, ctx: Context) -> Result:
         # placement, matched_rule, session and target are in ctx.selection, its id in
         # ctx.open_id, the window in ctx.window.
         raise TermctlError("internal", f"{PROG} open --dry-run is not implemented yet")
+    assert ctx.plan is not None and ctx.open_id is not None
     # TODO(#17): step 4, the pre-open hooks (veto 11, escalation 13; nothing created).
-    # TODO(#15): wire in step 5, `open_cmd.create_window(unchecked_backend(ctx), ctx.server,
-    # ctx.gateway, ctx.selection.session, ctx.window)`, together with step 6, which tags the
-    # pane it returns and respawns it with argv (the server environment must be set first);
-    # TODO(#16) records the process; TODO(#17) post-open hooks, the log record and the output.
-    # Until then open refuses here, before any side effect.
-    raise TermctlError(
-        "internal",
-        f"{PROG} open is not implemented yet: creating the pane lands with a later change",
+    backend = unchecked_backend(ctx)
+    created = open_cmd.create_window(
+        backend, ctx.server, ctx.gateway, ctx.selection.session, ctx.window
     )
+    created_at = open_cmd.timestamp(ctx.clock.now())
+    open_cmd.tag(backend, created, ctx.open_id, ctx.plan, created_at)
+    # TODO(#16): step 7 records the process; TODO(#24): step 8, --focus;
+    # TODO(#17): post-open hooks, the log record and the final output.
+    return _opened(args, ctx, backend, created, created_at)
+
+
+def _opened(
+    args: argparse.Namespace, ctx: Context, backend: Backend, created: Created, created_at: str
+) -> Result:
+    """The ``open`` output, from a read after step 6: the pane object, or, if the pane is no
+    longer there, ``state: gone`` with the last known values (interface.md ``open``). A read
+    that fails also reports ``state: gone``, with a warning."""
+    assert ctx.plan is not None and ctx.open_id is not None and ctx.selection is not None
+    socket_path = _socket_path(ctx)
+    pane: ManagedPane | None = None
+    try:
+        read = backend.read_panes()
+    except TermctlError as err:
+        ctx.out.warn(f"could not read pane {ctx.open_id} after opening it: {err.message}")
+    else:
+        seen = () if ctx.pane_read is None else ctx.pane_read.warnings
+        for warning in read.warnings:
+            if warning not in seen:
+                ctx.out.warn(warning)
+        pane = next(
+            (p for p in read.panes if p.id == ctx.open_id and p.pane_id == created.pane_id),
+            None,
+        )
+    if pane is not None:
+        data = pane.pane_object(socket_path)
+    else:
+        data = {
+            "id": ctx.open_id,
+            "name": ctx.plan.name,
+            "display_name": ctx.plan.name,
+            "marker": None,
+            "marker_text": None,
+            "labels": list(ctx.plan.labels),
+            "placement": ctx.plan.placement,
+            "session": ctx.selection.session,
+            "pane_id": created.pane_id,
+            "window_id": created.window_id,
+            "socket_path": socket_path,
+            "created": created_at,
+            "pid": None,
+            "state": "gone",
+            "exit_status": None,
+            "exit_signal": None,
+            "keep_on_exit": ctx.plan.keep_on_exit,
+        }
+    data["focused"] = False
+    # TODO(#17): the ids pre-open hooks return follow the --decision-id values.
+    data["decision_ids"] = list(args.decision_ids)
+    return Result(data, ctx.open_id)
 
 
 COMMAND_STEPS = {"show": show, "exists": exists, "list": list_panes, "open": open_pane}

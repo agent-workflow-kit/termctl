@@ -90,7 +90,7 @@ Status: planned, 2026-10-30. Implements [interface.md](interface.md) (normative)
 - hooks: pre-open payload fields (env names only), veto/escalate/override, decision ids in output, log and audit (override runs).
 - `--dry-run`: read-only tmux queries only, tmux checks, `%NEW`/`@NEW` tokens, no hooks, nothing created.
 
-Interim state: until the pane step (#15) lands, the CLI `open` runs steps 1 to 3 and then refuses (exit 1, `internal`) before any side effect; step 5 (`open_cmd.create_window`) is tested directly.
+Interim state: the CLI `open` runs steps 1 to 3, 5 and 6 (no hooks yet), then reads the pane back for its output, with `pid: null` until the process is recorded (#16), `focused: false` until focus-on-open lands (#24) and only the `--decision-id` values (#17). `open --dry-run` still refuses (exit 1, `internal`) until #18.
 
 **Status**: Not Started
 

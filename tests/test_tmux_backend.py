@@ -1644,6 +1644,97 @@ def test_a_session_name_starting_with_a_dash_is_a_value() -> None:
     assert argv[argv.index("-s") + 1] == "-x"
 
 
+# --- open: the pane (Open order step 6) ---------------------------------------------------------
+
+OPTIONS = [("@termctl_v", "1"), ("@termctl_name", "a b;"), ("@termctl_marker", "")]
+
+
+def test_tag_pane_shape_with_respawn() -> None:
+    respawn = tb.Respawn(cwd="/w", argv=("tool", "-x"), env=(("A", "1"),), path="/opt/bin")
+    argv = tb.tag_pane("%5", "@2", OPTIONS, "failed", respawn).argv(TMUX, SOCK)
+    assert argv[:9] == [TMUX, "-S", SOCK, "if-shell", "-F", "-t", "%5", "--",
+                        "#{&&:#{==:#{@termctl_pane},},#{==:#{window_id},@2}}"]  # fmt: skip
+    assert argv[9].split(" ; ") == [
+        "'set' '-p' '-t' '%5' '--' '@termctl_v' '1'",
+        "'set' '-p' '-t' '%5' '--' '@termctl_name' 'a b;'",
+        "'set' '-p' '-t' '%5' '--' '@termctl_marker' ''",
+        "'set' '-w' '-t' '%5' '--' 'automatic-rename' 'off'",
+        "'set' '-w' '-t' '%5' '--' 'allow-rename' 'off'",
+        "'set' '-p' '-t' '%5' '--' 'remain-on-exit' 'failed'",
+        "'respawn-pane' '-k' '-t' '%5' '-c' '/w' '-e' 'A=1' '--' '/usr/bin/env' '--'"
+        " 'PATH=/opt/bin' 'tool' '-x'",
+    ]
+    assert argv[10] == "'display' '-p' '--' 'termctl-nomatch'"
+    assert len(argv) == 11
+
+
+def test_tag_pane_without_respawn_only_sets_options() -> None:
+    argv = tb.tag_pane("%5", "@2", OPTIONS, "off", None).argv(TMUX, SOCK)
+    assert "respawn-pane" not in argv[9]
+    assert argv[9].endswith("'remain-on-exit' 'off'")
+
+
+def test_respawn_without_path_runs_argv_after_usr_bin_env() -> None:
+    respawn = tb.Respawn(cwd="/w", argv=("A=b-is-an-argument", "x"))
+    argv = tb.tag_pane("%5", "@2", OPTIONS, "on", respawn).argv(TMUX, SOCK)
+    assert argv[9].split(" ; ")[-1].endswith("'--' '/usr/bin/env' '--' 'A=b-is-an-argument' 'x'")
+
+
+def test_tag_pane_shows_env_names_never_values() -> None:
+    respawn = tb.Respawn(
+        cwd="/w", argv=("t",), env=(("TOKENISH", "s3cret-value"),), path="/s3cret-path"
+    )
+    invocation = tb.tag_pane("%5", "@2", OPTIONS, "on", respawn)
+    shown = " ".join(invocation.shown_argv(TMUX, SOCK))
+    assert "s3cret" not in shown
+    assert "'-e' 'TOKENISH'" in shown and "'PATH' 't'" in shown
+    assert "s3cret-value" in " ".join(invocation.argv(TMUX, SOCK))
+
+
+@pytest.mark.parametrize("value", HOSTILE)
+def test_tag_pane_applies_the_argument_rules(value: str) -> None:
+    if "\x00" in value:
+        pytest.skip("rejected as input earlier")
+    respawn = tb.Respawn(cwd="/w", argv=(value or "x", value), env=(("A", value),), path=value)
+    argv = tb.tag_pane("%5", "@2", [("@termctl_name", value)], "on", respawn).argv(TMUX, SOCK)
+    # One guard: the hostile value never adds a separator or a command of its own.
+    assert argv.count(";") == 0
+    assert len(argv) == 11
+
+
+def test_respawn_refuses_path_as_e_and_an_empty_command() -> None:
+    with pytest.raises(ValueError):
+        tb.tag_pane(
+            "%5", "@2", OPTIONS, "on", tb.Respawn(cwd="/", argv=("x",), env=(("PATH", "/"),))
+        )
+    with pytest.raises(ValueError):
+        tb.tag_pane("%5", "@2", OPTIONS, "on", tb.Respawn(cwd="/", argv=()))
+    with pytest.raises(ValueError):
+        tb.tag_pane("%5", "@2", OPTIONS, "on", tb.Respawn(cwd="rel", argv=("x",)))
+
+
+@pytest.mark.parametrize("remain", ["", "yes", "always", "ON"])
+def test_tag_pane_refuses_other_remain_on_exit_values(remain: str) -> None:
+    with pytest.raises(ValueError):
+        tb.tag_pane("%5", "@2", OPTIONS, remain, None)
+
+
+def test_tag_pane_refuses_options_outside_the_spec() -> None:
+    with pytest.raises(ValueError):
+        tb.tag_pane("%5", "@2", [("status", "off")], "on", None)
+
+
+def test_cleanup_kill_is_guarded_by_the_window_and_ownership() -> None:
+    argv = tb.cleanup_kill("%5", "@2").argv(TMUX, SOCK)
+    assert argv[3:] == [
+        "if-shell", "-F", "-t", "%5", "--",
+        "#{&&:#{==:#{window_id},@2},"
+        "#{||:#{==:#{@termctl_pane},},#{==:#{@termctl_pane},#{pane_id}}}}",
+        "'kill-pane' '-t' '%5'",
+        "'display' '-p' '--' 'termctl-nomatch'",
+    ]  # fmt: skip
+
+
 @pytest.mark.parametrize(
     ("stdout", "expected"),
     [
