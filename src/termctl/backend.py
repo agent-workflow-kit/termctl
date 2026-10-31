@@ -178,7 +178,14 @@ class TmuxBackend:
                 f"pane {created.pane_id} was gone, moved or already tagged before termctl"
                 " could tag it",
             )
-        return tb.parse_process_query(result.stdout)
+        query = tb.tagged_query(result.stdout)
+        if query is None:
+            raise TermctlError(
+                "tag_failed",
+                f"tagging pane {created.pane_id} failed: tmux did not confirm that the tagging"
+                " ran to the end",
+            )
+        return tb.parse_process_query(query)
 
     def cleanup_pane(self, created: Created) -> bool:
         try:

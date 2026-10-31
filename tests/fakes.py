@@ -219,6 +219,9 @@ class FakeGateway:
         # run_group and spawn_watched answers, keyed by argv.
         self.group_responses: dict[tuple[str, ...], GroupResponse] = {}
         self.group_calls: list[GroupCall] = []
+        # A stop (or any exception) raised after the call's ``record`` ran, as the real
+        # gateway raises a stop signal that came while the run was being recorded; by argv.
+        self.stops_after_record: dict[tuple[str, ...], BaseException] = {}
 
     def run(
         self,
@@ -275,24 +278,41 @@ class FakeGateway:
         timeout: float,
         stdout_limit: int,
         stderr_limit: int,
+        record: Callable[[GroupRun], None] | None = None,
     ) -> GroupRun:
         call = GroupCall(list(argv), stdin, dict(env), timeout, stdout_limit, stderr_limit, False)
         self.group_calls.append(call)
         response = self._group_response(argv)
         if isinstance(response, BaseException):
             raise response
-        if isinstance(response, GroupRun):
-            return response
-        return response(call)
+        run = response if isinstance(response, GroupRun) else response(call)
+        if record is not None:
+            record(run)
+        self._stop_after_record(argv)
+        return run
 
     def spawn_watched(
-        self, argv: list[str], *, stdin: bytes, env: Mapping[str, str], timeout: float
+        self,
+        argv: list[str],
+        *,
+        stdin: bytes,
+        env: Mapping[str, str],
+        timeout: float,
+        record: Callable[[int], None] | None = None,
     ) -> int:
         self.group_calls.append(GroupCall(list(argv), stdin, dict(env), timeout, None, None, True))
         response = self._group_response(argv)
         if isinstance(response, BaseException):
             raise response
+        if record is not None:
+            record(4343)
+        self._stop_after_record(argv)
         return 4343
+
+    def _stop_after_record(self, argv: list[str]) -> None:
+        stop = self.stops_after_record.get(tuple(argv))
+        if stop is not None:
+            raise stop
 
     def _group_response(self, argv: list[str]) -> GroupResponse:
         try:

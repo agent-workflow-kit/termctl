@@ -19,7 +19,7 @@ import sys
 import tempfile
 import threading
 import time
-from collections.abc import Iterator, Mapping
+from collections.abc import Callable, Iterator, Mapping
 from contextlib import contextmanager
 from dataclasses import dataclass
 from datetime import UTC, datetime
@@ -143,6 +143,7 @@ class Gateway(Protocol):
         timeout: float,
         stdout_limit: int,
         stderr_limit: int,
+        record: Callable[[GroupRun], None] | None = None,
     ) -> GroupRun:
         """Run ``argv`` in a new process group with exactly ``env``, write ``stdin`` to it, and
         keep at most ``stdout_limit`` and ``stderr_limit`` bytes of its output.
@@ -156,20 +157,33 @@ class Gateway(Protocol):
 
         While the program runs, SIGTERM and SIGHUP (unless ignored) raise ``Terminated`` and
         SIGINT raises ``KeyboardInterrupt``; the group is killed the same way first, and the
-        exception carries its group (``started_pgid``). Raises
-        ``OSError`` or ``ValueError`` if the program cannot be started and ``GroupNotStopped``
-        if it was to be killed but could not be.
+        exception carries its group (``started_pgid``). ``record``, if given, is called with
+        the result before it is returned, with stop signals held, so a stop that comes after
+        the program ended is raised only once the caller has recorded the run (and then
+        carries no group; without ``record`` it carries the group). Raises ``OSError`` or
+        ``ValueError`` if the program cannot be started and ``GroupNotStopped`` if it was to
+        be killed but could not be (a stop that came meanwhile is raised instead, carrying
+        the group).
         """
         ...
 
     def spawn_watched(
-        self, argv: list[str], *, stdin: bytes, env: Mapping[str, str], timeout: float
+        self,
+        argv: list[str],
+        *,
+        stdin: bytes,
+        env: Mapping[str, str],
+        timeout: float,
+        record: Callable[[int], None] | None = None,
     ) -> int:
         """Start ``argv`` detached under a watchdog (``hookwatch.py``, run by its file path) in a
         new session,
         with exactly ``env``, ``stdin`` as its input and no output, and return the watchdog's
         PID (also its process group and session id) without waiting. The watchdog runs
         ``argv`` in a process group of its own and kills that group after ``timeout`` seconds.
+        Stop signals are held while it starts and while ``record`` (if given) is called with
+        the PID; a stop that came meanwhile is raised afterwards, carrying the PID
+        (``started_pgid``) unless ``record`` took it. The watchdog is not stopped then.
         Raises ``OSError`` or ``ValueError`` if the watchdog cannot be started."""
         ...
 
@@ -261,15 +275,35 @@ class SystemGateway:
         kept as a lone surrogate), with no newline translation, so a ``\r`` in tmux's output
         reads back as ``\r`` and no byte makes the call fail. ``stdin`` is encoded with
         ``.encode("utf-8", "surrogateescape")``.
+
+        The program runs in a process group of its own, so a signal sent to termctl's group
+        or by its terminal (``timeout``, ``kill -TERM -<pgid>``, a hangup) reaches termctl
+        only: a tmux client killed halfway through a command chain exits 0 with the rest of
+        the chain dropped. Being in a background group, it must never use the terminal (that
+        would stop it with SIGTTIN or SIGTTOU), so its stdin is ``/dev/null`` (or the
+        ``stdin`` pipe) and its output is captured: the tmux commands and ``ps`` run here
+        never attach a client or otherwise need a terminal.
         """
-        completed = subprocess.run(
-            argv,
-            input=None if stdin is None else stdin.encode("utf-8", "surrogateescape"),
-            capture_output=True,
-            timeout=timeout,
-            env=None if env is None else dict(env),
-            check=False,
-        )
+        if stdin is None:
+            completed = subprocess.run(
+                argv,
+                stdin=subprocess.DEVNULL,
+                capture_output=True,
+                timeout=timeout,
+                env=None if env is None else dict(env),
+                check=False,
+                process_group=0,
+            )
+        else:
+            completed = subprocess.run(
+                argv,
+                input=stdin.encode("utf-8", "surrogateescape"),
+                capture_output=True,
+                timeout=timeout,
+                env=None if env is None else dict(env),
+                check=False,
+                process_group=0,
+            )
         return subprocess.CompletedProcess(
             completed.args,
             completed.returncode,
@@ -320,29 +354,62 @@ class SystemGateway:
         timeout: float,
         stdout_limit: int,
         stderr_limit: int,
+        record: Callable[[GroupRun], None] | None = None,
     ) -> GroupRun:
         with _hook_signals() as stops:
-            return _run_group(argv, stdin, env, timeout, stdout_limit, stderr_limit, stops)
+            try:
+                # Returns with stop signals held (``_run_group``).
+                run = _run_group(argv, stdin, env, timeout, stdout_limit, stderr_limit, stops)
+            except GroupNotStopped as exc:
+                _release_with_pgid(stops, exc.pgid)
+                raise
+            try:
+                if record is not None:
+                    record(run)
+            except BaseException:
+                stops.release()
+                raise
+            _release_with_pgid(stops, None if record is not None else run.pgid)
+            return run
 
     def spawn_watched(
-        self, argv: list[str], *, stdin: bytes, env: Mapping[str, str], timeout: float
+        self,
+        argv: list[str],
+        *,
+        stdin: bytes,
+        env: Mapping[str, str],
+        timeout: float,
+        record: Callable[[int], None] | None = None,
     ) -> int:
-        _default_sigchld()
-        # A file, not a pipe, holds the input, so writing it never blocks on a program that
-        # reads slowly or not at all. It is unlinked; only the watchdog's descriptor (which it
-        # hands to the hook unread) keeps it.
-        with tempfile.TemporaryFile() as data:
-            data.write(stdin)
-            data.seek(0)
-            proc = subprocess.Popen(
-                [sys.executable, "-I", WATCHDOG_PATH, str(timeout), *argv],
-                stdin=data,
-                stdout=subprocess.DEVNULL,
-                stderr=subprocess.DEVNULL,
-                env=dict(env),
-                start_new_session=True,
-            )
-        return proc.pid
+        with _hook_signals() as stops:
+            # A stop signal before proc is assigned would leave a watchdog nobody lists.
+            stops.hold()
+            try:
+                # A file, not a pipe, holds the input, so writing it never blocks on a program
+                # that reads slowly or not at all. It is unlinked; only the watchdog's
+                # descriptor (which it hands to the hook unread) keeps it.
+                with tempfile.TemporaryFile() as data:
+                    data.write(stdin)
+                    data.seek(0)
+                    proc = subprocess.Popen(
+                        [sys.executable, "-I", WATCHDOG_PATH, str(timeout), *argv],
+                        stdin=data,
+                        stdout=subprocess.DEVNULL,
+                        stderr=subprocess.DEVNULL,
+                        env=dict(env),
+                        start_new_session=True,
+                    )
+            except BaseException:
+                stops.release()  # a stop signal that came meanwhile is what the caller must see
+                raise
+            try:
+                if record is not None:
+                    record(proc.pid)
+            except BaseException:
+                stops.release()
+                raise
+            _release_with_pgid(stops, None if record is not None else proc.pid)
+            return proc.pid
 
     def current_dir(self) -> str:
         return os.getcwd()
@@ -491,21 +558,32 @@ class _StopSignals:
     for SIGINT), unless it is held, in which case ``release`` raises it.
 
     ``_hook_signals`` installs one for SIGTERM and SIGHUP while a hook runs, held while the hook
-    starts, so the signal cannot come between the fork and the moment the caller has the
-    process to kill. ``stop_signals`` installs one for a whole run. Not blocked with
-    ``pthread_sigmask``: the hook (or tmux and the pane) would inherit the blocked mask.
+    starts and from its end until the caller recorded it, so the signal cannot come between
+    the fork and the moment the caller has the process to kill, nor lose a hook that ended.
+    ``stop_signals`` installs one for a whole run; a hook's handler has the run's as its
+    ``parent``: holding it holds the parent too (SIGINT stays with the run's handler), and
+    only the first signal of either raises. Not blocked with ``pthread_sigmask``: the hook
+    (or tmux and the pane) would inherit the blocked mask.
     """
 
-    def __init__(self) -> None:
+    def __init__(self, parent: _StopSignals | None = None) -> None:
+        self._parent = parent
         self._raised = False
         self._held = False
+        self._holding_parent = False
         self._pending: int | None = None
 
+    def _done(self) -> bool:
+        return self._raised or (self._parent is not None and self._parent._raised)
+
     def handle(self, signum: int, frame: FrameType | None) -> None:
-        # Only the first signal raises, so a second one cannot interrupt the cleanup.
-        if self._raised:
+        # Only the first signal raises, so a second one cannot interrupt the cleanup; the run's
+        # handler, restored after a hook, must not raise again either (review round 2, R2-3).
+        if self._done():
             return
         self._raised = True
+        if self._parent is not None:
+            self._parent._raised = True
         if self._held:
             self._pending = signum
             return
@@ -513,10 +591,18 @@ class _StopSignals:
 
     def hold(self) -> None:
         self._held = True
+        parent = self._parent
+        if parent is not None and not parent._held and not self._holding_parent:
+            parent._held = self._holding_parent = True
 
     def release(self) -> None:
-        """Stop holding; raise the stop of a signal that came while held."""
+        """Stop holding (and the parent, if this held it); raise the stop of a signal that
+        came while held. At most one of the two has one."""
         self._held = False
+        if self._holding_parent:
+            assert self._parent is not None
+            self._holding_parent = False
+            self._parent.release()
         if self._pending is not None:
             signum, self._pending = self._pending, None
             raise _stop_exception(signum)
@@ -531,6 +617,15 @@ def _is_stop_handler(handler: Any) -> bool:
     """Whether ``handler`` is a ``_StopSignals`` handler (``stop_signals``'), which a hook's
     own handler may replace for as long as the hook runs."""
     return isinstance(getattr(handler, "__self__", None), _StopSignals)
+
+
+def _run_stops() -> _StopSignals | None:
+    """The run's handler (``stop_signals``), if one handles a stop signal now."""
+    for signum in (signal.SIGINT, signal.SIGTERM, signal.SIGHUP):
+        owner = getattr(signal.getsignal(signum), "__self__", None)
+        if isinstance(owner, _StopSignals):
+            return owner
+    return None
 
 
 class RunSignals:
@@ -589,13 +684,15 @@ def stop_signals() -> Iterator[RunSignals]:
 def _hook_signals() -> Iterator[_StopSignals]:
     """While a hook runs: ``SIGCHLD`` at its default, and ``SIGTERM`` and ``SIGHUP`` (unless
     ignored or handled already, other than by ``stop_signals``) raise ``Terminated`` (see
-    ``_StopSignals``), so the hook's group is killed before termctl exits. The previous
-    handlers are restored afterwards."""
+    ``_StopSignals``), so the hook's group is killed before termctl exits. The run's handler
+    (``stop_signals``), if any, is its parent: holding holds both, and once either has raised
+    neither raises again. The previous handlers are restored afterwards."""
     stops = _StopSignals()
     if threading.current_thread() is not threading.main_thread():
         yield stops
         return
     _default_sigchld()
+    stops = _StopSignals(parent=_run_stops())
     previous: dict[int, Any] = {}
     for signum in (signal.SIGTERM, signal.SIGHUP):
         current = signal.getsignal(signum)
@@ -606,6 +703,16 @@ def _hook_signals() -> Iterator[_StopSignals]:
     finally:
         for signum, handler in previous.items():
             signal.signal(signum, handler)
+
+
+def _release_with_pgid(stops: _StopSignals, pgid: int | None) -> None:
+    """``stops.release()``; the stop it raises carries ``pgid`` when given (``with_pgid``)."""
+    try:
+        stops.release()
+    except BaseException as exc:
+        if pgid is not None:
+            with_pgid(exc, pgid)
+        raise
 
 
 def _run_group(
@@ -643,6 +750,8 @@ def _run_group(
                 proc.wait(timeout=max(deadline - time.monotonic(), 0))
             except subprocess.TimeoutExpired:
                 finished = False
+        # Held from here until the caller recorded the run (``SystemGateway.run_group``).
+        stops.hold()
     except BaseException as exc:
         try:
             _stop(proc)

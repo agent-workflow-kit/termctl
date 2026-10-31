@@ -12,7 +12,7 @@ import pytest
 
 from termctl import config, hooks, lock
 from termctl.errors import TermctlError, UsageError
-from termctl.gateway import GroupNotStopped, GroupRun, SystemGateway
+from termctl.gateway import GroupNotStopped, GroupRun, SystemGateway, Terminated, with_pgid
 from termctl.hooks import Hook, HookProcess
 from termctl.output import Output
 
@@ -339,6 +339,28 @@ def test_pre_hook_outcome_records_each_process_group() -> None:
     gateway = gateway_for({"a": group_run(0, pgid=11), "b": group_run(13, pgid=12)})
     outcome = run_pre(gateway, pre("a", "b"))
     assert outcome.processes == [HookProcess("pre-open", "a", 11), HookProcess("pre-open", "b", 12)]
+
+
+def test_a_stop_right_after_a_pre_hook_ended_keeps_its_process_and_ids() -> None:
+    # The gateway records the run (process and ids) before it raises a stop that came
+    # meanwhile, so a stop between the hook's end and termctl's bookkeeping loses neither.
+    gateway = gateway_for({"a": group_run(0, stdout=b'{"decision_id": "a-1"}', pgid=11)})
+    gateway.stops_after_record[sh("a")] = Terminated(15)
+    ids: list[str] = ["d-1"]
+    processes: list[HookProcess] = []
+    with pytest.raises(Terminated):
+        hooks.run_pre_hooks(
+            pre("a"),
+            pre_open(decision_ids=["d-1"]),
+            decision_ids=["d-1"],
+            override_escalation=False,
+            gateway=gateway,
+            environ=CALLER_ENV,
+            ids=ids,
+            processes=processes,
+        )
+    assert ids == ["d-1", "a-1"]
+    assert processes == [HookProcess("pre-open", "a", 11)]
 
 
 def test_no_hooks_allow() -> None:
@@ -742,6 +764,30 @@ def test_async_post_hooks_are_started_under_a_watchdog() -> None:
     assert gateway.group_calls[0].env["TERMCTL_ID"] == ID
     assert [w.cmd for w in outcome.warnings] == ["bad"]
     assert outcome.processes == [HookProcess("post-open", "bg", 4343, watchdog=True)]
+
+
+def run_post_into(gateway: FakeGateway, post: list[Hook], processes: list[HookProcess]) -> None:
+    hooks.run_post_hooks(
+        post, post_payload(), gateway=gateway, environ=CALLER_ENV, processes=processes
+    )
+
+
+def test_a_stop_while_an_async_hook_starts_lists_its_watchdog() -> None:
+    gateway = gateway_for({"bg": with_pgid(Terminated(15), 4343)})
+    processes: list[HookProcess] = []
+    with pytest.raises(Terminated):
+        run_post_into(gateway, [Hook("post-open", "bg", 30, async_=True)], processes)
+    assert processes == [HookProcess("post-open", "bg", 4343, watchdog=True)]
+
+
+@pytest.mark.parametrize("async_", [True, False], ids=["async", "sync"])
+def test_a_stop_right_after_a_post_hook_keeps_its_process(async_: bool) -> None:
+    gateway = gateway_for({"bg": group_run(0, pgid=4343)})
+    gateway.stops_after_record[sh("bg")] = KeyboardInterrupt()
+    processes: list[HookProcess] = []
+    with pytest.raises(KeyboardInterrupt):
+        run_post_into(gateway, [Hook("post-open", "bg", 30, async_=async_)], processes)
+    assert processes == [HookProcess("post-open", "bg", 4343, watchdog=async_)]
 
 
 def test_pre_hooks_are_never_async() -> None:

@@ -37,6 +37,7 @@ from .test_cli_open import (
     proc_stat,
     run,
     tag_key,
+    tagged,
 )
 
 pytestmark = pytest.mark.usefixtures("fixed_id")
@@ -728,7 +729,7 @@ def test_reader_warnings_become_warning_records(private_state_home: Path) -> Non
 
 
 def test_pid_warnings_become_warning_records(private_state_home: Path) -> None:
-    gateway = existing_session_flow(make_plan(), completed("4242 0 77\n"))
+    gateway = existing_session_flow(make_plan(), tagged("4242 0 77\n"))
     gateway.responses[RECORD] = completed(stderr="boom\n", returncode=1)
     gateway.proc_stats[4242] = proc_stat()
     gateway.peer_pids[SOCK] = 77
@@ -778,7 +779,7 @@ def test_golden_open_output_with_a_recorded_pid() -> None:
     recorded = {"@termctl_pid": "4242", "@termctl_pid_start": "823520334", "pane_pid": "4242",
                 "@termctl_labels": "team=core"}  # fmt: skip
     plan = make_plan(labels=("team=core",))
-    gateway = existing_session_flow(plan, completed("4242 0 77\n"), after=[new_row(**recorded)])
+    gateway = existing_session_flow(plan, tagged("4242 0 77\n"), after=[new_row(**recorded)])
     gateway.responses[RECORD] = completed()
     gateway.proc_stats[4242] = proc_stat()
     gateway.peer_pids[SOCK] = 77
