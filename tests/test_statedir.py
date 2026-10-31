@@ -114,6 +114,42 @@ def test_created_dirs_and_files_have_exact_modes_under_a_narrow_umask(
     assert stat.S_IMODE((state / "termctl" / "log.jsonl").stat().st_mode) == 0o600
 
 
+def test_a_dir_swapped_for_a_symlink_after_mkdir_is_not_followed(
+    tmp_path: Path, monkeypatch: pytest.MonkeyPatch, umask: Callable[[int], int]
+) -> None:
+    """Someone with write access to the parent replaces the new dir with a symlink between
+    termctl's mkdir and its mode fix: the symlink target's mode must not change."""
+    umask(0o002)
+    target = tmp_path / "target"
+    target.mkdir()
+    os.chmod(target, 0o755)
+    real_mkdir, real_rmdir, real_symlink = os.mkdir, os.rmdir, os.symlink
+
+    def mkdir_then_swap(name: Any, mode: int = 0o777, *, dir_fd: int | None = None) -> None:
+        real_mkdir(name, mode, dir_fd=dir_fd)
+        real_rmdir(name, dir_fd=dir_fd)
+        real_symlink(target, name, dir_fd=dir_fd)
+
+    monkeypatch.setattr(statedir.os, "mkdir", mkdir_then_swap)
+    env = {"XDG_STATE_HOME": str(tmp_path / "a")}
+    with pytest.raises(StateDirError) as info:
+        statedir.open_state_dir(env)
+    monkeypatch.undo()
+    assert str(info.value) == f"{tmp_path / 'a'}: is a symlink"
+    assert stat.S_IMODE(target.stat().st_mode) == 0o755
+    assert list(target.iterdir()) == []
+
+
+def test_a_dangling_symlink_at_a_missing_component_is_refused(
+    tmp_path: Path, opened: list[int]
+) -> None:
+    (tmp_path / "a").symlink_to(tmp_path / "elsewhere")
+    with pytest.raises(StateDirError) as info:
+        statedir.open_state_dir({"XDG_STATE_HOME": str(tmp_path / "a" / "b")})
+    assert str(info.value) == f"{tmp_path / 'a'}: is a symlink"
+    assert not (tmp_path / "elsewhere").exists()
+
+
 def test_existing_ancestors_keep_their_mode(
     tmp_path: Path, opened: list[int], umask: Callable[[int], int]
 ) -> None:

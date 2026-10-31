@@ -102,7 +102,11 @@ def _os_error(
 
 def _create_dirs(path: Path) -> None:
     """Create ``path`` and its missing ancestors with mode 0700, refusing when the nearest
-    existing ancestor is not owned by the effective user."""
+    existing ancestor is not owned by the effective user.
+
+    Each missing component is created and opened relative to its parent's descriptor with
+    ``O_NOFOLLOW``, and its mode fixed on that descriptor, so a component swapped for a
+    symlink is refused rather than followed."""
     missing: list[Path] = []
     existing = path
     while True:
@@ -116,12 +120,28 @@ def _create_dirs(path: Path) -> None:
         return
     if info.st_uid != os.geteuid():
         raise StateDirError(str(path), f"parent {existing} not owned by the current user")
-    for directory in reversed(missing):
-        try:
-            os.mkdir(directory, 0o700)
-        except FileExistsError:
-            continue
-        os.chmod(directory, 0o700)  # the umask may have narrowed it
+    try:
+        parent_fd = os.open(existing, _DIR_FLAGS)
+    except OSError as exc:
+        raise _os_error(str(existing), exc) from None
+    try:
+        for directory in reversed(missing):
+            name = directory.name
+            created = True
+            try:
+                try:
+                    os.mkdir(name, 0o700, dir_fd=parent_fd)
+                except FileExistsError:
+                    created = False  # a concurrent creator; checked when opened
+                fd = os.open(name, _DIR_FLAGS | os.O_NOFOLLOW, dir_fd=parent_fd)
+            except OSError as exc:
+                raise _os_error(str(directory), exc, name, parent_fd) from None
+            if created:
+                os.fchmod(fd, 0o700)  # the umask may have narrowed it
+            os.close(parent_fd)
+            parent_fd = fd
+    finally:
+        os.close(parent_fd)
 
 
 def open_state_dir(environ: Mapping[str, str]) -> tuple[int, str]:
