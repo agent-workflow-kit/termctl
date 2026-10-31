@@ -41,6 +41,8 @@ class Run:
         config: Any | None,
         tmp_path: Path,
         monkeypatch: pytest.MonkeyPatch,
+        *,
+        json_mode: bool = True,
     ) -> None:
         if config is None:
             environ = {"XDG_CONFIG_HOME": str(tmp_path / "no-config")}
@@ -60,7 +62,7 @@ class Run:
         self.gateway = FakeGateway()
         stdout, stderr = io.StringIO(), io.StringIO()
         self.code = main(
-            ["--json", *argv],
+            ["--json", *argv] if json_mode else argv,
             gateway=self.gateway,
             clock=FakeClock(),
             environ=environ,
@@ -173,3 +175,71 @@ def test_unsupported_placement_in_config_does_not_affect_other_commands(
     run = Run(["list"], config, tmp_path, monkeypatch)
     assert run.code == 0
     assert run.selection is None
+
+
+# --- human mode: usage errors print the usage line ---------------------------------------------
+
+
+@pytest.mark.parametrize(
+    "argv",
+    [
+        ["open", "--placement", "nope", "--", "true"],
+        ["open", "--session", "a b", "--", "true"],
+        ["open", "--placement", "Default", "--", "true"],
+    ],
+)
+def test_usage_error_after_parsing_prints_the_open_usage(
+    tmp_path: Path, monkeypatch: pytest.MonkeyPatch, argv: list[str]
+) -> None:
+    run = Run(argv, CONFIG, tmp_path, monkeypatch, json_mode=False)
+    assert run.code == 2
+    assert run.stdout == ""
+    message, usage = run.stderr.split("\n", 1)
+    assert message.startswith("termctl: ")
+    assert usage.startswith("usage: termctl open ")
+
+
+@pytest.mark.parametrize(
+    "argv",
+    [
+        ["open", "--placement", "nope", "--", "true"],
+        ["open", "--session", "a b", "--", "true"],
+    ],
+)
+def test_usage_error_after_parsing_in_json_mode_prints_no_usage(
+    tmp_path: Path, monkeypatch: pytest.MonkeyPatch, argv: list[str]
+) -> None:
+    run = Run(argv, CONFIG, tmp_path, monkeypatch)
+    assert run.code == 2
+    assert set(run.error()) == {"code", "message"}
+    assert "usage:" not in run.stdout + run.stderr
+    assert run.stderr.count("\n") == 1
+
+
+# --- not_supported messages name where target: pane came from ----------------------------------
+
+
+def test_target_pane_from_the_flag_names_the_flag(
+    tmp_path: Path, monkeypatch: pytest.MonkeyPatch
+) -> None:
+    config = {"placements": {"default": {"session": "work"}}}
+    run = Run(["open", "--target", "pane", "--", "true"], config, tmp_path, monkeypatch)
+    error = run.error()
+    assert error["code"] == "not_supported"
+    assert error["message"] == (
+        "--target pane is not supported (placement 'default'; only target: window)"
+    )
+    assert error["details"] == {"placement": "default", "fields": ["target"]}
+
+
+def test_target_pane_from_the_config_names_the_placement(
+    tmp_path: Path, monkeypatch: pytest.MonkeyPatch
+) -> None:
+    config = {"placements": {"default": {"target": "pane"}}}
+    run = Run(["open", "--", "true"], config, tmp_path, monkeypatch)
+    error = run.error()
+    assert error["message"] == (
+        "placement 'default' uses target: pane, which this version does not support"
+        " (only target: window)"
+    )
+    assert error["details"] == {"placement": "default", "fields": ["target"]}

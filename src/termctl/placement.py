@@ -81,21 +81,31 @@ def match_rule(rules: Iterable[Rule], labels: Iterable[str]) -> int | None:
     return None
 
 
-def check_supported(name: str, fields: dict[str, Any]) -> None:
+def check_supported(name: str, fields: dict[str, Any], *, target_from_flag: bool = False) -> None:
     """Exit 2 (``not_supported``) when the placement uses ``target: pane`` or its fields
-    (present at all, an explicit null included)."""
-    used = (["target"] if fields.get("target") == "pane" else []) + [
-        field for field in PANE_FIELDS if field in fields
-    ]
+    (present at all, an explicit null included). ``target_from_flag`` says the target came
+    from ``--target``, so the message names the flag rather than the placement for it."""
+    pane_target = fields.get("target") == "pane"
+    pane_fields = [field for field in PANE_FIELDS if field in fields]
+    used = (["target"] if pane_target else []) + pane_fields
     if not used:
         return
-    shown = ", ".join("target: pane" if field == "target" else field for field in used)
-    raise TermctlError(
-        "not_supported",
-        f"placement {name!r} uses {shown}, which this version does not support"
-        " (only target: window)",
-        details={"placement": name, "fields": used},
-    )
+    if pane_target and target_from_flag:
+        if pane_fields:
+            message = (
+                f"--target pane is not supported, and placement {name!r} uses"
+                f" {', '.join(pane_fields)}, which this version does not support"
+                " (only target: window)"
+            )
+        else:
+            message = f"--target pane is not supported (placement {name!r}; only target: window)"
+    else:
+        shown = ", ".join("target: pane" if field == "target" else field for field in used)
+        message = (
+            f"placement {name!r} uses {shown}, which this version does not support"
+            " (only target: window)"
+        )
+    raise TermctlError("not_supported", message, details={"placement": name, "fields": used})
 
 
 @dataclass(frozen=True)
@@ -146,7 +156,7 @@ def select(
         fields["session"] = session
     if target is not None:
         fields["target"] = target
-    check_supported(name, fields)
+    check_supported(name, fields, target_from_flag=target is not None)
     return Selection(rule=rule, name=name, fields=fields)
 
 

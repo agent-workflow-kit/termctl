@@ -426,3 +426,43 @@ def test_overrides_do_not_change_the_effective_placements(tmp_path: Path) -> Non
     placement.select(cfg, [], session="other")
     assert placement.effective(cfg) == before
     assert cfg.placements["default"].session == "work"
+
+
+def test_target_pane_override_names_the_flag() -> None:
+    with pytest.raises(TermctlError) as caught:
+        placement.select(defaults(), [], target="pane")
+    assert caught.value.message == (
+        "--target pane is not supported (placement 'default'; only target: window)"
+    )
+
+
+def test_target_pane_in_config_names_the_placement(tmp_path: Path) -> None:
+    cfg = load_config(tmp_path, {"placements": {"default": {"target": "pane"}}})
+    with pytest.raises(TermctlError) as caught:
+        placement.select(cfg, [])
+    assert caught.value.message == (
+        "placement 'default' uses target: pane, which this version does not support"
+        " (only target: window)"
+    )
+
+
+def test_target_pane_override_with_pane_fields_names_both_sources(tmp_path: Path) -> None:
+    cfg = load_config(tmp_path, {"placements": {"p": {"layout": "tiled", "max_panes": 2}}})
+    with pytest.raises(TermctlError) as caught:
+        placement.select(cfg, [], placement="p", target="pane")
+    err = caught.value
+    assert err.details == {"placement": "p", "fields": ["target", "max_panes", "layout"]}
+    assert err.message == (
+        "--target pane is not supported, and placement 'p' uses max_panes, layout, which this"
+        " version does not support (only target: window)"
+    )
+
+
+def test_target_pane_override_over_a_pane_placement_names_both_sources(tmp_path: Path) -> None:
+    # The config also sets target: pane, but the flag is what put it there.
+    cfg = load_config(tmp_path, {"placements": {"p": {"target": "pane", "layout": "tiled"}}})
+    with pytest.raises(TermctlError) as caught:
+        placement.select(cfg, [], placement="p", target="pane")
+    err = caught.value
+    assert err.details == {"placement": "p", "fields": ["target", "layout"]}
+    assert err.message.startswith("--target pane is not supported, and placement 'p' uses layout")

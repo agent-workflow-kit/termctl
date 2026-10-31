@@ -421,7 +421,8 @@ def resolve_placement(args: argparse.Namespace, ctx: Context) -> None:
 
 def check_tmux(args: argparse.Namespace, ctx: Context) -> None:
     """Step 3: tmux binary, version and socket safety checks (exit 12)."""
-    # TODO: tmux binary and version - issue #10; socket safety - issue #8
+    # TODO: the tmux_missing check for the binary resolved in step 2, and the tmux version
+    # - issue #10; socket safety - issue #8
 
 
 def resolve_id(args: argparse.Namespace, ctx: Context) -> None:
@@ -446,9 +447,10 @@ def dispatch(args: argparse.Namespace, ctx: Context) -> Result:
     check_args(args, ctx)
     load_config(args, ctx)
     if spec.uses_tmux:
+        # Open order step 2: the server, then tmux_bin (#10), then the placement.
         resolve_server(args, ctx)
+        # TODO(#10): resolve tmux_bin here (Open order step 2), before resolve_placement
         if args.command == "open":
-            # Open order step 2: the server, then tmux_bin (#10), then the placement.
             resolve_placement(args, ctx)
         check_tmux(args, ctx)
         if spec.takes_id:
@@ -519,6 +521,9 @@ def _run(
     try:
         result = dispatch(args, ctx)
     except TermctlError as err:
+        if isinstance(err, UsageError) and err.usage is None:
+            # A usage error found after parsing concerns the subcommand that was parsed.
+            err.usage = scanned.parser.format_usage()
         out.error(err)
         return err.exit_code
     except Exception as exc:
