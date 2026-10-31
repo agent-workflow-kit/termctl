@@ -208,6 +208,14 @@ def fields(*names: str) -> Format:
     return _format(" ".join(f"#{{{_fullmatch(_FIELD_NAME, n, 'field name')}}}" for n in names))
 
 
+def byte_lengths(*names: str) -> Format:
+    """``#{n:a} #{n:b}``: the length in bytes of each named field or user option as stored,
+    before tmux escapes it for output (a control byte counts one, its escape text four)."""
+    if not names:
+        raise ValueError("byte_lengths needs at least one name")
+    return _format(" ".join(f"#{{n:{_fullmatch(_FIELD_NAME, n, 'field name')}}}" for n in names))
+
+
 # tmux's regex substitution (#{s/re/replacement/:field}) with a literal tab and newline in the
 # bracket: POSIX ERE has no "\t" escape, and a ":" (as in "[[:space:]]") ends the modifier.
 _SANITIZE = "s/[\t\n]/ /:"

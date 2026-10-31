@@ -12,6 +12,7 @@ import pytest
 from termctl import cli
 from termctl.cli import Context, Result, main
 
+from .conftest import STATE_HOME
 from .fakes import FakeClock, FakeGateway
 from .schemas import validate
 
@@ -28,7 +29,9 @@ def run(argv: list[str], gateway: FakeGateway | None = None) -> tuple[int, str, 
         argv,
         gateway=gateway or FakeGateway(dirs=DIRS),
         clock=FakeClock(),
-        environ={},
+        # A logged command that passes the grammar checks reaches the (recorded) later steps
+        # and would write its log record: keep it out of the user's state directory.
+        environ={"XDG_STATE_HOME": STATE_HOME},
         stdout=stdout,
         stderr=stderr,
     )

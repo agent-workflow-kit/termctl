@@ -14,6 +14,7 @@ from termctl import __version__, cli
 from termctl.cli import Context, Result, main, parse_args
 from termctl.errors import TermctlError, UsageError
 
+from .conftest import STATE_HOME
 from .fakes import TMUX, FakeClock, FakeGateway, is_list_panes, pane_row
 from .schemas import validate
 
@@ -21,7 +22,7 @@ GOLDEN = Path(__file__).parent / "golden"
 # A config directory that does not exist, so tests never read the user's own config.
 NO_CONFIG = {"XDG_CONFIG_HOME": str(Path(__file__).parent / "no-config")}
 # The environment of a ``Run``: no config, and a PATH on which the fake gateway finds tmux.
-ENVIRON = {**NO_CONFIG, "PATH": "/usr/bin"}
+ENVIRON = {**NO_CONFIG, "PATH": "/usr/bin", "XDG_STATE_HOME": STATE_HOME}
 ID = "tc-abcdefgh"
 
 # The shortest valid invocation of every command in interface.md "Commands".
@@ -806,7 +807,7 @@ def test_context_carries_injected_gateway_and_clock(monkeypatch: pytest.MonkeyPa
 # --- unimplemented commands ---------------------------------------------------------------------
 
 
-IMPLEMENTED = {"show", "exists", "list"}
+IMPLEMENTED = {"show", "exists", "list", "rename"}
 UNIMPLEMENTED = sorted(set(MINIMAL) - IMPLEMENTED)
 
 

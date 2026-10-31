@@ -14,7 +14,7 @@ from collections.abc import Mapping, Sequence
 from dataclasses import dataclass, field
 from typing import Any, NoReturn, TextIO
 
-from . import __version__, ids, panes, tmux_bin, tmux_socket, validate
+from . import __version__, display, ids, jsonlog, panes, tmux_bin, tmux_socket, validate
 from . import config as config_module
 from .argv import Scan, scan
 from .backend import Backend, TmuxBackend
@@ -22,7 +22,9 @@ from .config import Config
 from .errors import TermctlError, UsageError
 from .gateway import Clock, Gateway, SystemClock, SystemGateway
 from .output import PROG, Output, Result, flush_standard_streams
+from .pane_change import Change, change_pane
 from .panes import ManagedPane, PaneRead
+from .statedir import StateDirError
 from .tmux_backend import Tmux
 from .tmux_bin import TmuxBinary
 
@@ -49,6 +51,11 @@ class Context:
     # id, the pane it resolved to (step 4; None for ``exists`` when nothing matched).
     pane_read: PaneRead | None = None
     pane: ManagedPane | None = None
+    # The log.jsonl event of a logged invocation (interface.md "Audit and log"), set once it
+    # is past steps 1 and 2; None when nothing is logged (other commands, dry runs). A
+    # command clears ``logged`` for a no-op, which writes no record.
+    log_event: str | None = None
+    logged: bool = True
 
 
 # --- argument parsing ---------------------------------------------------------------------------
@@ -425,12 +432,11 @@ def check_tmux(args: argparse.Namespace, ctx: Context) -> None:
     if ctx.tmux is None:
         if ctx.tmux_path is None:
             ctx.tmux_path = tmux_bin.resolve(ctx.config.tmux_bin, ctx.environ, ctx.gateway)
-        # TODO(#5): a version warning also gets a `warning` log record in logged commands.
         ctx.tmux = tmux_bin.probe(
             ctx.config.tmux_bin,
             ctx.environ,
             ctx.gateway,
-            ctx.out.warn,
+            lambda message: warn(ctx, message),
             ctx.out.trace,
             path=ctx.tmux_path,
         )
@@ -481,8 +487,7 @@ def read_panes(ctx: Context) -> PaneRead:
         else:
             ctx.pane_read = backend.read_panes()
         for warning in ctx.pane_read.warnings:
-            # TODO(#5): logged commands also write each warning as a `warning` log record.
-            ctx.out.warn(warning)
+            warn(ctx, warning)
     return ctx.pane_read
 
 
@@ -513,6 +518,65 @@ def resolve_id(args: argparse.Namespace, ctx: Context) -> None:
     except TermctlError as err:
         if err.code != "not_found" or args.command != "exists":
             raise
+
+
+# --- the log ------------------------------------------------------------------------------------
+
+# The commands that write a log.jsonl record (interface.md "Audit and log"), by event.
+# TODO(#17): open; TODO(#20): mark, unmark; TODO(#21): label_add, label_remove; TODO(#23):
+# close; TODO(#24): focus. open and close records also need actor, decision_ids and
+# escalation_override, close records force, focus records action (jsonlog.log_record).
+LOGGED_EVENTS = {"rename": "rename"}
+
+
+def append_log(ctx: Context, record: dict[str, Any]) -> None:
+    """Append ``record`` to log.jsonl. A failure is a warning only: the command's outcome
+    and exit code stand, since what it did cannot be undone (design guide section 8)."""
+    try:
+        jsonlog.append_log(ctx.environ, record)
+    except StateDirError as exc:
+        ctx.out.warn(f"cannot write the log: {exc}")
+
+
+def warn(ctx: Context, message: str) -> None:
+    """Print a warning; in a logged invocation it also gets a ``warning`` log record."""
+    ctx.out.warn(message)
+    if ctx.log_event is not None:
+        append_log(ctx, _log_record(ctx, "warning", "warning", message=message))
+
+
+def _log_record(ctx: Context, event: str, result: str, **fields: Any) -> dict[str, Any]:
+    return jsonlog.log_record(
+        ctx.clock.now(),
+        event=event,
+        result=result,
+        id=None if ctx.pane is None else ctx.pane.id,
+        socket_path=None if ctx.server is None else ctx.server.socket_path,
+        **fields,
+    )
+
+
+def log_command(ctx: Context, err: TermctlError | None = None, exit_code: int = 0) -> None:
+    """The invocation's own record: ``ok``, or ``error`` with the error's exit code, message
+    and details. Nothing for an invocation that is not logged or a no-op."""
+    if ctx.log_event is None or not ctx.logged:
+        return
+    if err is None:
+        record = _log_record(ctx, ctx.log_event, "ok", exit_code=exit_code)
+    else:
+        record = _log_record(
+            ctx,
+            ctx.log_event,
+            "error",
+            exit_code=err.exit_code,
+            message=err.message,
+            details=err.details,
+        )
+    append_log(ctx, record)
+
+
+def internal_error(exc: Exception) -> TermctlError:
+    return TermctlError("internal", f"internal error: {type(exc).__name__}: {exc}")
 
 
 # --- the read commands --------------------------------------------------------------------------
@@ -550,7 +614,52 @@ def list_panes(args: argparse.Namespace, ctx: Context) -> Result:
     return Result(data, "\n".join(_pane_line(p) for p in chosen))
 
 
-COMMAND_STEPS = {"show": show, "exists": exists, "list": list_panes}
+# --- pane changes -------------------------------------------------------------------------------
+
+
+def _change_backend(ctx: Context) -> Backend:
+    """The backend for a pane change. The server may have gone since step 4: the pane went
+    with it (interface.md "Panes that vanish")."""
+    backend = connect(ctx)
+    if backend is None:
+        assert ctx.pane is not None
+        raise TermctlError(
+            "not_found", f"managed pane {ctx.pane.id} is gone (no tmux server is running)"
+        )
+    return backend
+
+
+def rename(args: argparse.Namespace, ctx: Context) -> Result:
+    """Set ``@termctl_name`` and recompute the displayed name, keeping a set marker; the
+    window is renamed only while termctl may (interface.md `rename`, "Names")."""
+    if args.dry_run:
+        # TODO(#22): rename --dry-run prints the pane as it would be (interface.md "Dry runs").
+        raise TermctlError("internal", f"{PROG} rename --dry-run is not implemented yet")
+    assert ctx.pane is not None and ctx.tmux is not None
+
+    def plan(pane: ManagedPane) -> Change:
+        shown = display.displayed_name(args.name, pane.marker_text, ctx.config.marker_display)
+        return Change(options={"@termctl_name": args.name}, display_name=shown)
+
+    outcome = change_pane(
+        _change_backend(ctx),
+        ctx.pane.id,
+        plan,
+        version=ctx.tmux.version,
+        environ=ctx.environ,
+        clock=ctx.clock,
+    )
+    ctx.logged = outcome.changed
+    data = {
+        **outcome.pane.pane_object(_socket_path(ctx)),
+        "changed": outcome.changed,
+        "display_updated": outcome.display_updated,
+        "dry_run": False,
+    }
+    return Result(data, outcome.pane.display_name)
+
+
+COMMAND_STEPS = {"show": show, "exists": exists, "list": list_panes, "rename": rename}
 
 
 def run_command(args: argparse.Namespace, ctx: Context) -> Result:
@@ -563,16 +672,33 @@ def run_command(args: argparse.Namespace, ctx: Context) -> Result:
 
 
 def dispatch(args: argparse.Namespace, ctx: Context) -> Result:
-    """Run the check order after the flag-level usage checks; stop at the first failure."""
+    """Run the check order after the flag-level usage checks; stop at the first failure.
+
+    A logged command (``LOGGED_EVENTS``, not a dry run) writes one record for every
+    invocation past steps 1 and 2 (interface.md "Audit and log": failures included, but not
+    usage or config errors, dry runs or no-ops)."""
     spec = COMMANDS[args.command]
     check_args(args, ctx)
     load_config(args, ctx)
-    if spec.uses_tmux:
-        resolve_server(args, ctx)
+    if not spec.uses_tmux:
+        return run_command(args, ctx)
+    resolve_server(args, ctx)
+    if not getattr(args, "dry_run", False):
+        ctx.log_event = LOGGED_EVENTS.get(args.command)
+    try:
         check_tmux(args, ctx)
         if spec.takes_id:
             resolve_id(args, ctx)
-    return run_command(args, ctx)
+        result = run_command(args, ctx)
+    except TermctlError as err:
+        log_command(ctx, err)
+        raise
+    except Exception as exc:
+        err = internal_error(exc)
+        log_command(ctx, err)
+        raise err from exc
+    log_command(ctx, exit_code=result.exit_code)
+    return result
 
 
 # --- entry point --------------------------------------------------------------------------------
@@ -641,7 +767,7 @@ def _run(
         out.error(err)
         return err.exit_code
     except Exception as exc:
-        err = TermctlError("internal", f"internal error: {type(exc).__name__}: {exc}")
+        err = internal_error(exc)
         out.error(err)
         return err.exit_code
     out.result(result)

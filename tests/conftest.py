@@ -28,6 +28,16 @@ from termctl.tmux_backend import Tmux
 
 TMUX_BIN = shutil.which("tmux")
 
+# The state directory base (XDG_STATE_HOME) of the shared test environments, so that commands
+# that log or lock (rename) never write to the user's own ~/.local/state; removed at the end.
+STATE_HOME = tempfile.mkdtemp(prefix="termctl-test-state-")
+
+
+@pytest.fixture(autouse=True, scope="session")
+def _remove_state_home() -> Iterator[None]:
+    yield
+    shutil.rmtree(STATE_HOME, ignore_errors=True)
+
 
 def tmux_version(tmux_bin: str | None = TMUX_BIN) -> tuple[int, int] | None:
     """``(major, minor)`` of ``tmux_bin`` (``tmux 3.2a`` is ``(3, 2)``); ``None`` without one."""

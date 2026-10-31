@@ -164,8 +164,8 @@ class PaneRead:
     escaped when printed.
     """
 
-    # The commands print each warning (``cli.read_panes``); TODO(#5): logged commands also
-    # write each as a `warning` log record.
+    # The commands print each warning, and logged commands also write each as a `warning`
+    # log record (``cli.read_panes``, ``cli.warn``).
     server_running: bool
     panes: tuple[ManagedPane, ...]
     warnings: tuple[str, ...]

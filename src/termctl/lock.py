@@ -16,8 +16,8 @@ hook runner assert it. The lock descriptor is close-on-exec, so no child inherit
 """
 
 # TODO(#6): hooks.py refuses to run a hook while held() is true.
-# TODO(#19): rename (then #20 mark/unmark, #21 labels) wraps its read-modify-write in
-# server_lock, with environ and clock from the CLI context.
+# pane_change.change_pane takes the lock for rename (and, through it, #20 mark/unmark and
+# #21 labels), with environ and clock from the CLI context.
 
 from __future__ import annotations
 

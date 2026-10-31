@@ -13,13 +13,14 @@ import pytest
 from termctl import cli
 from termctl.cli import Context, Result, main
 
+from .conftest import STATE_HOME
 from .fakes import TMUX, UID, FakeClock, FakeGateway, directory, safe_default_server, socket_file
 from .schemas import validate
 
 GOLDEN = Path(__file__).parent / "golden"
 NO_CONFIG = {"XDG_CONFIG_HOME": str(Path(__file__).parent / "no-config")}
 # A PATH on which the fake gateway finds tmux: the binary checks come first in step 3.
-ENVIRON = {**NO_CONFIG, "PATH": "/usr/bin"}
+ENVIRON = {**NO_CONFIG, "PATH": "/usr/bin", "XDG_STATE_HOME": STATE_HOME}
 # The only tmux call before the socket checks: the version check.
 VERSION_ONLY = [[TMUX, "-V"]]
 ID = "tc-abcdefgh"
