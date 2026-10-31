@@ -534,6 +534,19 @@ def test_symlinked_default_directory_through_an_alias_or_dotdot_fails(path: str)
     assert err.details is not None and err.details["path"] == f"/tmp/tmux-{UID}"
 
 
+@pytest.mark.parametrize("path", ["/home/l/s", f"/tmp/tmux-{UID}/sub/../s"])
+def test_symlinked_default_directory_followed_as_a_link_fails(path: str) -> None:
+    """The default directory followed as a link (here as the given parent's last component
+    through ``/home/l``, or before a later ``..``) fails rule 1 though not in default form."""
+    gateway = linked_default_dir_gateway()
+    gateway.files["/home"] = directory(0o755, UID)
+    gateway.files["/elsewhere/sub"] = directory(0o700, UID)
+    gateway.links["/home/l"] = f"/tmp/tmux-{UID}"
+    err = check_error(path, gateway)
+    assert "symlink" in err.message
+    assert err.details is not None and err.details["path"] == f"/tmp/tmux-{UID}"
+
+
 def link_files(**extra: FileInfo) -> dict[str, FileInfo]:
     files = {"/": directory(), "/ok": directory(0o700, UID), "/ok/s": socket_file()}
     files.update({f"/{name}": info for name, info in extra.items()})
@@ -785,6 +798,18 @@ def test_real_symlinked_default_directory_reached_indirectly_fails(base: Path, v
     err = real_failure(path, {"TMUX_TMPDIR": str(tmpdir)})
     assert "symlink" in err.message
     assert failed_path(err) == str(tmpdir / f"tmux-{os.getuid()}")
+
+
+@pytest.mark.parametrize("via", ["home/l/s", "t/{d}/sub/../s"])
+def test_real_symlinked_default_directory_followed_as_a_link_fails(base: Path, via: str) -> None:
+    tmpdir = linked_default_dir(base)
+    name = f"tmux-{os.getuid()}"
+    (base / "target" / "sub").mkdir(mode=0o700)
+    (base / "home").mkdir(mode=0o755)
+    (base / "home" / "l").symlink_to(tmpdir / name)
+    err = real_failure(f"{base}/{via.format(d=name)}", {"TMUX_TMPDIR": str(tmpdir)})
+    assert "symlink" in err.message
+    assert failed_path(err) == str(tmpdir / name)
 
 
 def test_real_link_in_a_group_writable_directory_fails(base: Path) -> None:

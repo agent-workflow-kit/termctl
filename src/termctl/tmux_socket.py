@@ -271,6 +271,10 @@ def check(server: Server, gateway: Gateway) -> bool:
     uid = gateway.real_uid()
     for link in dict.fromkeys(server.links):
         _check_link(server, link, uid, gateway)
+    if server.default_dir is not None and server.default_dir in server.links:
+        # The walk followed the default directory as a link: rule 1 fails however the path
+        # was given (as a later link's target, or before a ``..``).
+        raise _unsafe(server, server.default_dir, "it is a symlink")
     parent = posixpath.dirname(server.socket_path)
     info = _check_ancestors(server, parent, uid, gateway)
     if info is None:
