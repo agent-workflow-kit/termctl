@@ -280,3 +280,25 @@ def test_system_gateway_read_link(tmp_path: Path) -> None:
         gateway.read_link(str(tmp_path / "file"))
     with pytest.raises(FileNotFoundError):
         gateway.read_link(str(tmp_path / "missing"))
+
+
+def test_system_gateway_make_dir_uses_the_mode(tmp_path: Path) -> None:
+    path = tmp_path / "d"
+    old = os.umask(0o022)
+    try:
+        SystemGateway().make_dir(str(path), 0o700)
+    finally:
+        os.umask(old)
+    assert stat.S_IMODE(path.stat().st_mode) == 0o700
+
+
+def test_system_gateway_make_dir_refuses_an_existing_path(tmp_path: Path) -> None:
+    (tmp_path / "link").symlink_to(tmp_path / "missing")
+    with pytest.raises(FileExistsError):
+        SystemGateway().make_dir(str(tmp_path / "link"), 0o700)
+    assert not (tmp_path / "missing").exists()
+
+
+def test_system_gateway_make_dir_never_creates_parents(tmp_path: Path) -> None:
+    with pytest.raises(FileNotFoundError):
+        SystemGateway().make_dir(str(tmp_path / "a" / "b"), 0o700)

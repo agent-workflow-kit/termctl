@@ -383,3 +383,46 @@ def _unsafe(server: Server, path: str, problem: str) -> TermctlError:
         f"{validate.show(path, 200)}: {problem}",
         details={"socket_path": server.socket_path, "path": path},
     )
+
+
+# --- before open starts a server ----------------------------------------------------------------
+
+DEFAULT_DIR_MODE = 0o700
+
+
+def prepare_start(server: Server, gateway: Gateway) -> bool:
+    """Make the socket's directory ready for ``open`` to start a server (interface.md "Open
+    order" step 5), with the safety checks run before and after.
+
+    A missing parent directory is created only in the default directory form: ``mkdir`` with
+    mode 0700, never its parents. If it appeared meanwhile (``EEXIST``), the checks run on it
+    as they find it. For any other path a missing parent exits 12 (``server_unavailable``),
+    since tmux would exit 0 there without a server (spike F6). Returns what ``check`` returns
+    after: True when a socket file is now there (a stale one, or a server started meanwhile).
+    """
+    if check(server, gateway):
+        return True
+    parent = posixpath.dirname(server.socket_path)
+    if _lstat(server, parent, gateway) is not None:
+        return False
+    if not server.default_form:
+        raise _cannot_start(server, f"its directory {validate.show(parent, 200)} does not exist")
+    assert server.default_dir is not None
+    try:
+        gateway.make_dir(server.default_dir, DEFAULT_DIR_MODE)
+    except FileExistsError:
+        pass
+    except OSError as exc:
+        reason = exc.strerror or errno.errorcode.get(exc.errno or 0, str(exc))
+        raise _cannot_start(
+            server, f"cannot create {validate.show(server.default_dir, 200)}: {reason}"
+        ) from None
+    return check(server, gateway)
+
+
+def _cannot_start(server: Server, problem: str) -> TermctlError:
+    return TermctlError(
+        "server_unavailable",
+        f"cannot start a tmux server on {validate.show(server.socket_path, 200)}: {problem}",
+        details={"socket_path": server.socket_path},
+    )

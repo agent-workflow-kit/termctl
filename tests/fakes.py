@@ -144,6 +144,7 @@ class FakeGateway:
         executables: set[str] | None = None,
         panes: Sequence[Mapping[str, str]] | None = None,
         list_panes: Response | None = None,
+        mkdir_error: OSError | None = None,
     ) -> None:
         self.panes = None if panes is None else [dict(row) for row in panes]
         self.list_panes = list_panes
@@ -171,6 +172,12 @@ class FakeGateway:
         self.files = dict(safe_default_server(uid) if files is None else files)
         self.links = dict(links or {})
         self.lstats: list[str] = []
+        # ``make_dir`` calls as (path, mode); ``mkdir_error`` is raised by the next one, and
+        # ``appears`` (paths with their lstat) is added to ``files`` just before it, as another
+        # process creating them meanwhile would.
+        self.mkdirs: list[tuple[str, int]] = []
+        self.mkdir_error = mkdir_error
+        self.appears: dict[str, FileInfo] = {}
 
     def run(
         self,
@@ -257,6 +264,20 @@ class FakeGateway:
         if path in self.files:
             raise OSError(errno.EINVAL, os.strerror(errno.EINVAL), path)
         raise FileNotFoundError(errno.ENOENT, os.strerror(errno.ENOENT), path)
+
+    def make_dir(self, path: str, mode: int) -> None:
+        """Adds a directory owned by the uid with ``mode`` (no umask), as ``mkdir`` would."""
+        self.mkdirs.append((path, mode))
+        self.files.update(self.appears)
+        self.appears = {}
+        if self.mkdir_error is not None:
+            error, self.mkdir_error = self.mkdir_error, None
+            raise error
+        if path in self.files or path in self.links:
+            raise FileExistsError(errno.EEXIST, os.strerror(errno.EEXIST), path)
+        if os.path.dirname(path) not in self.files:
+            raise FileNotFoundError(errno.ENOENT, os.strerror(errno.ENOENT), path)
+        self.files[path] = directory(mode, self.uid)
 
     def _resolve(self, path: str, *, depth: int) -> str:
         if depth > 40:

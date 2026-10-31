@@ -103,6 +103,11 @@ class Gateway(Protocol):
         """The target of the symlink ``path``, as stored; raises ``OSError``."""
         ...
 
+    def make_dir(self, path: str, mode: int) -> None:
+        """``mkdir`` of ``path`` with ``mode`` (less the umask); never creates parents. Raises
+        ``FileExistsError`` if ``path`` exists (a symlink included) and ``OSError`` otherwise."""
+        ...
+
 
 class Clock(Protocol):
     def now(self) -> datetime:
@@ -217,6 +222,9 @@ class SystemGateway:
 
     def read_link(self, path: str) -> str:
         return os.readlink(path)
+
+    def make_dir(self, path: str, mode: int) -> None:
+        os.mkdir(path, mode)
 
 
 def _kill(proc: subprocess.Popen[bytes]) -> None:

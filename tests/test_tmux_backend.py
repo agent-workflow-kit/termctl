@@ -1542,3 +1542,141 @@ def test_runner_passes_utf8_output() -> None:
     assert tmux.run(inv, utf8=True).stdout == "x\n"
     assert gateway.calls == [argv]
     assert traced == [f"tmux: {TMUX} -u -S {SOCK} list-panes -a"]
+
+
+# --- open: server and session (Open order step 5) -----------------------------------------------
+
+PLACEHOLDER = ("/usr/bin/env", "--", "sleep", "30")
+SPEC = tb.WindowSpec(name="KEY-12", cwd="/home/u/src", command=PLACEHOLDER)
+CREATED = ["-d", "-P", "-F", "#{pane_id} #{window_id}"]
+
+
+def test_has_session_is_an_exact_target() -> None:
+    assert tb.has_session("work").argv(TMUX, SOCK) == [
+        TMUX, "-S", SOCK, "has-session", "-t", "=work:",
+    ]  # fmt: skip
+
+
+def test_new_window_targets_the_session_exactly() -> None:
+    assert tb.new_window("work", SPEC).argv(TMUX, SOCK) == [
+        TMUX, "-S", SOCK, "new-window", *CREATED, "-t", "=work:", "-n", "KEY-12",
+        "-c", "/home/u/src", "--", *PLACEHOLDER,
+    ]  # fmt: skip
+
+
+def test_new_session_chains_destroy_unattached_off() -> None:
+    # Spike C2: a user's destroy-unattached on would remove the session before a second
+    # invocation could run.
+    assert tb.new_session("work", SPEC, start_server=False).argv(TMUX, SOCK) == [
+        TMUX, "-S", SOCK, "new-session", *CREATED, "-s", "work", "-n", "KEY-12",
+        "-c", "/home/u/src", "--", *PLACEHOLDER,
+        ";", "set", "-t", "=work:", "--", "destroy-unattached", "off",
+    ]  # fmt: skip
+
+
+def test_new_session_starting_a_server_is_prefixed_with_exit_unattached_off() -> None:
+    # Spike F2: the prefix runs after the user's config is loaded.
+    argv = tb.new_session("work", SPEC, start_server=True).argv(TMUX, SOCK)
+    assert argv[:9] == [TMUX, "-S", SOCK, "set", "-s", "--", "exit-unattached", "off", ";"]
+    assert argv[9:] == tb.new_session("work", SPEC, start_server=False).argv(TMUX, SOCK)[3:]
+
+
+def test_new_session_without_a_command_runs_the_default_shell() -> None:
+    spec = tb.WindowSpec(name="shell", cwd="/", command=None)
+    argv = tb.new_window("work", spec).argv(TMUX, SOCK)
+    assert argv[-2:] == ["-c", "/"]
+    assert "--" not in argv
+
+
+def test_new_session_env_is_removed_from_the_session_environment() -> None:
+    # Spike G3c: -e on new-session, then set-environment -u for each variable.
+    spec = tb.WindowSpec(name="shell", cwd="/", command=None, env=(("A", "1;"), ("B", "x")))
+    invocation = tb.new_session("work", spec, start_server=False)
+    argv = invocation.argv(TMUX, SOCK)
+    assert argv[argv.index("-e") : argv.index("-e") + 4] == ["-e", "A=1\\;", "-e", "B=x"]
+    assert argv[-14:] == [
+        ";", "set-environment", "-t", "=work:", "-u", "--", "A",
+        ";", "set-environment", "-t", "=work:", "-u", "--", "B",
+    ]  # fmt: skip
+    assert "1;" not in " ".join(invocation.shown_argv(TMUX, SOCK))
+
+
+def test_new_window_env_is_for_that_pane_only() -> None:
+    spec = tb.WindowSpec(name="shell", cwd="/", command=None, env=(("A", "1"),))
+    argv = tb.new_window("work", spec).argv(TMUX, SOCK)
+    assert argv[-4:] == ["-c", "/", "-e", "A=1"]
+    assert "set-environment" not in argv
+
+
+@pytest.mark.parametrize("value", HOSTILE)
+def test_open_invocations_apply_the_argument_rules(value: str) -> None:
+    if "#[" in value or "\x00" in value:
+        pytest.skip("rejected as input earlier")
+    spec = tb.WindowSpec(name=value or "x", cwd="/" + value, command=(value, value))
+    for invocation in (
+        tb.new_session("work", spec, start_server=True),
+        tb.new_window("work", spec),
+    ):
+        argv = invocation.argv(TMUX, SOCK)
+        # Only termctl's own separators are a bare ";": no element ends in an unescaped one.
+        assert all(not e.endswith(";") or e.endswith("\\;") or e == ";" for e in argv)
+        assert argv.count("--") >= 1
+
+
+@pytest.mark.parametrize("name", ["", "a b", "=x", "x:", "a.b", "#", "x;", "x" * 65])
+def test_open_invocations_refuse_an_invalid_session_name(name: str) -> None:
+    with pytest.raises(ValueError):
+        tb.new_session(name, SPEC, start_server=False)
+    with pytest.raises(ValueError):
+        tb.new_window(name, SPEC)
+    with pytest.raises(ValueError):
+        tb.has_session(name)
+
+
+@pytest.mark.parametrize("cwd", ["rel", "-rel", ""])
+def test_open_invocations_refuse_a_relative_cwd(cwd: str) -> None:
+    with pytest.raises(ValueError):
+        tb.new_window("work", tb.WindowSpec(name="x", cwd=cwd, command=None))
+
+
+def test_a_session_name_starting_with_a_dash_is_a_value() -> None:
+    argv = tb.new_session("-x", SPEC, start_server=False).argv(TMUX, SOCK)
+    assert argv[argv.index("-s") + 1] == "-x"
+
+
+@pytest.mark.parametrize(
+    ("stdout", "expected"),
+    [
+        ("%3 @2\n", ("%3", "@2")),
+        ("%0 @0", ("%0", "@0")),
+        ("", None),
+        ("%3\n", None),
+        ("%3 @2 extra\n", None),
+        ("@2 %3\n", None),
+        ("%3 @2\n%4 @5\n", None),
+        ("%x @2\n", None),
+        (" %3 @2\n", None),
+    ],
+)
+def test_parse_created(stdout: str, expected: tuple[str, str] | None) -> None:
+    assert tb.parse_created(stdout) == expected
+
+
+def result(stderr: str, returncode: int = 1) -> subprocess.CompletedProcess[str]:
+    return subprocess.CompletedProcess([], returncode, "", stderr)
+
+
+def test_duplicate_session_is_tmux_exact_message() -> None:
+    assert tb.is_duplicate_session(result("duplicate session: work\n"), "work")
+    assert not tb.is_duplicate_session(result("duplicate session: work\n"), "wor")
+    assert not tb.is_duplicate_session(result("duplicate session: work\n", 0), "work")
+    assert not tb.is_duplicate_session(result("x\nduplicate session: work\n"), "work")
+    assert not tb.is_duplicate_session(result("duplicate session: work2\n"), "work")
+
+
+def test_missing_session_is_tmux_exact_message() -> None:
+    assert tb.is_session_missing(result("can't find session: work\n"), "work")
+    assert not tb.is_session_missing(result("can't find session: work\n", 0), "work")
+    assert not tb.is_session_missing(result("can't find session: other\n"), "work")
+    assert not tb.is_session_missing(result("can't find pane: %3\n"), "work")
+    assert not tb.is_session_missing(result("hook\ncan't find session: work\n"), "work")

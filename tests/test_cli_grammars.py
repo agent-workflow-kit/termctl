@@ -50,7 +50,9 @@ def later_steps(monkeypatch: pytest.MonkeyPatch) -> list[str]:
         "load_config",
         "resolve_server",
         "resolve_tmux_bin",
+        "resolve_command",
         "check_tmux",
+        "check_id_collision",
         "resolve_id",
     ):
         monkeypatch.setattr(cli, step, recorder(step))
