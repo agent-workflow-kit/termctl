@@ -80,7 +80,7 @@
         },
         "details": {
           "type": "object",
-          "description": "Code-specific context."
+          "description": "Code-specific context (interface.md Errors). server_unavailable: socket_path, plus path only when a socket safety check failed; tmux_missing and tmux_too_old: tmux_bin, and path once it resolved; tmux_too_old adds tmux_version."
         }
       },
       "additionalProperties": false,

@@ -86,7 +86,7 @@ def test_resolved_and_kept_on_the_context(monkeypatch: pytest.MonkeyPatch) -> No
     gateway = FakeGateway(
         {("/a/tmux", "-V"): completed("tmux 3.4\n")}, executables={"/a/tmux", TMUX}
     )
-    run = Run(["show", ID], gateway, environ={**ENVIRON, "PATH": "/x:/a:/usr/bin"})
+    run = Run(["list"], gateway, environ={**ENVIRON, "PATH": "/x:/a:/usr/bin"})
     assert run.code == 0
     assert seen[0].tmux == TmuxBinary("/a/tmux", TmuxVersion(3, 4, "3.4"))
     assert gateway.executable_checks == ["/x/tmux", "/a/tmux"]
@@ -125,9 +125,10 @@ def test_earlier_resolution_is_reused_and_the_version_still_checked() -> None:
     assert ctx.tmux is None
 
 
-def test_version_query_gets_the_callers_locale_only() -> None:
+def test_version_query_gets_the_callers_locale_only(monkeypatch: pytest.MonkeyPatch) -> None:
+    capture(monkeypatch)
     environ = {**ENVIRON, "LANG": "de_DE.UTF-8", "LC_ALL": "de_DE.UTF-8", "SECRET": "x"}
-    run = Run(["show", ID], environ=environ)
+    run = Run(["list"], environ=environ)
     assert run.gateway.envs == [{"LANG": "de_DE.UTF-8", "LC_ALL": "de_DE.UTF-8"}]
 
 
@@ -146,7 +147,7 @@ def test_configured_tmux_bin(monkeypatch: pytest.MonkeyPatch) -> None:
     gateway = FakeGateway(
         {("/opt/tmux", "-V"): completed("tmux 3.2a\n")}, executables={"/opt/tmux"}
     )
-    run = Run(["show", ID], gateway, environ={**ENVIRON, "TERMCTL_TMUX_BIN": "/opt/tmux"})
+    run = Run(["list"], gateway, environ={**ENVIRON, "TERMCTL_TMUX_BIN": "/opt/tmux"})
     assert run.code == 0
     assert seen[0].tmux == TmuxBinary("/opt/tmux", TmuxVersion(3, 2, "3.2"))
 
@@ -154,20 +155,20 @@ def test_configured_tmux_bin(monkeypatch: pytest.MonkeyPatch) -> None:
 def test_unparsable_version_warns_and_continues(monkeypatch: pytest.MonkeyPatch) -> None:
     seen = capture(monkeypatch)
     gateway = FakeGateway({(TMUX, "-V"): completed("tmux master\x1b[2J\n")})
-    run = Run(["show", ID], gateway)
+    run = Run(["list"], gateway)
     assert run.code == 0
     assert seen[0].tmux == TmuxBinary(TMUX, None)
     assert run.stderr == (
         "termctl: warning: no version in /usr/bin/tmux -V output 'tmux master\\x1b[2J'; "
         "assuming tmux 3.2 or newer\n"
     )
-    assert Run(["show", ID, "--quiet"], gateway).stderr == ""
+    assert Run(["list", "--quiet"], gateway).stderr == ""
 
 
 def test_verbose_traces_the_version_query(monkeypatch: pytest.MonkeyPatch) -> None:
     capture(monkeypatch)
-    assert Run(["show", ID, "--verbose"]).stderr == "termctl: /usr/bin/tmux -V\n"
-    assert Run(["show", ID]).stderr == ""
+    assert Run(["list", "--verbose"]).stderr == "termctl: tmux: /usr/bin/tmux -V\n"
+    assert Run(["list"]).stderr == ""
 
 
 def test_usage_errors_come_before_the_tmux_checks() -> None:

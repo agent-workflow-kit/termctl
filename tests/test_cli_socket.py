@@ -116,7 +116,7 @@ def test_context_carries_the_resolved_server(captured: list[Context]) -> None:
     files = safe_default_server()
     files["/srv"] = directory()
     files["/srv/s"] = socket_file()
-    run(["show", ID], FakeGateway(files=files), {"TMUX": "/srv/s,99,0"})
+    run(["list"], FakeGateway(files=files), {"TMUX": "/srv/s,99,0"})
     server = captured[0].server
     assert server is not None
     assert (server.socket_path, server.source) == ("/srv/s", "TMUX")

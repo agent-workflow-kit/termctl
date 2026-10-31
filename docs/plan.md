@@ -16,7 +16,9 @@ Status: planned, 2026-10-30. Implements [interface.md](interface.md) (normative)
 
 | Module | Stage | Responsibility |
 |---|---|---|
-| `cli.py` | 0 | argparse surface (global flags before or after the subcommand), dispatch, human and `--json` output, error envelopes, exit codes, check order |
+| `cli.py` | 0 | argparse surface (global flags before or after the subcommand), dispatch, exit codes, check order |
+| `argv.py` | 0 | the pre-scan of the command line: getopt-style option values, subparser and `--` positions, for the `--json`, `--version` and `--help` checks |
+| `output.py` | 0 | writing results, errors (the `--json` error envelope on stdout), warnings and `--verbose` traces; escaping of human output |
 | `errors.py` | 0 | error codes, the exit code table and the error envelope |
 | `config.py` | 0 | YAML + `config.d` merge (maps deep, hook lists appended, other lists replaced), Pydantic models, `TERMCTL_*` scalars, load-time checks |
 | `validate.py` | 0 | grammars: ids, names, marker names and texts, labels, sessions, placement names, env names, durations, actor, decision ids, client names, socket names and paths, cwd |
@@ -71,7 +73,7 @@ Status: planned, 2026-10-30. Implements [interface.md](interface.md) (normative)
 - untrusted pane fields: the pane schema marks `name`, `labels`, `marker`, `marker_text`, `placement`, `pid` as `x-untrusted` (schema test); a forged but grammar-valid option value is reported as read.
 - `show`/`exists`/`list` outputs: golden files for running, dead (with and without exit status; `exit_signal` null on 3.2), and the `exists` exit-10 output.
 
-**Status**: Not Started
+**Status**: In Progress
 
 ## Stage 2: open (0.2)
 

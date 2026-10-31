@@ -166,7 +166,8 @@ class PaneRead:
     escaped when printed.
     """
 
-    # TODO(#12): the commands print each warning and write it as a `warning` log record (#5).
+    # The commands print each warning (``cli.read_panes``); TODO(#5): logged commands also
+    # write each as a `warning` log record.
     server_running: bool
     panes: tuple[ManagedPane, ...]
     warnings: tuple[str, ...]
@@ -191,7 +192,11 @@ def read(tmux: Tmux, *, sentinel: str | None = None) -> PaneRead:
             return PaneRead(server_running=False, panes=(), warnings=())
         if result.returncode == 1 and result.stderr.splitlines() == [_NO_TARGET]:
             return PaneRead(server_running=True, panes=(), warnings=())
-        raise TermctlError("server_unavailable", f"cannot list the panes: {tmux_message(result)}")
+        raise TermctlError(
+            "server_unavailable",
+            f"cannot list the panes: {tmux_message(result)}",
+            details={"socket_path": tmux.socket_path},
+        )
     found, warnings = parse(result.stdout, token)
     return PaneRead(server_running=True, panes=found, warnings=warnings)
 

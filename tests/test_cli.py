@@ -16,7 +16,7 @@ from termctl.cli import Context, Result, main, parse_args
 from termctl.errors import TermctlError, UsageError
 from termctl.gateway import Terminated
 
-from .fakes import TMUX, FakeClock, FakeGateway
+from .fakes import TMUX, FakeClock, FakeGateway, is_list_panes, pane_row
 from .schemas import validate
 
 GOLDEN = Path(__file__).parent / "golden"
@@ -827,9 +827,14 @@ def test_context_carries_injected_gateway_and_clock(monkeypatch: pytest.MonkeyPa
 # --- unimplemented commands ---------------------------------------------------------------------
 
 
-@pytest.mark.parametrize("command", sorted(set(MINIMAL) - {"placements"}))
+IMPLEMENTED = {"show", "exists", "list", "placements"}
+UNIMPLEMENTED = sorted(set(MINIMAL) - IMPLEMENTED)
+
+
+@pytest.mark.parametrize("command", UNIMPLEMENTED)
 def test_unimplemented_command_is_internal_error(command: str) -> None:
-    run = Run(["--json", *MINIMAL[command]])
+    # A managed pane carrying ID, so that commands taking an id get past id resolution.
+    run = Run(["--json", *MINIMAL[command]], FakeGateway(panes=[pane_row(tc_id=ID)]))
     assert run.code == 1
     envelope = run.json()
     validate(envelope, "termctl/cli/error.json")
@@ -837,14 +842,18 @@ def test_unimplemented_command_is_internal_error(command: str) -> None:
         "code": "internal",
         "message": f"termctl {command} is not implemented yet",
     }
-    # Only the tmux checks ran.
-    assert run.gateway.calls == [[TMUX, "-V"]]
+    # Only the tmux checks and, for an id, the one pane read ran.
+    calls = run.gateway.calls
+    if command == "open":
+        assert calls == [[TMUX, "-V"]]
+    else:
+        assert calls[0] == [TMUX, "-V"] and len(calls) == 2 and is_list_panes(calls[1])
 
 
 def test_unimplemented_command_golden() -> None:
     expected = json.loads((GOLDEN / "error-not-implemented.json").read_text(encoding="utf-8"))
     validate(expected, "termctl/cli/error.json")
-    assert Run(["--json", "show", ID]).json() == expected
+    assert Run(["--json", "close", ID], FakeGateway(panes=[pane_row(tc_id=ID)])).json() == expected
 
 
 # --- broken output streams ----------------------------------------------------------------------

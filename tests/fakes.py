@@ -6,14 +6,67 @@ import errno
 import os
 import stat
 import subprocess
-from collections.abc import Callable, Mapping
+from collections.abc import Callable, Mapping, Sequence
 from dataclasses import dataclass
 from datetime import UTC, datetime, timedelta
 from typing import Any
 
+from termctl import panes as panes_module
 from termctl.gateway import BoundedOutput, FileInfo, GroupRun
 
 UID = 1000
+
+# One managed pane as ``list-panes`` prints it for the pane reader's format (``panes.FIELDS``):
+# running, in session ``termctl``, created 2026-10-30T12:00:00.000Z.
+PANE_VALUES: dict[str, str] = {
+    "pane_id": "%3",
+    "window_id": "@2",
+    "pane_dead": "0",
+    "pane_dead_status": "",
+    "pane_dead_signal": "",
+    "pane_pid": "4242",
+    "window_panes": "1",
+    "session_name": "termctl",
+    "window_name": "KEY-12",
+    "@termctl_pane": "%3",
+    "@termctl_v": "1",
+    "@termctl_window": "@2",
+    "@termctl_id": "tc-abcdefgh",
+    "@termctl_name": "KEY-12",
+    "@termctl_marker": "",
+    "@termctl_marker_text": "",
+    "@termctl_labels": "kind=review",
+    "@termctl_placement": "default",
+    "@termctl_keep": "never",
+    "@termctl_created": "2026-10-30T12:00:00.000Z",
+    "@termctl_pid": "4242",
+    "@termctl_pid_start": "123456",
+}
+
+
+def pane_row(
+    pane_id: str = "%3", tc_id: str = "tc-abcdefgh", overrides: Mapping[str, str] | None = None
+) -> dict[str, str]:
+    """The ``list-panes`` values of a managed pane with tmux pane id ``pane_id``."""
+    return {
+        **PANE_VALUES,
+        "pane_id": pane_id,
+        "@termctl_pane": pane_id,
+        "@termctl_id": tc_id,
+        **(overrides or {}),
+    }
+
+
+def list_panes_stdout(rows: Sequence[Mapping[str, str]], sentinel: str) -> str:
+    """What ``list-panes -a -F <the reader's format>`` prints for ``rows``."""
+    return "".join(
+        "\t".join([*(row[name] for name in panes_module.FIELDS), sentinel]) + "\n" for row in rows
+    )
+
+
+def is_list_panes(argv: Sequence[str]) -> bool:
+    """Whether ``argv`` is the pane reader's ``list-panes -a -F`` call."""
+    return len(argv) >= 4 and list(argv[-4:-1]) == ["list-panes", "-a", "-F"]
 
 
 def directory(mode: int = 0o755, uid: int = 0) -> FileInfo:
@@ -94,6 +147,11 @@ class FakeGateway:
     scripted exception is raised instead of returned. ``tmux -V`` of ``TMUX`` answers
     ``tmux 3.5a`` unless the test scripts it, and ``TMUX`` is the only executable file
     unless the test gives ``executables``.
+
+    The pane reader's ``list-panes`` carries a fresh random sentinel, so it cannot be scripted
+    by argv: ``panes`` gives the rows it prints (``pane_row``), with the sentinel taken from
+    the call, and ``list_panes`` a fixed result instead (a failure, say). With neither, it is
+    an unscripted call.
     """
 
     def __init__(
@@ -108,7 +166,11 @@ class FakeGateway:
         uid: int = UID,
         files: Mapping[str, FileInfo] | None = None,
         links: Mapping[str, str] | None = None,
+        panes: Sequence[Mapping[str, str]] | None = None,
+        list_panes: Response | None = None,
     ) -> None:
+        self.panes = None if panes is None else [dict(row) for row in panes]
+        self.list_panes = list_panes
         self.responses: dict[tuple[str, ...], Response] = {
             (TMUX, "-V"): completed("tmux 3.5a\n"),
             **(responses or {}),
@@ -170,6 +232,14 @@ class FakeGateway:
         try:
             response = self.responses[tuple(argv)]
         except KeyError:
+            if is_list_panes(argv) and self.list_panes is not None:
+                response = self.list_panes
+            elif is_list_panes(argv) and self.panes is not None:
+                sentinel = argv[-1].rsplit("\t", 1)[-1]
+                response = completed(list_panes_stdout(self.panes, sentinel))
+            else:
+                response = None
+        if response is None:
             raise AssertionError(f"unexpected gateway call: {argv!r}") from None
         if isinstance(response, BaseException):
             raise response
