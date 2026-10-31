@@ -167,7 +167,7 @@ def test_unparsable_version_warns_and_continues(monkeypatch: pytest.MonkeyPatch)
 
 def test_verbose_traces_the_version_query(monkeypatch: pytest.MonkeyPatch) -> None:
     capture(monkeypatch)
-    assert Run(["list", "--verbose"]).stderr == "termctl: /usr/bin/tmux -V\n"
+    assert Run(["list", "--verbose"]).stderr == "termctl: tmux: /usr/bin/tmux -V\n"
     assert Run(["list"]).stderr == ""
 
 

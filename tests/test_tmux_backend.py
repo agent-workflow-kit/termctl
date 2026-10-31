@@ -1004,6 +1004,7 @@ def test_check_guard_maps_other_failures_to_server_unavailable(stderr: str) -> N
     with pytest.raises(TermctlError) as info:
         tb.check_guard(_failed(stderr), ID, SOCK)
     assert info.value.code == "server_unavailable" and info.value.exit_code == 12
+    assert info.value.details == {"socket_path": SOCK}
 
 
 def test_check_guard_maps_a_killed_tmux_to_server_unavailable() -> None:
@@ -1145,6 +1146,7 @@ def test_runner_maps_a_timeout_to_server_unavailable() -> None:
     with pytest.raises(TermctlError) as info:
         tmux.run(inv)
     assert info.value.code == "server_unavailable"
+    assert info.value.details == {"socket_path": SOCK}
 
 
 def test_runner_maps_an_exec_failure_to_tmux_missing() -> None:
@@ -1153,6 +1155,16 @@ def test_runner_maps_an_exec_failure_to_tmux_missing() -> None:
     with pytest.raises(TermctlError) as info:
         tmux.run(inv)
     assert info.value.code == "tmux_missing"
+    assert info.value.details == {"tmux_bin": TMUX, "path": TMUX}
+
+
+def test_runner_reports_the_configured_tmux_bin_when_exec_fails() -> None:
+    inv = Invocation.of(command("list-panes").flag("-a").build())
+    gateway = RaisingGateway(FileNotFoundError(2, "No such file"))
+    tmux = Tmux(gateway, TMUX, SOCK, env={}, configured_bin="tmux")
+    with pytest.raises(TermctlError) as info:
+        tmux.run(inv)
+    assert info.value.details == {"tmux_bin": "tmux", "path": TMUX}
 
 
 def test_runner_refuses_a_relative_binary() -> None:

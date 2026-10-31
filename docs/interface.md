@@ -189,7 +189,7 @@ termctl stores these tmux pane options on every managed pane. Every one is alway
 | `@termctl_pid` | the command's PID | `^[1-9][0-9]{0,9}$`, or empty |
 | `@termctl_pid_start` | that process's start time ([Liveness](#liveness)) | `^[0-9]{1,20}$`, or empty |
 
-termctl reads all managed panes of a server with a single `list-panes -a` call. A `#{@...}` format also returns values inherited from the window, session or global scope (spike F4), so a pane is managed only if `#{@termctl_pane}` equals its `#{pane_id}`: inherited values are rejected unless they equal the pane's own id, which a value at window, session or global scope does only when deliberately set to name that pane (forgery, a [residual risk](#residual-risks)). termctl checks every `@termctl_*` value it reads against its grammar; a pane with a missing or invalid value, or with a `@termctl_v` termctl does not know, is ignored with a warning (a `warning` log record).
+termctl reads all managed panes of a server with a single `list-panes -a` call. A `#{@...}` format also returns values inherited from the window, session or global scope (spike F4), so a pane is managed only if `#{@termctl_pane}` equals its `#{pane_id}`: inherited values are rejected unless they equal the pane's own id, which a value at window, session or global scope does only when deliberately set to name that pane (forgery, a [residual risk](#residual-risks)). termctl checks every `@termctl_*` value it reads against its grammar, as tmux prints it ([Residual risks](#residual-risks), forged control bytes); a pane with a missing or invalid value, or with a `@termctl_v` termctl does not know, is ignored with a warning (a `warning` log record).
 
 Anyone who can reach the tmux server can change these options ([Residual risks](#residual-risks)).
 
@@ -365,7 +365,7 @@ With `--json`, every non-zero exit prints `{"error": {...}}` on stdout (`schemas
 | `candidates` | only with `ambiguous`: the matching panes (`id`, `pane_id`, `session`), sorted by id, then by pane id (tmux's `%N` by number, so `%9` comes before `%10`) |
 | `details` | optional, code-specific context |
 
-`details` of `server_unavailable`: `socket_path` and `path` (the file or directory that failed a check); of `no_server`: `socket_path`; of `config_invalid` from the environment: `variable`, from config: `key`.
+`details` of `server_unavailable`: `socket_path`, plus `path` (the file or directory that failed) only when a socket safety check failed ([Server selection](#server-selection)); of `no_server`: `socket_path`; of `config_invalid` from the environment: `variable`, from config: `key`.
 
 | Code | Exit | Commands |
 |---|---|---|
@@ -466,6 +466,7 @@ termctl has no per-repo overrides (it has no notion of a repository).
 
 - **The tmux socket is full control.** Any process that can reach the server's socket (every process in its panes, through `TMUX`) can open, rename, close and read any window, including changing termctl's pane options and window names (so `display_name` is untrusted). termctl cannot prevent this; sessions that read third-party content must not reach the socket, which claude-session's sandbox enforces (architecture section 13.1).
 - **Forged options.** Anything with socket access can write `@termctl_*` options that make a pane look managed, at pane scope or at window, session or global scope with `@termctl_pane` naming the pane; set a global `@termctl_pane` so that every `open` fails its tagging guard with `tag_failed`; or install server hooks whose output (for example an `after-list-panes` hook's) forges whole `list-panes` records, since a hook can see the read's format and its per-read sentinel.
+- **Forged control bytes.** termctl checks a pane option's value as tmux prints it, and tmux prints a C0 or DEL byte, or a byte that is not valid UTF-8, in a user option as backslash escape text (`\033` for ESC, `\177` for DEL, `\377`, `\r`). Such a forged byte is therefore not rejected: a name set to `n`, ESC, `[2Jx` reads as the text `n\033[2Jx`, which cannot be told from a name containing that literal backslash text. No raw control character reaches termctl's output. A C1 character written as UTF-8, and a newline, are rejected as invalid values.
 - **Human gates are advisory.** `--override-escalation` and `close --force` require a TTY on stdin or `--actor human:<user>`, but every pane has a TTY and `--actor` is self-declared. The gates stop automation that follows the rules, not a hostile caller; policies that must hold use a pre-hook veto, which an override never bypasses.
 - **Clients import their environment.** A user's plain `tmux attach` or `switch-client` imports variables such as `SSH_AUTH_SOCK` into a session termctl created, and later panes there get them ([Environment](#environment)).
 - **`exit-unattached` on servers termctl starts.** termctl turns `exit-unattached` off on a server it starts, overriding a user's `exit-unattached on` for that server; it never changes a server it did not start, except in the short race where another server starts between `open`'s re-probe and its server start ([Open order](#open-order) step 5).

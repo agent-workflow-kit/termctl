@@ -190,7 +190,11 @@ def read(tmux: Tmux, *, sentinel: str | None = None) -> PaneRead:
             return PaneRead(server_running=False, panes=(), warnings=())
         if result.returncode == 1 and result.stderr.splitlines() == [_NO_TARGET]:
             return PaneRead(server_running=True, panes=(), warnings=())
-        raise TermctlError("server_unavailable", f"cannot list the panes: {tmux_message(result)}")
+        raise TermctlError(
+            "server_unavailable",
+            f"cannot list the panes: {tmux_message(result)}",
+            details={"socket_path": tmux.socket_path},
+        )
     found, warnings = parse(result.stdout, token)
     return PaneRead(server_running=True, panes=found, warnings=warnings)
 

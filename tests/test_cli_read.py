@@ -307,15 +307,28 @@ def test_list_of_a_running_server_without_managed_panes() -> None:
 
 FORGED = pane_row("%5", OTHER, {"@termctl_name": "evil\x1b[2J\x9b"})
 
+FORGED_OPTIONS = {
+    "name": (
+        {"@termctl_name": "evil\x1b[2J\x9b"},
+        "invalid @termctl_name 'evil\\x1b[2J\\x9b': must not contain control characters",
+    ),
+    "labels": ({"@termctl_labels": "k=v\x1b[2J"}, "invalid @termctl_labels 'k=v\\x1b[2J'"),
+    "marker_text": (
+        {"@termctl_marker": "attention", "@termctl_marker_text": "\x9b!"},
+        "invalid @termctl_marker_text '\\x9b!': must not contain control characters",
+    ),
+}
 
+
+@pytest.mark.parametrize("option", sorted(FORGED_OPTIONS))
 @pytest.mark.parametrize("argv", [["list"], ["show", ID], ["exists", ID], ["--json", "list"]])
-def test_reader_warnings_are_printed_escaped(argv: list[str]) -> None:
-    result = run(argv, [RUNNING, FORGED])
+def test_reader_warnings_are_printed_escaped(argv: list[str], option: str) -> None:
+    overrides, problem = FORGED_OPTIONS[option]
+    result = run(argv, [RUNNING, pane_row("%5", OTHER, overrides)])
     assert result.code == 0
-    assert result.stderr == (
-        "termctl: warning: ignoring managed pane %5: invalid @termctl_name "
-        "'evil\\x1b[2J\\x9b': must not contain control characters\n"
-    )
+    assert result.stderr == f"termctl: warning: ignoring managed pane %5: {problem}\n"
+    raw = [c for c in result.stderr if c != "\n" and (ord(c) < 0x20 or 0x7F <= ord(c) <= 0x9F)]
+    assert raw == []
 
 
 def test_reader_warnings_are_printed_once_and_quiet_suppresses_them() -> None:
@@ -332,6 +345,7 @@ def test_other_tmux_failures_are_server_unavailable_with_escaped_text(argv: list
     as_json = run(["--json", *argv], gateway=FakeGateway(list_panes=failure))
     assert as_json.json()["error"]["code"] == "server_unavailable"
     assert as_json.json()["error"]["message"] == "cannot list the panes: lost server\x1b[2J\x9b\x7f"
+    assert as_json.json()["error"]["details"] == {"socket_path": SOCK}
 
 
 HOSTILE = {"session_name": "s\x1b]0;x\x07", "window_name": "w\x1b[2J\x85\x9b"}
@@ -358,7 +372,7 @@ def test_json_output_is_not_escaped_as_human_output() -> None:
 
 def test_verbose_traces_the_list_panes_command() -> None:
     lines = run(["--verbose", "list"]).stderr.splitlines()
-    assert lines[0] == "termctl: /usr/bin/tmux -V"
+    assert lines[0] == "termctl: tmux: /usr/bin/tmux -V"
     assert lines[1].startswith(f"termctl: tmux: /usr/bin/tmux -u -S {SOCK} list-panes -a -F ")
     assert len(lines) == 2
 

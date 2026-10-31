@@ -457,7 +457,14 @@ def connect(ctx: Context) -> Backend | None:
     # TODO(#15): run tmux with the environment filtered by server_env_allow; until then only
     # the caller's locale, as for `tmux -V`.
     env = tmux_bin.locale_env(ctx.environ)
-    tmux = Tmux(ctx.gateway, ctx.tmux.path, ctx.server.socket_path, env=env, trace=ctx.out.trace)
+    tmux = Tmux(
+        ctx.gateway,
+        ctx.tmux.path,
+        ctx.server.socket_path,
+        env=env,
+        trace=ctx.out.trace,
+        configured_bin=ctx.config.tmux_bin,
+    )
     return TmuxBackend(tmux)
 
 

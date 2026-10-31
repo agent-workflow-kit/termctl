@@ -133,7 +133,7 @@ def check_version(
     """
     argv = [path, "-V"]
     if trace is not None:
-        trace(shlex.join(argv))
+        trace("tmux: " + shlex.join(argv))
     try:
         # TODO(#15): run with the full filtered environment; until then only the locale.
         result = gateway.run_bounded(

@@ -56,10 +56,17 @@ def _error_output(json_mode: bool) -> tuple[str, str]:
     return stdout.getvalue(), stderr.getvalue()
 
 
+def _raw_controls(text: str) -> list[str]:
+    """The C0 (other than newline), DEL and C1 characters in ``text``."""
+    return [c for c in text if c != "\n" and (ord(c) < 0x20 or 0x7F <= ord(c) <= 0x9F)]
+
+
+# TODO(#6): once hook_stderr lines are printed (PR #41), this invariant covers their escaping.
 def test_human_error_output_never_carries_raw_controls_from_hook_text() -> None:
     stdout, stderr = _error_output(json_mode=False)
     assert stdout == ""
-    assert stderr == "termctl: vetoed by hook gate: \\x1b[2J\\x07\\x9b\\x7f\n"
+    assert stderr.splitlines()[0] == "termctl: vetoed by hook gate: \\x1b[2J\\x07\\x9b\\x7f"
+    assert _raw_controls(stderr) == []
 
 
 def test_json_error_output_keeps_hook_stderr_unchanged_and_json_encoded() -> None:

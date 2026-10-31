@@ -941,7 +941,11 @@ def tmux_failure(
         return TermctlError(
             "not_found", f"managed pane {termctl_id} is gone ({tmux_message(result)})"
         )
-    return TermctlError("server_unavailable", f"tmux failed: {tmux_message(result)}")
+    return TermctlError(
+        "server_unavailable",
+        f"tmux failed: {tmux_message(result)}",
+        details={"socket_path": socket_path},
+    )
 
 
 def check_guard(
@@ -971,7 +975,9 @@ class Tmux:
 
     ``tmux_bin`` is the absolute path resolved once per invocation (#10); ``socket_path`` the
     resolved, checked socket (#8); ``env`` the environment filtered by ``server_env_allow``
-    (#15). ``trace`` receives each command as shown under ``--verbose``.
+    (#15). ``trace`` receives each command as shown under ``--verbose``. ``configured_bin``
+    is the configured ``tmux_bin`` reported in ``tmux_missing`` details (``tmux_bin`` when
+    not given).
     """
 
     def __init__(
@@ -982,6 +988,7 @@ class Tmux:
         *,
         env: Mapping[str, str],
         trace: Callable[[str], None] | None = None,
+        configured_bin: str | None = None,
     ) -> None:
         _check_tmux_bin(tmux_bin)
         _check_socket(socket_path)
@@ -990,6 +997,7 @@ class Tmux:
         self.socket_path = socket_path
         self.env = dict(env)
         self.trace = trace
+        self.configured_bin = tmux_bin if configured_bin is None else configured_bin
 
     def run(
         self, invocation: Invocation, *, utf8: bool = False
@@ -1005,9 +1013,13 @@ class Tmux:
             return self.gateway.run(argv, timeout=TMUX_TIMEOUT, env=self.env)
         except subprocess.TimeoutExpired:
             raise TermctlError(
-                "server_unavailable", f"tmux did not answer within {TMUX_TIMEOUT:g} seconds"
+                "server_unavailable",
+                f"tmux did not answer within {TMUX_TIMEOUT:g} seconds",
+                details={"socket_path": self.socket_path},
             ) from None
         except OSError as exc:
             raise TermctlError(
-                "tmux_missing", f"cannot run {self.tmux_bin}: {exc.strerror or exc}"
+                "tmux_missing",
+                f"cannot run {self.tmux_bin}: {exc.strerror or exc}",
+                details={"tmux_bin": self.configured_bin, "path": self.tmux_bin},
             ) from None

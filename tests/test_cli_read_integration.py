@@ -155,6 +155,23 @@ def test_a_forged_invalid_pane_is_ignored_with_an_escaped_warning(tmux_server: T
     )
 
 
+def test_a_raw_control_byte_in_an_option_is_read_as_tmux_escape_text(
+    tmux_server: TmuxServer,
+) -> None:
+    # interface.md "Residual risks", forged control bytes: tmux -u prints a raw ESC in a user
+    # option as the text \033, which passes the name grammar; nothing raw reaches the output.
+    pane_id = tmux_server.start()
+    tag(tmux_server, pane_id, **{"@termctl_name": "n\x1b[2Jx"})
+    result = termctl(tmux_server, "--json", "show", ID)
+    assert (result.code, result.stderr) == (0, "")
+    assert result.json()["name"] == "n\\033[2Jx"
+    assert "\x1b" not in result.stdout
+    human = termctl(tmux_server, "list")
+    assert (human.code, human.stderr) == (0, "")
+    raw = [c for c in human.stdout if c != "\n" and (ord(c) < 0x20 or 0x7F <= ord(c) <= 0x9F)]
+    assert raw == []
+
+
 # --- dead panes ---------------------------------------------------------------------------------
 
 

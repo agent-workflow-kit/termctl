@@ -63,7 +63,9 @@ Terminal placement, tmux backend. Layer 1 (primitive), fully standalone (archite
 
 | Module | Responsibility |
 |---|---|
-| `cli.py` | argparse, global flags, output and error rendering, exit codes |
+| `cli.py` | argparse, global flags, dispatch, check order, exit codes |
+| `argv.py` | the pre-scan of the command line before argparse: getopt-style option values (a value may begin with `-`), the subparser of each token and the `--` separator, for the `--json`, `--version` and `--help` checks |
+| `output.py` | writing results, errors, warnings and `--verbose` traces; escaping of human output ([Human output](interface.md#check-order)) |
 | `errors.py` | error codes, their exit codes and the `{"error": {...}}` envelope; separate from `cli.py` so every module can raise them without importing the CLI |
 | `config.py` | Pydantic models, file and drop-in merge, `TERMCTL_*` scalars, validation |
 | `ids.py` | id generation and prefix resolution |
