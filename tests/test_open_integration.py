@@ -15,7 +15,7 @@ import stat
 import subprocess
 import tempfile
 import threading
-from collections.abc import Iterator
+from collections.abc import Callable, Iterator
 from pathlib import Path
 
 import pytest
@@ -231,22 +231,29 @@ def test_an_unsafe_socket_directory_is_never_connected(tmux_server: TmuxServer) 
     assert list(unsafe.iterdir()) == []
 
 
-class LateProbe(TmuxBackend):
-    """A backend whose probe answers what it found, after which ``other`` runs: another
-    caller acting between termctl's probe and its creation."""
+Other = tuple[str, ...] | Callable[[], None]
 
-    def __init__(self, tmux: Tmux, other: list[tuple[str, ...]]) -> None:
+
+class LateProbe(TmuxBackend):
+    """A backend whose probe answers what it found, after which ``other`` runs (an argv, or a
+    function): another caller acting between termctl's probe and its creation."""
+
+    def __init__(self, tmux: Tmux, other: list[Other]) -> None:
         super().__init__(tmux)
         self.other = other
 
     def session_state(self, session: str) -> SessionState:
         state = super().session_state(session)
         if self.other:
-            subprocess.run(self.other.pop(0), check=True, capture_output=True, timeout=30)
+            other = self.other.pop(0)
+            if callable(other):
+                other()
+            else:
+                subprocess.run(other, check=True, capture_output=True, timeout=30)
         return state
 
 
-def late(server: TmuxServer, *other: tuple[str, ...]) -> tuple[Created, list[str]]:
+def late(server: TmuxServer, *other: Other) -> tuple[Created, list[str]]:
     gateway = SystemGateway()
     resolved = tmux_socket.resolve(server.socket_path, None, {}, gateway)
     traces: list[str] = []
@@ -268,10 +275,80 @@ def test_duplicate_session_falls_back_to_new_window(tmux_server: TmuxServer) -> 
     assert len(windows(tmux_server, "work")) == 2
 
 
-def test_vanished_session_is_retried_by_the_new_session_path(tmux_server: TmuxServer) -> None:
+def test_vanished_session_is_retried_by_the_path_the_probe_selects(
+    tmux_server: TmuxServer,
+) -> None:
     tmux_server.start()
     tmux_server.raw("new-session", "-d", "-s", "work")
     other = raw_argv(tmux_server, "kill-session", "-t", "=work:")
     created, commands = late(tmux_server, other)
-    assert commands == ["has-session", "new-window", "has-session", "new-session"]
+    assert commands == ["has-session", "new-window", "has-session", "new-session", "has-session"]
     assert windows(tmux_server, "work") == [f"{created.window_id} {created.pane_id}"]
+
+
+def test_a_vanished_last_session_that_took_the_server_is_retried(tmux_server: TmuxServer) -> None:
+    # The session is the server's last: killing it ends the server (exit-empty), so new-window
+    # finds no server; the retry starts one.
+    tmux_server.start("work")
+
+    def kill_last_session() -> None:
+        tmux_server.raw("kill-session", "-t", "=work:")
+        assert wait_for(lambda: not tmux_server.alive())
+
+    created, commands = late(tmux_server, kill_last_session)
+    assert commands[:2] == ["has-session", "new-window"]
+    assert commands[-2:] == ["set", "has-session"]
+    assert windows(tmux_server, "work") == [f"{created.window_id} {created.pane_id}"]
+
+
+class ServerEndsAtNewSession(TmuxBackend):
+    """A backend where the server ends right before the first ``new-session`` that does not
+    start a server, so that ``new-session`` starts one without the prefix; the user config
+    ends that one at once."""
+
+    def __init__(self, tmux: Tmux, server: TmuxServer) -> None:
+        super().__init__(tmux)
+        self.server = server
+        self.armed = True
+
+    def create_session(
+        self, session: str, spec: WindowSpec, *, start_server: bool
+    ) -> Created | None:
+        if not self.armed or start_server:
+            return super().create_session(session, spec, start_server=start_server)
+        self.armed = False
+        self.server.raw("kill-server")
+        assert wait_for(lambda: not self.server.alive())
+        created = super().create_session(session, spec, start_server=False)
+        assert wait_for(lambda: not self.server.alive())
+        return created
+
+
+def test_a_server_started_by_new_session_without_the_prefix_is_retried(
+    tmux_server: TmuxServer,
+) -> None:
+    tmux_server.start()
+    user_config(tmux_server, HOSTILE_CONFIG)
+    gateway = SystemGateway()
+    resolved = tmux_socket.resolve(tmux_server.socket_path, None, {}, gateway)
+    tmux = Tmux(gateway, tmux_server.tmux_bin, resolved.socket_path, env=tmux_server.env)
+    backend = ServerEndsAtNewSession(tmux, tmux_server)
+    created = open_cmd.create_window(backend, resolved, gateway, "work", SPEC)
+    assert not backend.armed
+    assert not wait_for(lambda: not tmux_server.alive(), timeout=0.5)
+    assert windows(tmux_server, "work") == [f"{created.window_id} {created.pane_id}"]
+    assert server_option(tmux_server, "exit-unattached") == "off"
+
+
+def test_a_socket_directory_made_unsafe_after_the_probe_is_never_connected(
+    tmux_server: TmuxServer,
+) -> None:
+    tmux_server.start("work")
+    try:
+        with pytest.raises(TermctlError) as caught:
+            late(tmux_server, lambda: tmux_server.root.chmod(0o777))
+    finally:
+        tmux_server.root.chmod(0o700)
+    assert (caught.value.code, caught.value.exit_code) == ("server_unavailable", 12)
+    assert "writable by group or others" in caught.value.message
+    assert len(windows(tmux_server, "work")) == 1

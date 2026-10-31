@@ -69,8 +69,9 @@ class Backend(Protocol):
         ...
 
     def create_window(self, session: str, spec: WindowSpec) -> Created | None:
-        """Create a window in the existing session, or None when the session is gone. Any
-        other failure, no server included, exits 12 (``server_unavailable``)."""
+        """Create a window in the existing session, or None when the session is gone, or the
+        server with it (the last session ending takes the server with it). Any other failure
+        exits 12 (``server_unavailable``)."""
         ...
 
 
@@ -109,7 +110,7 @@ class TmuxBackend:
 
     def create_window(self, session: str, spec: WindowSpec) -> Created | None:
         result = self.tmux.run(tb.new_window(session, spec))
-        if tb.is_session_missing(result, session):
+        if tb.is_session_missing(result, session) or tb.is_no_server(result, self.socket_path):
             return None
         return self._created(result)
 

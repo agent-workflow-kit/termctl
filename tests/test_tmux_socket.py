@@ -912,12 +912,14 @@ def test_prepare_creates_the_default_directory_for_a_socket_name() -> None:
     assert gateway.mkdirs == [(f"/tmp/tmux-{UID}", 0o700)]
 
 
-def test_prepare_leaves_an_existing_directory_alone() -> None:
+def test_prepare_rechecks_an_existing_directory_after_eexist() -> None:
     files = safe_default_server()
     del files[DEFAULT]
     gateway = FakeGateway(files=files)
     assert prepare(gateway) is False
-    assert gateway.mkdirs == []
+    # mkdir is always attempted; EEXIST leaves the directory as it is, checked again.
+    assert gateway.mkdirs == [(f"/tmp/tmux-{UID}", 0o700)]
+    assert gateway.files[f"/tmp/tmux-{UID}"] == directory(0o700, UID)
 
 
 def test_prepare_reports_an_existing_socket() -> None:
@@ -952,6 +954,54 @@ def test_prepare_refuses_a_default_directory_that_appeared_owned_by_another_user
     gateway = FakeGateway(files=no_default_dir())
     gateway.appears[f"/tmp/tmux-{UID}"] = directory(0o700, UID + 1)
     assert "owned by uid" in prepare_error(gateway).message
+
+
+class LateLstat(FakeGateway):
+    """A fake gateway where ``path`` appears (with ``info``) just before its ``nth`` lstat:
+    another process creating it between two of termctl's looks. Resolution looks once and
+    the first check once, so ``nth=3`` is right after the first check."""
+
+    def __init__(self, path: str, nth: int, info: FileInfo, **kwargs: object) -> None:
+        super().__init__(**kwargs)  # type: ignore[arg-type]
+        self.late = (path, nth, info)
+
+    def lstat(self, path: str) -> FileInfo:
+        late_path, nth, info = self.late
+        if path == late_path and self.lstats.count(path) + 1 == nth:
+            self.files[path] = info
+        return super().lstat(path)
+
+
+@pytest.mark.parametrize(
+    ("info", "problem"),
+    [(symlink(UID), "symlink"), (directory(0o777, UID), "writable by group or others")],
+    ids=["symlink", "mode-0777"],
+)
+def test_prepare_rechecks_a_default_directory_that_appeared_after_the_first_check(
+    info: FileInfo, problem: str
+) -> None:
+    # The directory is missing at the first check and appears right after it.
+    gateway = LateLstat(f"/tmp/tmux-{UID}", 3, info, files=no_default_dir())
+    assert problem in prepare_error(gateway).message
+
+
+def test_prepare_accepts_a_safe_default_directory_that_appeared_after_the_first_check() -> None:
+    gateway = LateLstat(f"/tmp/tmux-{UID}", 3, directory(0o700, UID), files=no_default_dir())
+    assert prepare(gateway) is False
+
+
+def test_prepare_rechecks_after_creating_the_directory() -> None:
+    # A socket that appears with the directory is reported: the checks run after the mkdir.
+    gateway = FakeGateway(files=no_default_dir())
+    gateway.appears[DEFAULT] = socket_file()
+    assert prepare(gateway) is True
+    assert gateway.mkdirs == [(f"/tmp/tmux-{UID}", 0o700)]
+
+
+def test_prepare_explicit_path_rechecks_a_parent_that_appeared_after_the_first_check() -> None:
+    files = safe_default_server()
+    gateway = LateLstat("/srv", 3, directory(0o777, UID), files=files)
+    assert "writable by group or others" in prepare_error(gateway, "/srv/sock").message
 
 
 def test_prepare_mkdir_failure_is_server_unavailable() -> None:

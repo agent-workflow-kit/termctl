@@ -80,7 +80,7 @@ Status: planned, 2026-10-30. Implements [interface.md](interface.md) (normative)
 **Success Criteria**: `open` creates a managed pane in the configured placement on a running or absent server, under a user config with `destroy-unattached on` and `exit-unattached on`, and the pane carries every option before the real command can exit; `--env` values reach only that pane; a cron-like caller's credentials never reach tmux; dry runs change nothing.
 **Tests**:
 
-- check order: usage (including the cwd) → resolve (placement, `command_not_found` on the filtered or `--env` PATH, size limit 12288 bytes on the worst case) → tmux checks and id-collision check → pre-open hooks → session → pane → record → focus → post-open.
+- check order: usage (including the cwd) → resolve (server, `tmux_bin` with `tmux_missing`, placement, id, `command_not_found` on the filtered or `--env` PATH, size limit 12288 bytes on the worst case) → tmux checks and id-collision check → pre-open hooks → session → pane → record → focus → post-open.
 - placement: rules (first match, empty match), `--placement`, `--session`/`--target` overrides, inheritance from `default`, `not_supported` for `target: pane` and related fields.
 - session creation: exact `=S:` targets; duplicate-session race (two concurrent opens, one server, both panes created); `destroy-unattached off` chained (spike C2); `exit-unattached off` only when the re-probe found no server (spike F2); `has-session` confirmation; the vanished-session retry, never exit 10; re-run socket checks and `mkdir`/`EEXIST`/`lstat` before starting a server.
 - placeholder + respawn (spike C1, E5): options set before a fast-exiting command (`true`, `false`); keep `never|failed|always`; no leftover placeholder; `state: gone` output; `-d` always; PID recorded only when not dead and parented by the server (spike E6).
@@ -89,6 +89,8 @@ Status: planned, 2026-10-30. Implements [interface.md](interface.md) (normative)
 - failure handling: `tag_failed` with the guarded cleanup kill; no post-open hooks; log `result: error`.
 - hooks: pre-open payload fields (env names only), veto/escalate/override, decision ids in output, log and audit (override runs).
 - `--dry-run`: read-only tmux queries only, tmux checks, `%NEW`/`@NEW` tokens, no hooks, nothing created.
+
+Interim state: until the pane step (#15) lands, the CLI `open` runs steps 1 to 3 and then refuses (exit 1, `internal`) before any side effect; step 5 (`open_cmd.create_window`) is tested directly.
 
 **Status**: Not Started
 

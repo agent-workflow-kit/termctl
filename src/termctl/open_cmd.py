@@ -69,8 +69,9 @@ def check_command(argv0: str, cwd: str, path: str | None, gateway: Gateway) -> N
 
     An argv[0] containing ``/`` must be an executable regular file, a relative one resolved
     against ``cwd``. Any other argv[0] must be found in ``path``. Only absolute ``PATH``
-    entries are searched: an empty or relative entry would be looked up from the pane's
-    directory, which termctl does not resolve, so such a command is reported as not found.
+    entries are searched: termctl deliberately does not search an empty or relative entry
+    (conservative: what it finds there would depend on the pane's working directory), so a
+    command found only through one is reported as not found.
     """
     if "\x00" not in argv0 and argv0 not in ("", ".", ".."):
         if "/" in argv0:
@@ -123,14 +124,20 @@ def check_size(invocations: Iterable[Invocation], tmux_bin: str, socket_path: st
 def _probe(
     backend: Backend, server: tmux_socket.Server, gateway: Gateway, session: str
 ) -> SessionState:
-    """The socket checks, then, only if they found a socket, ``has-session``."""
+    """The socket checks, then, only if they found a socket, ``has-session``: the probe, and
+    the confirmation after ``new-session``."""
     if not tmux_socket.check(server, gateway):
         return SessionState.NO_SERVER
     return backend.session_state(session)
 
 
-def _unavailable(server: tmux_socket.Server, message: str) -> TermctlError:
-    return TermctlError("server_unavailable", message, details={"socket_path": server.socket_path})
+def _gone(server: tmux_socket.Server, session: str) -> TermctlError:
+    return TermctlError(
+        "server_unavailable",
+        f"session {session} on the tmux server {validate.show(server.socket_path, 200)} went"
+        " away while opening a window in it, again after a retry",
+        details={"socket_path": server.socket_path},
+    )
 
 
 def create_window(
@@ -143,41 +150,46 @@ def create_window(
     """Open order step 5: create the window ``spec`` in ``session``, starting the server and
     creating the session when needed.
 
-    The hooks may have run long, so the socket checks and the server probe run again first.
-    With no server: the default directory is made ready (``prepare_start``, which repeats the
-    checks), and the server is started by the invocation that creates the session, prefixed
-    with ``exit-unattached off`` (spike F2), then confirmed with ``has-session``. A session
-    another caller created first (duplicate session) takes the new-window path; a session that
-    vanishes before ``new-window`` is retried once, after probing again, by the new-session
-    path. Every other failure exits 12 (``server_unavailable``): ``open`` never exits 10.
+    The hooks may have run long, so the socket checks and the server probe run again first,
+    and the socket checks run again immediately before every later connect: a check that
+    finds no socket is no server, and an unsafe socket exits 12. With no server: the default
+    directory is made ready (``prepare_start``, which repeats the checks); if a socket file is
+    then there, the server is probed again and the prefix is used only if none answers.
+    Otherwise the server is started by the invocation that creates the session, prefixed with
+    ``exit-unattached off`` (spike F2). Every ``new-session`` is confirmed with
+    ``has-session``. A session another caller created first (duplicate session) takes the
+    new-window path. A session or server that is not there at ``new-window`` or at the
+    confirmation (or a server that appeared after the probe) is retried once, after probing
+    again, by whichever path the probe selects. Every other failure, and a second one, exits
+    12 (``server_unavailable``): ``open`` never exits 10.
     """
     state = _probe(backend, server, gateway, session)
     retried = False
     while True:
-        if state is SessionState.NO_SERVER:
-            tmux_socket.prepare_start(server, gateway)
-            created = backend.create_session(session, spec, start_server=True)
-            if created is None:
-                # Another caller's server, with the session, started meanwhile.
-                state = SessionState.EXISTS
-                continue
-            if backend.session_state(session) is not SessionState.EXISTS:
-                raise _unavailable(
-                    server,
-                    f"the tmux server on {validate.show(server.socket_path, 200)} did not stay"
-                    f" up with session {session}",
-                )
-            return created
-        if state is SessionState.MISSING:
-            created = backend.create_session(session, spec, start_server=False)
-            if created is None:
-                state = SessionState.EXISTS
-                continue
-            return created
-        created = backend.create_window(session, spec)
-        if created is not None:
-            return created
+        if state is SessionState.NO_SERVER and tmux_socket.prepare_start(server, gateway):
+            # A socket file is there: a stale one, or another caller's server started since
+            # the probe, which must never get the prefix.
+            state = backend.session_state(session)
+            if state is not SessionState.NO_SERVER:
+                if retried:
+                    raise _gone(server, session)
+                retried = True
+        if state is SessionState.EXISTS:
+            if tmux_socket.check(server, gateway):
+                created = backend.create_window(session, spec)
+                if created is not None:
+                    return created
+        else:
+            start = state is SessionState.NO_SERVER
+            if start or tmux_socket.check(server, gateway):
+                created = backend.create_session(session, spec, start_server=start)
+                if created is None:
+                    # Another caller created the session first.
+                    state = SessionState.EXISTS
+                    continue
+                if _probe(backend, server, gateway, session) is SessionState.EXISTS:
+                    return created
         if retried:
-            raise _unavailable(server, f"session {session} vanished while opening a window in it")
+            raise _gone(server, session)
         retried = True
         state = _probe(backend, server, gateway, session)

@@ -97,10 +97,17 @@ def test_create_session_duplicate_is_none() -> None:
     assert backend.create_session("work", SPEC, start_server=False) is None
 
 
-def test_create_window_missing_session_is_none() -> None:
-    backend = backend_for(
-        {NEW_WINDOW: completed(stderr="can't find session: work\n", returncode=1)}
-    )
+@pytest.mark.parametrize(
+    "stderr",
+    [
+        "can't find session: work\n",
+        # The last session ended and took the server with it: retried like a missing session.
+        f"no server running on {SOCK}\n",
+        f"error connecting to {SOCK} (No such file or directory)\n",
+    ],
+)
+def test_create_window_missing_session_or_server_is_none(stderr: str) -> None:
+    backend = backend_for({NEW_WINDOW: completed(stderr=stderr, returncode=1)})
     assert backend.create_window("work", SPEC) is None
 
 
@@ -134,7 +141,7 @@ def test_create_session_failures_are_server_unavailable(
 @pytest.mark.parametrize(
     "response",
     [
-        completed(stderr=f"no server running on {SOCK}\n", returncode=1),
+        completed(stderr="server exited unexpectedly\n", returncode=1),
         completed(stderr="duplicate session: work\n", returncode=1),
         completed(stderr="can't find window: @1\n", returncode=1),
         completed("%1\n"),

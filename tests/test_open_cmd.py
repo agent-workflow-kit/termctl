@@ -4,7 +4,7 @@
 from __future__ import annotations
 
 import subprocess
-from collections.abc import Mapping
+from collections.abc import Callable, Mapping
 
 import pytest
 
@@ -12,9 +12,10 @@ from termctl import open_cmd, tmux_socket
 from termctl import tmux_backend as tb
 from termctl.backend import Created, TmuxBackend
 from termctl.errors import TermctlError
+from termctl.gateway import FileInfo
 from termctl.tmux_backend import Tmux, WindowSpec
 
-from .fakes import UID, FakeGateway, completed, directory, safe_default_server
+from .fakes import UID, FakeGateway, completed, directory, safe_default_server, socket_file
 
 TMUX = "/usr/bin/tmux"
 SOCK = f"/tmp/tmux-{UID}/default"
@@ -217,17 +218,39 @@ DUPLICATE = completed(stderr="duplicate session: work\n", returncode=1)
 OK = completed()
 
 
+Effect = Callable[[FakeGateway], None]
+
+
+def socket_appears(gateway: FakeGateway) -> None:
+    """A server starts and creates its socket file."""
+    gateway.files[SOCK] = socket_file()
+
+
+def socket_gone(gateway: FakeGateway) -> None:
+    """The server exits and removes its socket file."""
+    del gateway.files[SOCK]
+
+
+def directory_unsafe(gateway: FakeGateway) -> None:
+    """The socket's directory becomes writable by others."""
+    gateway.files[f"/tmp/tmux-{UID}"] = directory(0o777, UID)
+
+
 class Script(FakeGateway):
     """A fake gateway whose tmux answers come from a per-argv queue, so a test can script the
-    same invocation answering differently each time (a race)."""
+    same invocation answering differently each time (a race). ``after`` runs an effect on
+    the gateway after each answer of an argv, one per call in order (another process acting
+    right after that call)."""
 
     def __init__(
         self,
         script: Mapping[tuple[str, ...], list[subprocess.CompletedProcess[str]]],
+        after: Mapping[tuple[str, ...], list[Effect | None]] | None = None,
         **kwargs: object,
     ) -> None:
         super().__init__(**kwargs)  # type: ignore[arg-type]
         self.script = {k: list(v) for k, v in script.items()}
+        self.after = {k: list(v) for k, v in (after or {}).items()}
 
     def run(
         self,
@@ -241,6 +264,10 @@ class Script(FakeGateway):
         queue = self.script.get(tuple(argv))
         if not queue:
             raise AssertionError(f"unexpected gateway call: {argv!r}")
+        effects = self.after.get(tuple(argv))
+        effect = effects.pop(0) if effects else None
+        if effect is not None:
+            effect(self)
         return queue.pop(0)
 
     def tmux_calls(self) -> list[tuple[str, ...]]:
@@ -260,10 +287,11 @@ def create_error(gateway: FakeGateway, socket: str | None = None) -> TermctlErro
     return caught.value
 
 
-def no_socket(uid: int = UID) -> dict[str, object]:
-    files = safe_default_server(uid)
+def no_socket() -> dict[str, FileInfo]:
+    """A filesystem with a safe default directory and no socket file."""
+    files = safe_default_server()
     del files[SOCK]
-    return {"files": files}
+    return files
 
 
 def test_existing_session_gets_a_new_window() -> None:
@@ -272,16 +300,18 @@ def test_existing_session_gets_a_new_window() -> None:
     assert gateway.tmux_calls() == [HAS, NEW_WINDOW]
 
 
-def test_missing_session_is_created_without_the_server_prefix() -> None:
+def test_missing_session_is_created_without_the_server_prefix_and_confirmed() -> None:
     # Spike F2: a running server's settings are never changed.
-    gateway = Script({HAS: [MISSING], NEW_SESSION: [completed("%5 @3\n")]})
+    gateway = Script({HAS: [MISSING, OK], NEW_SESSION: [completed("%5 @3\n")]})
     assert create(gateway) == Created("%5", "@3")
-    assert gateway.tmux_calls() == [HAS, NEW_SESSION]
+    assert gateway.tmux_calls() == [HAS, NEW_SESSION, HAS]
     assert "exit-unattached" not in NEW_SESSION
 
 
 def test_no_server_starts_one_with_the_prefix_and_confirms() -> None:
-    gateway = Script({START: [completed("%0 @0\n")], HAS: [OK]}, **no_socket())
+    gateway = Script(
+        {START: [completed("%0 @0\n")], HAS: [OK]}, {START: [socket_appears]}, files=no_socket()
+    )
     assert create(gateway) == Created("%0", "@0")
     # No socket file: no probe before the start, has-session after it.
     assert gateway.tmux_calls() == [START, HAS]
@@ -289,25 +319,42 @@ def test_no_server_starts_one_with_the_prefix_and_confirms() -> None:
 
 
 def test_a_stale_socket_file_is_no_server() -> None:
-    gateway = Script({HAS: [NO_SERVER, OK], START: [completed("%0 @0\n")]})
+    # The socket file is still there when the server starts: probed again, then started.
+    gateway = Script({HAS: [NO_SERVER, NO_SERVER, OK], START: [completed("%0 @0\n")]})
     assert create(gateway) == Created("%0", "@0")
-    assert gateway.tmux_calls() == [HAS, START, HAS]
+    assert gateway.tmux_calls() == [HAS, HAS, START, HAS]
 
 
-def test_a_started_server_that_is_not_there_is_server_unavailable() -> None:
-    gateway = Script({START: [completed("%0 @0\n")], HAS: [NO_SERVER]}, **no_socket())
-    assert "did not" in create_error(gateway).message
+def test_a_started_server_that_is_not_there_is_retried_once_then_server_unavailable() -> None:
+    gateway = Script(
+        {START: [completed("%0 @0\n")] * 2, HAS: [NO_SERVER] * 4},
+        {START: [socket_appears]},
+        files=no_socket(),
+    )
+    assert "work" in create_error(gateway).message
+    assert gateway.tmux_calls() == [START, HAS, HAS, HAS, START, HAS]
 
 
-def test_a_started_server_without_the_session_is_server_unavailable() -> None:
-    gateway = Script({START: [completed("%0 @0\n")], HAS: [MISSING]}, **no_socket())
-    create_error(gateway)
+def test_a_started_server_without_the_session_is_retried_by_the_path_the_probe_selects() -> None:
+    gateway = Script(
+        {
+            START: [completed("%0 @0\n")],
+            HAS: [MISSING, MISSING, OK],
+            NEW_SESSION: [completed("%1 @1\n")],
+        },
+        {START: [socket_appears]},
+        files=no_socket(),
+    )
+    assert create(gateway) == Created("%1", "@1")
+    assert gateway.tmux_calls() == [START, HAS, HAS, NEW_SESSION, HAS]
 
 
 def test_no_server_creates_the_default_directory_first() -> None:
     files = safe_default_server()
     del files[SOCK], files[f"/tmp/tmux-{UID}"]
-    gateway = Script({START: [completed("%0 @0\n")], HAS: [OK]}, files=files)
+    gateway = Script(
+        {START: [completed("%0 @0\n")], HAS: [OK]}, {START: [socket_appears]}, files=files
+    )
     assert create(gateway) == Created("%0", "@0")
     assert gateway.mkdirs == [(f"/tmp/tmux-{UID}", 0o700)]
 
@@ -337,6 +384,30 @@ def test_a_socket_made_unsafe_before_the_start_is_never_connected() -> None:
     assert gateway.calls == []
 
 
+def test_a_socket_made_unsafe_after_the_probe_is_never_connected() -> None:
+    gateway = Script({HAS: [OK]}, {HAS: [directory_unsafe]})
+    create_error(gateway)
+    assert gateway.tmux_calls() == [HAS]
+
+
+def test_a_socket_made_unsafe_after_new_session_is_never_connected() -> None:
+    gateway = Script(
+        {HAS: [MISSING], NEW_SESSION: [completed("%5 @3\n")]}, {NEW_SESSION: [directory_unsafe]}
+    )
+    create_error(gateway)
+    assert gateway.tmux_calls() == [HAS, NEW_SESSION]
+
+
+def test_a_socket_gone_after_the_probe_is_no_server() -> None:
+    # No connect after the checks found no socket: the server is started instead.
+    gateway = Script(
+        {HAS: [OK, OK], START: [completed("%0 @0\n")]},
+        {HAS: [socket_gone], START: [socket_appears]},
+    )
+    assert create(gateway) == Created("%0", "@0")
+    assert gateway.tmux_calls() == [HAS, START, HAS]
+
+
 def test_duplicate_session_race_falls_back_to_a_new_window() -> None:
     gateway = Script({HAS: [MISSING], NEW_SESSION: [DUPLICATE], NEW_WINDOW: [completed("%9 @9\n")]})
     assert create(gateway) == Created("%9", "@9")
@@ -346,25 +417,44 @@ def test_duplicate_session_race_falls_back_to_a_new_window() -> None:
 def test_server_started_by_another_caller_falls_back_to_a_new_window() -> None:
     # The other caller's server has the session: the prefix ran there (a residual risk), and
     # termctl takes the new-window path without confirming a server it did not start.
-    gateway = Script({START: [DUPLICATE], NEW_WINDOW: [completed("%9 @9\n")]}, **no_socket())
+    gateway = Script(
+        {START: [DUPLICATE], NEW_WINDOW: [completed("%9 @9\n")]},
+        {START: [socket_appears]},
+        files=no_socket(),
+    )
     assert create(gateway) == Created("%9", "@9")
     assert gateway.tmux_calls() == [START, NEW_WINDOW]
 
 
-def test_vanished_session_is_retried_once_by_the_new_session_path() -> None:
+@pytest.mark.parametrize(
+    ("state", "path"), [(OK, NEW_WINDOW), (MISSING, NEW_SESSION)], ids=["exists", "missing"]
+)
+def test_a_server_started_after_the_probe_never_gets_the_prefix(
+    state: subprocess.CompletedProcess[str], path: tuple[str, ...]
+) -> None:
+    # Another caller's server creates its socket between the probe and the start.
+    gateway = Script({HAS: [state, OK], path: [completed("%9 @9\n")]}, files=no_socket())
+    gateway.appears[SOCK] = socket_file()
+    assert create(gateway) == Created("%9", "@9")
+    assert START not in gateway.tmux_calls()
+    assert gateway.tmux_calls()[:2] == [HAS, path]
+
+
+def test_vanished_session_is_retried_once_by_the_path_the_probe_selects() -> None:
     gateway = Script(
-        {HAS: [OK, MISSING], NEW_WINDOW: [MISSING], NEW_SESSION: [completed("%2 @2\n")]}
+        {HAS: [OK, MISSING, OK], NEW_WINDOW: [MISSING], NEW_SESSION: [completed("%2 @2\n")]}
     )
     assert create(gateway) == Created("%2", "@2")
-    assert gateway.tmux_calls() == [HAS, NEW_WINDOW, HAS, NEW_SESSION]
+    assert gateway.tmux_calls() == [HAS, NEW_WINDOW, HAS, NEW_SESSION, HAS]
 
 
 def test_vanished_session_and_server_restarts_the_server() -> None:
     gateway = Script(
-        {HAS: [OK, NO_SERVER, OK], NEW_WINDOW: [MISSING], START: [completed("%0 @0\n")]}
+        {HAS: [OK, OK], NEW_WINDOW: [MISSING], START: [completed("%0 @0\n")]},
+        {NEW_WINDOW: [socket_gone], START: [socket_appears]},
     )
     assert create(gateway) == Created("%0", "@0")
-    assert gateway.tmux_calls() == [HAS, NEW_WINDOW, HAS, START, HAS]
+    assert gateway.tmux_calls() == [HAS, NEW_WINDOW, START, HAS]
 
 
 def test_session_vanishing_twice_is_server_unavailable_never_10() -> None:
@@ -386,9 +476,32 @@ def test_session_vanishing_again_after_the_retry_is_server_unavailable() -> None
     assert gateway.tmux_calls() == [HAS, NEW_WINDOW, HAS, NEW_WINDOW]
 
 
-def test_server_vanishing_at_new_window_is_server_unavailable() -> None:
-    gateway = Script({HAS: [OK], NEW_WINDOW: [NO_SERVER]})
+def test_server_vanishing_at_new_window_is_retried_by_starting_it() -> None:
+    # The last session vanished and took the server with it (exit-empty).
+    gateway = Script(
+        {HAS: [OK, OK], NEW_WINDOW: [NO_SERVER], START: [completed("%0 @0\n")]},
+        {NEW_WINDOW: [socket_gone], START: [socket_appears]},
+    )
+    assert create(gateway) == Created("%0", "@0")
+    assert gateway.tmux_calls() == [HAS, NEW_WINDOW, START, HAS]
+
+
+def test_server_vanishing_at_new_window_twice_is_server_unavailable() -> None:
+    gateway = Script({HAS: [OK, OK], NEW_WINDOW: [NO_SERVER, NO_SERVER]})
     create_error(gateway)
+    assert gateway.tmux_calls() == [HAS, NEW_WINDOW, HAS, NEW_WINDOW]
+
+
+def test_new_session_that_started_a_server_without_the_prefix_is_retried() -> None:
+    # The server ends between the probe and new-session; new-session starts one without the
+    # prefix, which a user's exit-unattached on ends at once: the confirmation finds no
+    # server, and the retry starts it with the prefix.
+    gateway = Script(
+        {HAS: [MISSING, OK], NEW_SESSION: [completed("%0 @0\n")], START: [completed("%1 @1\n")]},
+        {NEW_SESSION: [socket_gone], START: [socket_appears]},
+    )
+    assert create(gateway) == Created("%1", "@1")
+    assert gateway.tmux_calls() == [HAS, NEW_SESSION, START, HAS]
 
 
 def test_probe_failure_is_server_unavailable() -> None:

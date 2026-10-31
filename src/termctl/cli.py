@@ -52,7 +52,7 @@ class Context:
     pane: ManagedPane | None = None
     # `open`'s resolved placement (Open order step 2); None for other commands.
     selection: placement.Selection | None = None
-    # `open`'s window (Open order step 2) and id (step 3, after the id-collision check).
+    # `open`'s window and id (Open order step 2; step 3 replaces the id on a collision).
     window: WindowSpec | None = None
     open_id: str | None = None
 
@@ -458,6 +458,8 @@ def resolve_command(args: argparse.Namespace, ctx: Context) -> None:
     # --env values; until then the new-session invocation of step 5 is the largest.
     largest = tb.new_session(ctx.selection.session, ctx.window, start_server=True)
     open_cmd.check_size([largest], ctx.tmux_path, ctx.server.socket_path)
+    # The id; step 3 checks it against the managed panes.
+    ctx.open_id = ids.generate()
 
 
 def check_tmux(args: argparse.Namespace, ctx: Context) -> None:
@@ -479,13 +481,18 @@ def check_tmux(args: argparse.Namespace, ctx: Context) -> None:
     # answer, step 4 exits 10 for the other commands, and `open` starts a server in its step 5
     # (`open_cmd.create_window`). `read_panes` and step 5 re-run these checks before they
     # connect.
+    if args.command == "open" and not ctx.socket_present:
+        # `open` could not start a server there: it never creates an explicit path's parent.
+        tmux_socket.require_parent(ctx.server, ctx.gateway)
 
 
 def check_id_collision(ctx: Context) -> None:
-    """Step 3 of ``open``, after the tmux checks: an id no managed pane carries, from one
-    read-only ``list-panes -a`` (none without a server)."""
+    """Step 3 of ``open``, after the tmux checks: the id from step 2 is kept unless a managed
+    pane carries it, from one read-only ``list-panes -a`` (none without a server)."""
+    assert ctx.open_id is not None
     taken = {pane.id for pane in read_panes(ctx).panes}
-    ctx.open_id = ids.generate_unique(taken)
+    if ctx.open_id in taken:
+        ctx.open_id = ids.generate_unique(taken)
 
 
 def connect(ctx: Context) -> Backend | None:
@@ -505,8 +512,9 @@ def unchecked_backend(ctx: Context) -> TmuxBackend:
     """The backend for the resolved server, without the socket checks: only for a caller that
     runs them itself immediately before each connect (``open_cmd.create_window``)."""
     assert ctx.server is not None and ctx.tmux is not None
-    # TODO(#15): run tmux with the environment filtered by server_env_allow; until then only
-    # the caller's locale, as for `tmux -V`.
+    # TODO(#15): run tmux with the environment filtered by server_env_allow, through
+    # `open_cmd.allowed`, the single server_env_allow matcher (never a second one); until then
+    # only the caller's locale, as for `tmux -V`.
     env = tmux_bin.locale_env(ctx.environ)
     tmux = Tmux(
         ctx.gateway,
@@ -610,15 +618,14 @@ def open_pane(args: argparse.Namespace, ctx: Context) -> Result:
         # ctx.open_id, the window in ctx.window.
         raise TermctlError("internal", f"{PROG} open --dry-run is not implemented yet")
     # TODO(#17): step 4, the pre-open hooks (veto 11, escalation 13; nothing created).
-    created = open_cmd.create_window(
-        unchecked_backend(ctx), ctx.server, ctx.gateway, ctx.selection.session, ctx.window
-    )
-    # TODO(#15): step 6 tags pane created.pane_id and respawns it with argv; TODO(#16) records
-    # the process; TODO(#17) post-open hooks, the log record and the output. Until then the
-    # untagged window ends with its placeholder.
+    # TODO(#15): wire in step 5, `open_cmd.create_window(unchecked_backend(ctx), ctx.server,
+    # ctx.gateway, ctx.selection.session, ctx.window)`, together with step 6, which tags the
+    # pane it returns and respawns it with argv (the server environment must be set first);
+    # TODO(#16) records the process; TODO(#17) post-open hooks, the log record and the output.
+    # Until then open refuses here, before any side effect.
     raise TermctlError(
         "internal",
-        f"{PROG} open is not implemented past creating window {created.window_id} yet",
+        f"{PROG} open is not implemented yet: creating the pane lands with a later change",
     )
 
 
