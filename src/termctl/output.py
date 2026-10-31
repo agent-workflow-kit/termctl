@@ -151,6 +151,15 @@ class Output:
         if self.verbose:
             self._stderr(message)
 
+    def flush(self) -> None:
+        """Flush both streams, and the standard ones, before termctl replaces itself (focus's
+        attach), which would lose anything still buffered."""
+        _flush(self.stdout)
+        _flush(self.stderr)
+        for stream in (sys.stdout, sys.stderr):
+            if stream is not None:
+                _flush(stream)
+
     def _stderr(self, message: str) -> None:
         _write(self.stderr, f"{PROG}: {escape(message)}\n")
 

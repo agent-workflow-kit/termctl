@@ -535,3 +535,57 @@ def test_a_post_open_hook_gets_the_open_output(tmux_server: TmuxServer, tmp_path
     validate(data, "termctl/hooks/post-open.json")
     assert data["pane"] == out
     assert Path(f"{seen}.id").read_text(encoding="utf-8") == f"{out['id']}\n"
+
+
+# --- --dry-run (#18) ----------------------------------------------------------------------------
+
+
+def dry_run(server: TmuxServer, *argv: str) -> Any:
+    result = termctl(server, "--json", "open", "--dry-run", *argv)
+    assert result.code == 0, result.stdout + result.stderr
+    out = result.json()
+    validate(out, "termctl/cli/open-dry-run.json")
+    return out
+
+
+def test_dry_run_changes_nothing_on_a_running_server(tmux_server: TmuxServer) -> None:
+    tmux_server.start(SESSION)
+    before = tmux_server.raw("list-panes", "-a", "-F", "#{pane_id} #{window_id}").stdout
+    out = dry_run(tmux_server, "--env", "SECRET=s3cret-value", "--", "true")
+    assert out["session_exists"] is True
+    assert out["tmux_commands"][0][3] == "new-window"
+    assert "s3cret" not in json.dumps(out)
+    after = tmux_server.raw("list-panes", "-a", "-F", "#{pane_id} #{window_id}").stdout
+    assert after == before
+    assert dry_run(tmux_server, "--session", "other")["session_exists"] is False
+    assert tmux_server.raw("has-session", "-t", "=other:").returncode != 0
+
+
+def test_dry_run_starts_no_server(tmux_server: TmuxServer) -> None:
+    out = dry_run(tmux_server, "--", "true")
+    assert out["session_exists"] is None
+    assert out["tmux_commands"][0][3:5] == ["set", "-s"]
+    assert not os.path.exists(tmux_server.socket_path)
+
+
+def test_dry_run_creates_no_default_directory(tmux_server: TmuxServer) -> None:
+    # A socket in default directory form whose directory does not exist yet: a real run would
+    # create the directory (Open order step 5), a dry run must not.
+    tmpdir = tmux_server.root / "t"
+    tmpdir.mkdir()
+    tmpdir.chmod(0o700)  # whatever the umask: the socket checks refuse a group-writable one
+    default_dir = tmpdir / f"tmux-{os.getuid()}"
+    socket_path = str(default_dir / "default")
+    stdout, stderr = io.StringIO(), io.StringIO()
+    code = main(
+        ["--socket", socket_path, "--json", "open", "--dry-run", "--", "true"],
+        environ={**tmux_server.env, "XDG_CONFIG_HOME": NO_CONFIG, "TMUX_TMPDIR": str(tmpdir)},
+        stdout=stdout,
+        stderr=stderr,
+    )
+    assert code == 0, stdout.getvalue() + stderr.getvalue()
+    out = json.loads(stdout.getvalue())
+    validate(out, "termctl/cli/open-dry-run.json")
+    assert out["socket_path"] == socket_path
+    assert out["session_exists"] is None
+    assert not default_dir.exists()

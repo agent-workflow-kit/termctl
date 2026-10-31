@@ -4,7 +4,7 @@ Places commands in terminal panes (tmux backend): open, rename, mark, focus, lis
 
 ## Status
 
-Designed: interface 0.1.0-design ([docs/interface.md](docs/interface.md)); not yet implemented. Implementation plan: [docs/plan.md](docs/plan.md).
+Implemented: interface 0.1.0-design ([docs/interface.md](docs/interface.md)). Implementation plan: [docs/plan.md](docs/plan.md).
 
 ## Layer
 
@@ -42,7 +42,7 @@ Global flags: `--json`, `--socket NAME|PATH`, `--config PATH`, `--verbose`, `--q
 
 ## Exit codes
 
-0 success; 1 internal error; 2 usage or invalid config; 10 not found (or no server); 11 vetoed by a pre-hook; 12 expected failure (tmux missing or too old, server unavailable, command not found, no client to focus, lock busy, pane state changed during `close`, ...); 13 a pre-hook escalated; 20 refused (`running`); 21 ambiguous id. Details: [Exit codes](docs/interface.md#exit-codes).
+0 success; 1 internal error; 2 usage or invalid config; 10 not found (or no server, or `--client` not attached); 11 vetoed by a pre-hook; 12 expected failure (tmux missing or too old, server unavailable, command not found, no client to focus, lock busy, pane state changed during `close`, ...); 13 a pre-hook escalated; 20 refused (`running`); 21 ambiguous id. Details: [Exit codes](docs/interface.md#exit-codes).
 
 ## Config, hooks and environment
 

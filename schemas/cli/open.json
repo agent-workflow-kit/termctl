@@ -101,7 +101,8 @@
       "description": "From @termctl_keep."
     },
     "focused": {
-      "type": "boolean"
+      "type": "boolean",
+      "description": "Whether --focus switched a client (Open order step 8). A failed focus (no client, the client gone, a tmux error) is a warning: focused stays false and the open still succeeds."
     },
     "decision_ids": {
       "$ref": "../defs.json#/$defs/decision_ids"

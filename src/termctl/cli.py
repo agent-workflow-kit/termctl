@@ -9,6 +9,7 @@ from __future__ import annotations
 import argparse
 import io
 import os
+import shlex
 import signal
 import sys
 from collections.abc import Callable, Mapping, Sequence
@@ -17,7 +18,9 @@ from typing import Any, NoReturn, TextIO
 
 from . import (
     __version__,
+    close_cmd,
     display,
+    focus_cmd,
     hooks,
     ids,
     jsonlog,
@@ -30,7 +33,7 @@ from . import (
 )
 from . import config as config_module
 from .argv import Scan, scan
-from .backend import Backend, Created, TmuxBackend
+from .backend import Backend, Created, SessionState, TmuxBackend
 from .config import Config
 from .errors import TermctlError, UsageError
 from .gateway import (
@@ -42,7 +45,7 @@ from .gateway import (
     Terminated,
     stop_signals,
 )
-from .output import PROG, Output, Result, flush_standard_streams
+from .output import PROG, Output, Result, escape, flush_standard_streams
 from .pane_change import Change, Outcome, change_pane, preview_change
 from .panes import ManagedPane, PaneRead
 from .statedir import StateDirError
@@ -79,27 +82,36 @@ class Context:
     plan: open_cmd.Plan | None = None
     window: WindowSpec | None = None
     open_id: str | None = None
-    # A command that writes log records (``open`` or a pane change of ``CHANGE_EVENTS``, not a
-    # dry run, once past step 1): each of its warnings also becomes a ``warning`` log record
-    # (``warn``).
+    # A command that writes log records (``open``, ``close``, ``focus`` or a pane change of
+    # ``CHANGE_EVENTS``, not a dry run, once past step 1): each of its warnings also becomes a
+    # ``warning`` log record (``warn``).
     logged: bool = False
     # A logged pane change: its ``warning`` records, held until its outcome is known, then
     # written before its own record, or dropped if it changed nothing (``_logged_change``).
     held_warnings: list[dict[str, Any]] | None = None
     # The actor, resolved once per run (``resolve_actor``).
     actor: str | None = None
-    # ``open``: the --decision-id values, then the ids its pre-open hooks returned (step 4),
-    # and every hook it started (interface.md "Hooks").
+    # ``open`` and ``close``: the --decision-id values, then the ids their pre-hooks
+    # returned, and every hook they started (interface.md "Hooks").
     decision_ids: list[str] = field(default_factory=list[str])
     hook_processes: list[hooks.HookProcess] = field(default_factory=list[hooks.HookProcess])
-    # ``open``: whether its audit record was written (it is written once).
+    # ``close``: whether step 1 or step 3 saw the pane running (a forced run is then audited).
+    close_saw_running: bool = False
+    # ``open`` and ``close``: whether the audit record was written (it is written once).
     audited: bool = False
-    # A logged ``open``: its stop-signal handling (``gateway.stop_signals``).
+    # A logged ``open`` or ``close``: its stop-signal handling (``gateway.stop_signals``).
     signals: RunSignals | None = None
     # A pane change (``rename``, ``mark``, ``unmark``, ``label add``, ``label remove``) that
     # changed nothing: no log record
     # (interface.md "Audit and log").
     no_op: bool = False
+    # ``focus``: the action decided, for its log record (``switched`` until one is decided).
+    focus_action: focus_cmd.Action = "switched"
+    # ``focus``: it succeeded (a real switch, or an attach decided), for ``_logged_focus`` to
+    # log once stop signals are ignored.
+    focus_ok: bool = False
+    # ``focus``: the attach argv to exec, once the run's stop-signal handling is gone.
+    focus_exec: list[str] | None = None
 
     def socket_path(self) -> str | None:
         """The resolved server's socket path; None before step 2 resolved it."""
@@ -466,9 +478,8 @@ def check_args(args: argparse.Namespace, ctx: Context) -> None:
     Replaces ``open``'s ``args.cwd`` with the resolved working directory and, for ``open``
     and ``close``, sets ``args.flag_hooks`` to the parsed ``--hook`` values. Checks that need
     config (a marker or placement being defined) or the pane list (the label limit of
-    ``label add``) belong to later steps. Some step-1 checks are not here yet (see the TODO).
+    ``label add``) belong to later steps.
     """
-    # TODO(#23): remaining step-1 usage check: the `close --force` gate.
     if args.socket is not None:
         validate.check_socket_flag(args.socket)
     command = args.command
@@ -485,6 +496,10 @@ def check_args(args: argparse.Namespace, ctx: Context) -> None:
         args.flag_hooks = hooks.parse_flag_hooks(command, args.hooks)
         hooks.check_override_gate(
             args.override_escalation, actor=args.actor, stdin_is_tty=ctx.gateway.stdin_isatty()
+        )
+    if command == "close":
+        close_cmd.check_force_gate(
+            args.force, actor=args.actor, stdin_is_tty=ctx.gateway.stdin_isatty()
         )
     if hasattr(args, "labels"):
         labels = validate.parse_labels(args.labels)
@@ -730,10 +745,7 @@ def open_pane(args: argparse.Namespace, ctx: Context) -> Result:
     """Steps 4 on of the open order (steps 1 to 3 ran in ``dispatch``)."""
     assert ctx.selection is not None and ctx.server is not None and ctx.window is not None
     if args.dry_run:
-        # TODO(#18): the dry run stops after step 3 and prints what a real run would do: its
-        # placement, matched_rule, session and target are in ctx.selection, its id in
-        # ctx.open_id, the window in ctx.window.
-        raise TermctlError("internal", f"{PROG} open --dry-run is not implemented yet")
+        return _dry_run_open(args, ctx)
     assert ctx.plan is not None and ctx.open_id is not None and ctx.signals is not None
     run_pre_open_hooks(args, ctx)
     # Steps 5 to 8 run with stop signals deferred: a signal there is raised only once the
@@ -750,14 +762,67 @@ def open_pane(args: argparse.Namespace, ctx: Context) -> Result:
         open_cmd.record(
             backend, ctx.gateway, ctx.server.socket_path, created, ctx.open_id, query, ctx.warn
         )
-        # TODO(#24): step 8, --focus.
-        result = _opened(ctx, backend, created, created_at)
+        result, opened = _opened(ctx, backend, created, created_at)
+        # Step 8: focus without attaching (`open` never blocks); the outcome is `focused`.
+        if args.focus and opened is not None:
+            result.data["focused"] = _focus_opened(ctx, backend, opened)
         _audit_open(args, ctx, result.data)
     # Step 9: the post-open hooks, the log record and the output.
     run_post_open_hooks(args, ctx, result.data)
     ctx.signals.finish()
     ctx.log(_open_record(args, ctx, result="ok", exit_code=0))
     return result
+
+
+def _dry_run_open(args: argparse.Namespace, ctx: Context) -> Result:
+    """``open --dry-run``: stops after step 3 and reports what a real run would do, having
+    run only read-only tmux queries: the step-3 ones and, with a server, one ``has-session``
+    for ``session_exists``. No hooks, no log or audit record, nothing created (interface.md
+    ``open``, "Dry runs")."""
+    assert ctx.plan is not None and ctx.selection is not None and ctx.open_id is not None
+    assert ctx.server is not None and ctx.tmux is not None
+    plan, session = ctx.plan, ctx.selection.session
+    state = SessionState.NO_SERVER
+    if read_panes(ctx).server_running:
+        backend = connect(ctx)
+        if backend is not None:
+            state = backend.session_state(session)
+    commands = open_cmd.dry_run_commands(
+        session,
+        plan,
+        ctx.open_id,
+        open_cmd.timestamp(ctx.clock.now()),
+        state,
+        server_env(ctx),
+        ctx.tmux.path,
+        ctx.server.socket_path,
+    )
+    data = {
+        "dry_run": True,
+        "id": ctx.open_id,
+        "name": plan.name,
+        "socket_path": ctx.server.socket_path,
+        "tmux_version": ctx.tmux.version_text,
+        "placement": ctx.selection.name,
+        "matched_rule": ctx.selection.rule,
+        "session": session,
+        "session_exists": None if state is SessionState.NO_SERVER else state is SessionState.EXISTS,
+        "target": ctx.selection.target,
+        "cwd": plan.cwd,
+        "argv": list(plan.argv),
+        "env_names": [name for name, _ in plan.env],
+        "labels": list(plan.labels),
+        "keep_on_exit": plan.keep_on_exit,
+        "focus": bool(args.focus),
+        "actor": resolve_actor(args, ctx),
+        "decision_ids": list(args.decision_ids),
+        "override_escalation": bool(args.override_escalation),
+        "tmux_commands": commands,
+    }
+    # One line per command: each is escaped as a whole, so a line break inside an argument
+    # (a filtered environment value in set-environment) prints as \x0a (interface.md "Human
+    # output").
+    return Result(data, "\n".join(escape(shlex.join(argv)) for argv in commands))
 
 
 def resolve_actor(args: argparse.Namespace, ctx: Context) -> str:
@@ -832,7 +897,9 @@ def _hook_warnings(ctx: Context, warnings: Sequence[hooks.HookWarning]) -> None:
         ctx.out.warn(warning.message)
         if warning.hook_stderr and not (ctx.out.json or ctx.out.quiet):
             ctx.out.hook_stderr(warning.hook_stderr)
-        ctx.log(warning.log_record(ctx.clock.now(), id=ctx.open_id, socket_path=ctx.socket_path()))
+        ctx.log(
+            warning.log_record(ctx.clock.now(), id=ctx.record_id(), socket_path=ctx.socket_path())
+        )
 
 
 def _open_record(
@@ -921,10 +988,13 @@ def _stopped(stop: BaseException) -> tuple[int, str]:
     return 128 + int(signal.SIGINT), "interrupted"
 
 
-def _opened(ctx: Context, backend: Backend, created: Created, created_at: str) -> Result:
-    """The ``open`` output, from a read after step 6: the pane object, or, if the pane is no
-    longer there, ``state: gone`` with the last known values (interface.md ``open``). A read
-    that fails also reports ``state: gone``, with a warning."""
+def _opened(
+    ctx: Context, backend: Backend, created: Created, created_at: str
+) -> tuple[Result, ManagedPane | None]:
+    """The ``open`` output, from a read after step 6, and the pane read: the pane object, or,
+    if the pane is no longer there, ``state: gone`` with the last known values (interface.md
+    ``open``) and no pane. A read that fails also reports ``state: gone``, with a warning.
+    ``focused`` is false until step 8 sets it."""
     assert ctx.plan is not None and ctx.open_id is not None and ctx.selection is not None
     socket_path = _socket_path(ctx)
     pane: ManagedPane | None = None
@@ -963,10 +1033,9 @@ def _opened(ctx: Context, backend: Backend, created: Created, created_at: str) -
             "exit_signal": None,
             "keep_on_exit": ctx.plan.keep_on_exit,
         }
-    # TODO(#24): `focused` reports the outcome of --focus (step 8).
     data["focused"] = False
     data["decision_ids"] = list(ctx.decision_ids)
-    return Result(data, ctx.open_id)
+    return Result(data, ctx.open_id), pane
 
 
 # --- pane changes -------------------------------------------------------------------------------
@@ -1098,6 +1167,444 @@ def label_change(args: argparse.Namespace, ctx: Context) -> Result:
     return Result(data, " ".join(outcome.pane.labels))
 
 
+# --- close --------------------------------------------------------------------------------------
+
+
+def close_pane(args: argparse.Namespace, ctx: Context) -> Result:
+    """The close order (interface.md `close`) after id resolution (step 4)."""
+    assert ctx.pane is not None
+    first = ctx.pane
+    socket_path = _socket_path(ctx)
+    grace = close_cmd.grace_ms(args.grace, ctx.config)
+    # Step 1: the check.
+    ctx.close_saw_running = not first.dead
+    if not first.dead and not args.force:
+        raise close_cmd.refuse_running(first)
+    if args.dry_run:
+        return _close_dry_run(args, ctx, grace)
+    started = ctx.clock.monotonic()
+    pid_mismatch = close_cmd.row_mismatch(first)
+    proof: close_cmd.Probe | None = None
+    if not first.dead and first.pid is not None and not pid_mismatch:
+        proof = close_cmd.probe(connect(ctx), ctx.gateway, socket_path, first)
+        identity = proof.verification.identity
+        # A pane gone at the probe is no mismatch: step 3 finds it gone (``close_cmd.close``).
+        if not proof.pane_gone and identity in (
+            close_cmd.Identity.MISMATCH,
+            close_cmd.Identity.UNCHECKABLE,
+        ):
+            pid_mismatch = True
+            if proof.verification.problem is not None:
+                ctx.warn(f"{proof.verification.problem}; the recorded process is not signaled")
+    # Step 2: the pre-close hooks; a veto exits 11, an escalation 13.
+    run_pre_close_hooks(args, ctx, first, grace)
+    assert ctx.signals is not None
+    # From step 3 on SIGHUP does nothing (closing the pane termctl runs in hangs up its
+    # terminal), and steps 3 to 5 run with SIGINT and SIGTERM deferred: one there is raised
+    # only once the output exists and its audit record is written, so it never leaves a
+    # killed pane or a signaled process without an audit record (interface.md "Audit and log").
+    ctx.signals.ignore_hangups()
+    with ctx.signals.deferred():
+        data = _close_steps_3_to_5(args, ctx, first, grace, pid_mismatch, proof, started)
+        _audit_close(args, ctx, data)
+    # The post-close hooks, the log record and the output.
+    run_post_close_hooks(args, ctx, data, first.labels)
+    ctx.signals.finish()
+    ctx.log(_close_record(args, ctx, result="ok", exit_code=0))
+    return Result(data, f"closed {first.id}")
+
+
+def _close_steps_3_to_5(
+    args: argparse.Namespace,
+    ctx: Context,
+    first: ManagedPane,
+    grace: int,
+    pid_mismatch: bool,
+    proof: close_cmd.Probe | None,
+    started: float,
+) -> dict[str, Any]:
+    """Steps 3 to 5 of ``close``: the re-check (a fresh read; the hooks may have run long),
+    the guarded kill and the signal sequence; returns the ``--json`` output."""
+    socket_path = _socket_path(ctx)
+    backend = connect(ctx)
+    reread = _reread(ctx, backend)
+    # Before the re-check can fail: a forced run that sees the pane running here is audited.
+    if any(pane.id == first.id and not pane.dead for pane in reread.panes):
+        ctx.close_saw_running = True
+    current = close_cmd.recheck(reread, first, ctx.warn)
+    if current is not None:
+        pid_mismatch = pid_mismatch or close_cmd.recheck_mismatch(first, current)
+    closing = close_cmd.Closing(
+        first=first,
+        current=current,
+        force=bool(args.force),
+        grace_s=grace / 1000,
+        pid_mismatch=pid_mismatch,
+        proof=proof,
+    )
+    # Steps 4 and 5.
+    closed = close_cmd.close(backend, ctx.gateway, ctx.clock, socket_path, closing, ctx.warn)
+    data = {
+        "id": first.id,
+        "pane_closed": True,
+        "was_running": not first.dead,
+        "forced": bool(args.force),
+        "signals_sent": closed.signals_sent,
+        "exited": closed.exited,
+        "pid_mismatch": closed.pid_mismatch,
+        "decision_ids": list(ctx.decision_ids),
+        "duration_ms": max(0, round((ctx.clock.monotonic() - started) * 1000)),
+        "socket_path": socket_path,
+    }
+    return data
+
+
+def _reread(ctx: Context, backend: Backend | None) -> PaneRead:
+    """A fresh read of the server's panes (no server: none); warnings not printed before are
+    printed now."""
+    if backend is None:
+        return PaneRead(server_running=False, panes=(), warnings=())
+    read = backend.read_panes()
+    seen = () if ctx.pane_read is None else ctx.pane_read.warnings
+    for warning in read.warnings:
+        if warning not in seen:
+            ctx.warn(warning)
+    return read
+
+
+def _close_dry_run(args: argparse.Namespace, ctx: Context, grace: int) -> Result:
+    """``close --dry-run``: the check of step 1 only; no hooks, no change, no records."""
+    assert ctx.pane is not None
+    pane = ctx.pane
+    socket_path = _socket_path(ctx)
+    found = close_cmd.dry_run(connect(ctx), ctx.gateway, socket_path, pane, ctx.warn)
+    data = {
+        "dry_run": True,
+        "id": pane.id,
+        "state": pane.state,
+        "forced": bool(args.force),
+        "pid": pane.pid,
+        "pid_mismatch": found.pid_mismatch,
+        "signals_possible": found.signals_possible,
+        "grace_ms": grace,
+        "socket_path": socket_path,
+        "actor": resolve_actor(args, ctx),
+        "decision_ids": list(args.decision_ids),
+        "override_escalation": bool(args.override_escalation),
+    }
+    human = (
+        f"{pane.state} pid={'none' if pane.pid is None else pane.pid}"
+        f" pid_mismatch={'true' if found.pid_mismatch else 'false'}"
+        f" signals_possible={','.join(found.signals_possible) or 'none'}"
+    )
+    return Result(data, human)
+
+
+def run_pre_close_hooks(
+    args: argparse.Namespace, ctx: Context, pane: ManagedPane, grace: int
+) -> None:
+    """Step 2: the ``pre-close`` hooks, with the pane object read at step 1; a veto exits 11
+    and an escalation 13 (not on an ``--override-escalation`` run), closing nothing."""
+    override = bool(args.override_escalation)
+    payload = hooks.pre_close_payload(
+        pane=pane.pane_object(_socket_path(ctx)),
+        force=bool(args.force),
+        grace_ms=grace,
+        actor=resolve_actor(args, ctx),
+        decision_ids=args.decision_ids,
+        override_escalation=override,
+    )
+    # The ids and processes go straight into ctx, so a stop signal loses neither.
+    outcome = hooks.run_pre_hooks(
+        hooks.hooks_for(ctx.config, "pre-close", args.flag_hooks),
+        payload,
+        decision_ids=args.decision_ids,
+        override_escalation=override,
+        gateway=ctx.gateway,
+        environ=ctx.environ,
+        ids=ctx.decision_ids,
+        processes=ctx.hook_processes,
+    )
+    _hook_warnings(ctx, outcome.warnings)
+    outcome.check()
+
+
+def run_post_close_hooks(
+    args: argparse.Namespace, ctx: Context, output: dict[str, Any], labels: Sequence[str]
+) -> None:
+    """The ``post-close`` hooks, with the ``close`` output as their payload's ``result``; a
+    failure is a warning and a ``hook_failed`` record, never an error."""
+    outcome = hooks.run_post_hooks(
+        hooks.hooks_for(ctx.config, "post-close", args.flag_hooks),
+        hooks.post_close_payload(result=output, labels=labels),
+        gateway=ctx.gateway,
+        environ=ctx.environ,
+        processes=ctx.hook_processes,
+    )
+    _hook_warnings(ctx, outcome.warnings)
+
+
+def _close_record(
+    args: argparse.Namespace,
+    ctx: Context,
+    *,
+    result: str,
+    exit_code: int,
+    message: str | None = None,
+    details: dict[str, Any] | None = None,
+) -> dict[str, Any]:
+    """The ``log.jsonl`` record of this ``close`` (interface.md "Audit and log")."""
+    actor = resolve_actor(args, ctx)  # first: its warning record precedes this one
+    return jsonlog.log_record(
+        ctx.clock.now(),
+        event="close",
+        result=result,
+        id=ctx.record_id(),
+        socket_path=ctx.socket_path(),
+        exit_code=exit_code,
+        message=message,
+        details=details,
+        actor=actor,
+        decision_ids=ctx.decision_ids,
+        escalation_override=bool(args.override_escalation),
+        force=bool(args.force),
+        hooks=[process.log_entry() for process in ctx.hook_processes],
+    )
+
+
+def _audit_close(args: argparse.Namespace, ctx: Context, result: Mapping[str, Any]) -> None:
+    """The audit record of a ``close --force`` in which step 1 or 3 saw a running pane, and of
+    an ``--override-escalation`` run, once the id is resolved, and only once; ``result`` is
+    the ``--json`` output or the error envelope."""
+    if ctx.pane is None or ctx.audited:
+        return
+    forced = bool(args.force) and ctx.close_saw_running
+    if not (forced or args.override_escalation):
+        return
+    ctx.audited = True
+    assert ctx.server is not None
+    ctx.audit(
+        jsonlog.audit_close_record(
+            ctx.clock.now(),
+            actor=resolve_actor(args, ctx),
+            decision_ids=ctx.decision_ids,
+            target=ctx.pane.id,
+            force=bool(args.force),
+            escalation_override=bool(args.override_escalation),
+            socket_path=ctx.server.socket_path,
+            pid=ctx.pane.pid,
+            grace_ms=close_cmd.grace_ms(args.grace, ctx.config) if args.force else None,
+            result=result,
+        )
+    )
+
+
+def _close_failed(args: argparse.Namespace, ctx: Context, err: TermctlError) -> None:
+    """Log (and audit, where ``_audit_close`` says) a ``close`` that failed after step 1."""
+    if err.decision_ids is None and ctx.decision_ids:
+        err.decision_ids = list(ctx.decision_ids)
+    if err.code in ("vetoed", "escalated"):
+        result, details = err.code, {"hook": err.hook}
+    elif err.code == "refused":
+        result, details = "refused", err.details
+    else:
+        result, details = "error", err.details
+    ctx.log(
+        _close_record(
+            args, ctx, result=result, exit_code=err.exit_code, message=err.message, details=details
+        )
+    )
+    _audit_close(args, ctx, err.envelope())
+
+
+def _close_stopped(args: argparse.Namespace, ctx: Context, stop: BaseException) -> None:
+    """Log a ``close`` stopped by a signal (exit 128 plus its number). Its audit record, if
+    any, was written once the output existed (``close_pane``); a run stopped before step 3
+    has changed nothing and has neither output nor error object, and gets none."""
+    if isinstance(stop, Terminated):
+        signum, message = stop.signum, f"terminated by signal {stop.signum}"
+    else:
+        signum, message = int(signal.SIGINT), "interrupted"
+    ctx.log(_close_record(args, ctx, result="error", exit_code=128 + signum, message=message))
+
+
+def _logged_close(args: argparse.Namespace, ctx: Context) -> Result:
+    """``close`` past step 1, not a dry run: every outcome gets a ``log.jsonl`` record, and a
+    forced run that saw a running pane or an ``--override-escalation`` run an audit record
+    once its id is resolved (interface.md "Audit and log"). Stop signals are handled as for
+    ``open`` (``_logged_open``)."""
+    ctx.logged = True
+    ctx.decision_ids = list(args.decision_ids)
+    # SIGINT, SIGTERM and SIGHUP raise for the whole run, so it is logged whenever one stops it.
+    with stop_signals() as signals:
+        ctx.signals = signals
+        try:
+            return _resolve_and_run(args, ctx)
+        except TermctlError as err:
+            signals.finish()
+            _close_failed(args, ctx, err)
+            raise
+        except (KeyboardInterrupt, Terminated) as stop:
+            signals.finish()
+            _close_stopped(args, ctx, stop)
+            raise
+        except Exception as exc:
+            signals.finish()
+            err = internal_error(exc)
+            _close_failed(args, ctx, err)
+            raise err from exc
+
+
+def _focus_opened(ctx: Context, backend: Backend, pane: ManagedPane) -> bool:
+    """Open order step 8: switch a client by the rules of `focus`, never attaching. Whether a
+    client was switched; a failure (no client, a tmux error) is a warning and leaves the open
+    in place (interface.md "Open order")."""
+    assert ctx.tmux is not None
+    try:
+        where = focus_cmd.caller(ctx.environ, _socket_path(ctx), ctx.gateway)
+        decision = focus_cmd.decide(
+            backend, pane, where, client=None, attach_ok=False, tmux_bin=ctx.tmux.path
+        )
+        assert decision.client is not None
+        focus_cmd.switch(backend, pane, decision.client, named=False)
+    except TermctlError as err:
+        ctx.warn(f"could not focus pane {pane.id}: {err.message}")
+        return False
+    return True
+
+
+def focus(args: argparse.Namespace, ctx: Context) -> Result:
+    """`focus` after id resolution: decide (steps 1 to 4), then switch the client or attach.
+    A real run records its success in ``ctx`` (and the argv to exec, when it attaches without
+    --json); ``_logged_focus`` writes every record and runs the exec."""
+    assert ctx.pane is not None and ctx.tmux is not None
+    pane, socket_path = ctx.pane, _socket_path(ctx)
+    backend = connect(ctx)
+    if backend is None:
+        raise TermctlError("not_found", f"managed pane {pane.id} is gone (no server running)")
+    attach_ok = (
+        args.client is None
+        and not args.no_attach
+        and ctx.gateway.stdin_isatty()
+        and ctx.gateway.stderr_isatty()
+    )
+    decision = focus_cmd.decide(
+        backend,
+        pane,
+        focus_cmd.caller(ctx.environ, socket_path, ctx.gateway),
+        client=args.client,
+        attach_ok=attach_ok,
+        tmux_bin=ctx.tmux.path,
+    )
+    ctx.focus_action = decision.action
+    data = focus_cmd.output(pane, decision, socket_path, dry_run=bool(args.dry_run))
+    if decision.argv is None:
+        assert decision.client is not None
+        if not args.dry_run:
+            focus_cmd.switch(backend, pane, decision.client, named=args.client is not None)
+            ctx.focus_ok = True
+        return Result(data, decision.client)
+    if args.dry_run:
+        return Result(data, shlex.join(decision.argv))
+    # An attach is logged before the exec (interface.md "Audit and log"); with --json the
+    # caller execs the argv itself, with its own environment, and termctl exits 0. Without
+    # --json ``_logged_focus`` execs it once the stop-signal handlers are restored.
+    ctx.focus_ok = True
+    if not ctx.out.json:
+        ctx.focus_exec = decision.argv
+    return Result(data, "")
+
+
+def _focus_attach(ctx: Context, argv: list[str]) -> NoReturn:
+    """Exec the attach argv (``focus`` step 2), after its log record and with the run's
+    stop-signal handlers gone, so the tmux client starts with the caller's dispositions."""
+    ctx.out.flush()
+    try:
+        # The caller's unfiltered environment: it is the user's own terminal, and -E keeps
+        # that environment out of the session.
+        ctx.gateway.exec_replace(argv, ctx.environ)
+    except (OSError, ValueError) as exc:
+        reason = exc.strerror if isinstance(exc, OSError) and exc.strerror else str(exc)
+        raise TermctlError(
+            "attach_failed",
+            f"cannot run {validate.show(argv[0], 200)}: {reason}",
+            details={"socket_path": _socket_path(ctx)},
+        ) from None
+
+
+def _focus_record(
+    ctx: Context,
+    *,
+    result: str,
+    exit_code: int | None,
+    message: str | None = None,
+    details: dict[str, Any] | None = None,
+) -> dict[str, Any]:
+    """The ``log.jsonl`` record of this ``focus``; ``action`` is the action decided, or
+    ``switched`` when it failed before one was. ``exit_code`` None: not known (an exec)."""
+    return jsonlog.log_record(
+        ctx.clock.now(),
+        event="focus",
+        result=result,
+        id=ctx.record_id(),
+        socket_path=ctx.socket_path(),
+        exit_code=exit_code,
+        message=message,
+        details=details,
+        action=ctx.focus_action,
+    )
+
+
+def _logged_focus(args: argparse.Namespace, ctx: Context) -> Result:
+    """``focus`` past step 1, not a dry run: every outcome gets one ``log.jsonl`` record, a stop
+    by a signal (exit 128 plus its number) included; a success is logged after a switch and
+    before an exec (without an exit code: after the exec the status is tmux's), and a failed
+    exec then adds its error record. Stop signals raise as for ``open`` (``stop_signals``) but
+    are never deferred, and are ignored from the success record on; the attach exec runs after
+    their handlers are restored."""
+    ctx.logged = True
+    with stop_signals() as signals:
+        try:
+            result = _resolve_and_run(args, ctx)
+        except TermctlError as err:
+            signals.finish()
+            _focus_failed(ctx, err)
+            raise
+        except (KeyboardInterrupt, Terminated) as stop:
+            signals.finish()
+            exit_code, message = _stopped(stop)
+            ctx.log(_focus_record(ctx, result="error", exit_code=exit_code, message=message))
+            raise
+        except Exception as exc:
+            signals.finish()
+            err = internal_error(exc)
+            _focus_failed(ctx, err)
+            raise err from exc
+        signals.finish()
+        if ctx.focus_ok:
+            exit_code = None if ctx.focus_exec is not None else 0
+            ctx.log(_focus_record(ctx, result="ok", exit_code=exit_code))
+    if ctx.focus_exec is not None:
+        try:
+            _focus_attach(ctx, ctx.focus_exec)
+        except TermctlError as err:
+            _focus_failed(ctx, err)
+            raise
+        except Exception as exc:
+            err = internal_error(exc)
+            _focus_failed(ctx, err)
+            raise err from exc
+    return result
+
+
+def _focus_failed(ctx: Context, err: TermctlError) -> None:
+    ctx.log(
+        _focus_record(
+            ctx, result="error", exit_code=err.exit_code, message=err.message, details=err.details
+        )
+    )
+
+
 COMMAND_STEPS = {
     "show": show,
     "exists": exists,
@@ -1108,6 +1615,8 @@ COMMAND_STEPS = {
     "unmark": unmark,
     "label add": label_change,
     "label remove": label_change,
+    "close": close_pane,
+    "focus": focus,
 }
 
 
@@ -1119,8 +1628,6 @@ def run_command(args: argparse.Namespace, ctx: Context) -> Result:
     if args.command == "placements":
         labels = validate.parse_labels(args.labels) if args.labels else None
         return placement.report(ctx.config, labels)
-    # TODO(#23): close.
-    # TODO(#24): focus.
     raise TermctlError("internal", f"{PROG} {args.command} is not implemented yet")
 
 
@@ -1132,6 +1639,10 @@ def dispatch(args: argparse.Namespace, ctx: Context) -> Result:
         return _logged_open(args, ctx)
     if args.command in CHANGE_EVENTS and not args.dry_run:
         return _logged_change(args, ctx)
+    if args.command == "close" and not args.dry_run:
+        return _logged_close(args, ctx)
+    if args.command == "focus" and not args.dry_run:
+        return _logged_focus(args, ctx)
     return _resolve_and_run(args, ctx)
 
 

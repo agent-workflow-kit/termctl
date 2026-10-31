@@ -369,7 +369,7 @@ def test_targets_are_exact() -> None:
     assert tb.pane("%12").text == "%12"
     assert tb.window("@7").text == "@7"
     assert tb.session("work").text == "=work:"
-    assert tb.pane_in_session("work", "@7", "%12").text == "=work:@7.%12"
+    assert tb.pane_in_session("$4", "@7", "%12").text == "=$4:@7.%12"
 
 
 @pytest.mark.parametrize("value", ["", "%", "12", "%1a", "%-1", "%1;", " %1", "%1 ", "@1", "%１"])
@@ -390,8 +390,21 @@ def test_bad_window_targets_are_refused(value: str) -> None:
 def test_bad_session_targets_are_refused(value: str) -> None:
     with pytest.raises(ValueError):
         tb.session(value)
+
+
+@pytest.mark.parametrize(
+    "value", ["", "$", "1", "work", "$1a", "$-1", "$1;", " $1", "$1 ", "=$1", "$1:", "$１", "@1"]
+)
+def test_pane_in_session_takes_a_session_id_only(value: str) -> None:
+    """A session name is refused: it may be anything a user renamed the session to (#24)."""
     with pytest.raises(ValueError):
         tb.pane_in_session(value, "@1", "%1")
+
+
+@pytest.mark.parametrize(("window_id", "pane_id"), [("%1", "%1"), ("@1", "@1"), ("@1;", "%1")])
+def test_pane_in_session_checks_window_and_pane(window_id: str, pane_id: str) -> None:
+    with pytest.raises(ValueError):
+        tb.pane_in_session("$1", window_id, pane_id)
 
 
 def test_target_cannot_be_forged_from_a_string() -> None:
@@ -400,7 +413,21 @@ def test_target_cannot_be_forged_from_a_string() -> None:
 
 
 @pytest.mark.parametrize(
-    "text", ["main; run-shell x", "main", "=a", "%1;", "=a:@1", "=a:%1", "@1.%2", "", "=a b:"]
+    "text",
+    [
+        "main; run-shell x",
+        "main",
+        "=a",
+        "%1;",
+        "=a:@1",
+        "=a:%1",
+        "@1.%2",
+        "",
+        "=a b:",
+        "=w:@1.%2",
+        "$1:@1.%2",
+        "=$1:@1.%2;",
+    ],
 )
 def test_targets_built_directly_are_checked(text: str) -> None:
     with pytest.raises(ValueError):
@@ -409,14 +436,14 @@ def test_targets_built_directly_are_checked(text: str) -> None:
 
 def test_targets_built_directly_with_a_valid_grammar_are_accepted() -> None:
     assert tb.Target("%3") == tb.pane("%3")
-    assert tb.Target("=w:@1.%2") == tb.pane_in_session("w", "@1", "%2")
+    assert tb.Target("=$3:@1.%2") == tb.pane_in_session("$3", "@1", "%2")
 
 
 def test_targets_know_their_kind() -> None:
     assert tb.pane("%1").kind == "pane"
     assert tb.window("@1").kind == "window"
     assert tb.session("s").kind == "session"
-    assert tb.pane_in_session("s", "@1", "%1").kind == "pane_in_session"
+    assert tb.pane_in_session("$1", "@1", "%1").kind == "pane_in_session"
 
 
 def test_a_command_takes_one_target() -> None:
@@ -622,7 +649,7 @@ def test_guard_target_spoofs_are_refused() -> None:
         # Another pane, a session or a pane-in-session target.
         command("kill-pane").target(tb.pane("%6")).build(),
         command("kill-session").target(tb.session("s")).build(),
-        command("kill-pane").target(tb.pane_in_session("s", "@1", "%5")).build(),
+        command("kill-pane").target(tb.pane_in_session("$1", "@1", "%5")).build(),
         # if-shell inside a guard, however built.
         command("if-shell").target(guard).arg("1").arg("kill-server").build(),
     ]
@@ -877,7 +904,7 @@ def test_an_option_value_double_dash_is_refused() -> None:
 
 
 @pytest.mark.parametrize(
-    "outer", [tb.window("@1"), tb.session("s"), tb.pane_in_session("s", "@1", "%5")]
+    "outer", [tb.window("@1"), tb.session("s"), tb.pane_in_session("$1", "@1", "%5")]
 )
 def test_guard_target_must_be_a_pane(outer: tb.Target) -> None:
     inner = command("kill-pane").target(tb.pane("%5")).build()
@@ -1907,3 +1934,123 @@ def test_missing_session_is_tmux_exact_message() -> None:
     assert not tb.is_session_missing(result("can't find session: other\n"), "work")
     assert not tb.is_session_missing(result("can't find pane: %3\n"), "work")
     assert not tb.is_session_missing(result("hook\ncan't find session: work\n"), "work")
+
+
+# --- focus (interface.md `focus`) ---------------------------------------------------------------
+
+FOCUS_BIN = "/usr/bin/tmux"
+FOCUS_SOCK = "/tmp/tmux-1000/default"
+
+
+def test_list_clients_is_one_read_only_command() -> None:
+    assert tb.list_clients().argv(FOCUS_BIN, FOCUS_SOCK) == [
+        FOCUS_BIN, "-S", FOCUS_SOCK, "list-clients", "-F",
+        "#{client_name} #{client_activity} #{session_id} #{window_id}",
+    ]  # fmt: skip
+
+
+def test_parse_clients_keeps_only_well_formed_nameable_clients() -> None:
+    stdout = (
+        "/dev/pts/3 1700000000 $1 @2\n"
+        "client-42 1700000005 $0 @0\n"
+        "/dev/pts/4 1700000001  \n"  # attached to no session
+        "/dev/pts/5 x $1 @2\n"
+        "/dev/pts/6 1700000000 1 @2\n"
+        "/dev/pts/7 1700000000 $1 2\n"
+        "/dev/pts/8 1700000000 $1 @2 extra\n"
+        "bad;name 1700000000 $1 @2\n"
+        "/dev/pts/9\x1b[2J 1700000000 $1 @2\n" + "/" + "a" * 101 + " 1 $1 @2\n"
+        "-dash 7 $2 @3\n"
+        "\n"
+    )
+    assert tb.parse_clients(stdout) == (
+        tb.ClientInfo("/dev/pts/3", 1700000000, "$1", "@2"),
+        tb.ClientInfo("client-42", 1700000005, "$0", "@0"),
+        tb.ClientInfo("-dash", 7, "$2", "@3"),
+    )
+
+
+def test_parse_clients_of_nothing_is_empty() -> None:
+    assert tb.parse_clients("") == ()
+
+
+def test_pane_sessions_lists_every_pane_with_its_session() -> None:
+    assert tb.pane_sessions().argv(FOCUS_BIN, FOCUS_SOCK) == [
+        FOCUS_BIN, "-S", FOCUS_SOCK, "list-panes", "-a", "-F", "#{pane_id} #{session_id}",
+    ]  # fmt: skip
+
+
+@pytest.mark.parametrize(
+    ("stdout", "expected"),
+    [
+        ("%4 $2\n", True),
+        ("%4 $2", True),
+        ("%1 $0\n%4 $1\n%4 $2\n", True),  # a window in several sessions: once per session
+        ("%4 $1\n", False),
+        ("%5 $2\n", False),
+        ("", False),
+        (" \n", False),
+        ("%4 $20\n", False),
+        ("%44 $2\n", False),
+        ("%4  $2\n", False),
+        ("%4 $2 x\n", False),
+        ("x%4 $2\n", False),
+    ],
+)
+def test_has_pane_in_session_needs_that_exact_pair(stdout: str, expected: bool) -> None:
+    assert tb.has_pane_in_session(stdout, "%4", "$2") is expected
+
+
+def test_switch_client_names_the_client_passes_e_and_targets_the_pane_id() -> None:
+    assert tb.switch_client("/dev/pts/3", "%7").argv(FOCUS_BIN, FOCUS_SOCK) == [
+        FOCUS_BIN, "-S", FOCUS_SOCK, "switch-client", "-E", "-c", "/dev/pts/3", "-t", "%7",
+    ]  # fmt: skip
+
+
+def test_switch_client_takes_a_client_starting_with_a_dash_as_its_value() -> None:
+    argv = tb.switch_client("-x", "%7").argv(FOCUS_BIN, FOCUS_SOCK)
+    assert argv[-4:] == ["-c", "-x", "-t", "%7"]
+
+
+@pytest.mark.parametrize("client", ["", "a b", "a;", "#{x}", "a\n", "/" + "a" * 101])
+def test_switch_client_refuses_a_client_outside_the_grammar(client: str) -> None:
+    with pytest.raises(ValueError):
+        tb.switch_client(client, "%7")
+
+
+def test_attach_argv_is_the_seven_elements_of_the_spec() -> None:
+    assert tb.attach_argv(FOCUS_BIN, FOCUS_SOCK, "$3", "@2", "%7") == [
+        FOCUS_BIN, "-S", FOCUS_SOCK, "attach", "-E", "-t", "=$3:@2.%7",
+    ]  # fmt: skip
+
+
+@pytest.mark.parametrize(
+    ("session_id", "window_id", "pane_id"),
+    [("my work", "@2", "%7"), ("$3", "%2", "%7"), ("$3", "@2", "@7"), ("$3;", "@2", "%7")],
+)
+def test_attach_argv_refuses_anything_but_ids(
+    session_id: str, window_id: str, pane_id: str
+) -> None:
+    with pytest.raises(ValueError):
+        tb.attach_argv(FOCUS_BIN, FOCUS_SOCK, session_id, window_id, pane_id)
+
+
+def test_attach_argv_refuses_a_relative_binary() -> None:
+    with pytest.raises(ValueError):
+        tb.attach_argv("tmux", FOCUS_SOCK, "$3", "@2", "%7")
+
+
+@pytest.mark.parametrize(
+    ("returncode", "stderr", "expected"),
+    [
+        (1, "can't find client: /dev/pts/3\n", True),
+        (1, "can't find client: /dev/pts/3\nmore\n", True),
+        (0, "can't find client: /dev/pts/3\n", False),
+        (1, "can't find client: /dev/pts/30\n", False),
+        (1, "x\ncan't find client: /dev/pts/3\n", False),
+        (1, "can't find pane: %7\n", False),
+    ],
+)
+def test_is_client_missing(returncode: int, stderr: str, expected: bool) -> None:
+    result = subprocess.CompletedProcess([], returncode, "", stderr)
+    assert tb.is_client_missing(result, "/dev/pts/3") is expected

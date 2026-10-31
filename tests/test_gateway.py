@@ -841,6 +841,56 @@ def test_a_stop_signal_during_a_hook_kills_its_group(tmp_path: Path, signum: int
     assert wait_gone(child)
 
 
+def test_ignored_hangups_stop_neither_the_run_nor_a_hook_it_runs() -> None:
+    # close from its re-check on (closing termctl's own pane hangs up its terminal).
+    with stop_signals() as signals:
+        signals.ignore_hangups()
+        os.kill(os.getpid(), signal.SIGHUP)  # this process: exact, and handled
+        time.sleep(0.05)
+        run = SystemGateway().run_group(
+            [SH, "-c", "kill -HUP $PPID; sleep 0.2; echo done"], stdin=b"", env=base_env(),
+            timeout=10, stdout_limit=100, stderr_limit=100,
+        )  # fmt: skip
+        assert run.stdout == b"done\n"
+        # A program termctl runs gets SIGHUP at its default, and so does a hook.
+        child = SystemGateway().run([SH, "-c", "kill -HUP $$; echo alive"])
+        assert child.returncode == -signal.SIGHUP
+        hook = SystemGateway().run_group(
+            [SH, "-c", "kill -HUP $$; echo alive"], stdin=b"", env=base_env(), timeout=10,
+            stdout_limit=100, stderr_limit=100,
+        )  # fmt: skip
+        assert hook.returncode == -signal.SIGHUP
+        # SIGTERM still stops the run.
+        with pytest.raises(Terminated):
+            os.kill(os.getpid(), signal.SIGTERM)  # this process: exact, and handled
+            time.sleep(1)
+
+
+def test_an_ignored_hangup_in_a_deferred_block_is_not_raised_but_sigterm_is() -> None:
+    with stop_signals() as signals:
+        signals.ignore_hangups()
+        with signals.deferred():
+            os.kill(os.getpid(), signal.SIGHUP)  # this process: exact, and handled
+            time.sleep(0.05)
+        with pytest.raises(Terminated) as info:
+            with signals.deferred():
+                os.kill(os.getpid(), signal.SIGHUP)  # this process: exact, and handled
+                os.kill(os.getpid(), signal.SIGTERM)
+                time.sleep(0.05)
+    assert info.value.signum == signal.SIGTERM
+
+
+def test_ignore_hangups_leaves_an_ignored_sighup_ignored_and_restores_the_handlers() -> None:
+    before = signal.signal(signal.SIGHUP, signal.SIG_IGN)
+    try:
+        with stop_signals() as signals:
+            signals.ignore_hangups()
+            assert signal.getsignal(signal.SIGHUP) == signal.SIG_IGN
+        assert signal.getsignal(signal.SIGHUP) == signal.SIG_IGN
+    finally:
+        signal.signal(signal.SIGHUP, before)
+
+
 # --- spawn_watched ------------------------------------------------------------------------------
 
 
@@ -1186,3 +1236,72 @@ def test_write_tty_from_a_background_group_with_tostop_does_not_stop() -> None:
     )
     assert result.returncode == 0, result.stderr
     assert result.stdout == "0 b'\\x07'\n"
+
+
+def test_system_gateway_stderr_isatty_asks_about_fd_2(monkeypatch: pytest.MonkeyPatch) -> None:
+    asked: list[int] = []
+
+    def isatty(fd: int) -> bool:
+        asked.append(fd)
+        return False
+
+    monkeypatch.setattr(os, "isatty", isatty)
+    assert SystemGateway().stderr_isatty() is False
+    assert asked == [2]
+
+
+# --- exec_replace: focus's attach (interface.md `focus` step 2) ---------------------------------
+
+
+def test_exec_replace_execs_exactly_argv_and_env_with_sigpipe_restored(
+    monkeypatch: pytest.MonkeyPatch,
+) -> None:
+    seen: list[tuple[str, list[str], dict[str, str], Any]] = []
+
+    class Execed(Exception):
+        pass
+
+    def execve(path: str, argv: list[str], env: dict[str, str]) -> None:
+        seen.append((path, list(argv), dict(env), signal.getsignal(signal.SIGPIPE)))
+        raise Execed
+
+    monkeypatch.setattr(os, "execve", execve)
+    previous = signal.signal(signal.SIGPIPE, signal.SIG_IGN)
+    try:
+        with pytest.raises(Execed):
+            SystemGateway().exec_replace(["/usr/bin/tmux", "attach"], {"A": "1"})
+        # The failed exec put termctl's own handler back.
+        assert signal.getsignal(signal.SIGPIPE) == signal.SIG_IGN
+    finally:
+        signal.signal(signal.SIGPIPE, previous)
+    assert seen == [("/usr/bin/tmux", ["/usr/bin/tmux", "attach"], {"A": "1"}, signal.SIG_DFL)]
+
+
+@pytest.mark.parametrize("argv", [[], ["tmux", "attach"], ["./tmux"]])
+def test_exec_replace_refuses_a_relative_program(argv: list[str]) -> None:
+    with pytest.raises(ValueError):
+        SystemGateway().exec_replace(argv, {})
+
+
+def test_exec_replace_raises_oserror_for_a_missing_program(tmp_path: Path) -> None:
+    with pytest.raises(OSError):
+        SystemGateway().exec_replace([str(tmp_path / "missing")], {})
+
+
+@pytest.mark.skipif(not Path("/proc/self/status").exists(), reason="reads /proc/self/status")
+def test_exec_replace_really_replaces_the_process_without_ignored_sigpipe() -> None:
+    """Run in a child Python, which ignores SIGPIPE as every Python does; the program it execs
+    must not inherit that (SigIgn bit 13 clear)."""
+    code = (
+        "from termctl.gateway import SystemGateway\n"
+        "SystemGateway().exec_replace(['/bin/sh', '-c', "
+        "'echo $$ $MARK; grep SigIgn /proc/self/status'], {'MARK': 'm'})\n"
+    )
+    result = subprocess.run(
+        [sys.executable, "-c", code], capture_output=True, text=True, timeout=30, check=False
+    )
+    assert result.returncode == 0, result.stderr
+    first, second = result.stdout.splitlines()
+    assert first.split()[1] == "m"
+    ignored = int(second.split()[1], 16)
+    assert not ignored & (1 << (signal.SIGPIPE - 1))

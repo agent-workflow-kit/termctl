@@ -1,0 +1,1 @@
+{"id": "tc-abcdefgh", "action": "attach", "client": null, "argv": ["/usr/bin/tmux", "-S", "/tmp/tmux-1000/default", "attach", "-E", "-t", "=$1:@2.%3"], "dry_run": false, "socket_path": "/tmp/tmux-1000/default", "session": "termctl", "window_id": "@2", "pane_id": "%3"}

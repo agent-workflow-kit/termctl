@@ -91,7 +91,7 @@
           "type": "string"
         }
       },
-      "description": "Each tmux invocation as argv, after the tmux argument rules; --env values are replaced by the name only; ids not yet known appear as the literal tokens %NEW and @NEW."
+      "description": "The tmux invocations that would create and tag the pane (Open order steps 5 and 6), in order, each as argv, after the tmux argument rules; read-only probes, confirmations, the step-7 PID recording and the step-8 focus (its client is chosen only once the pane exists) are not listed; --env values are replaced by the name only; ids not yet known appear as the literal tokens %NEW and @NEW."
     }
   },
   "additionalProperties": false,

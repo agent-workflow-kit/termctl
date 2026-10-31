@@ -863,35 +863,28 @@ IMPLEMENTED = {
     "unmark",
     "label add",
     "label remove",
+    "close",
+    "focus",
 }
-UNIMPLEMENTED = sorted(set(MINIMAL) - IMPLEMENTED)
 
 
-@pytest.mark.parametrize("command", UNIMPLEMENTED)
-def test_unimplemented_command_is_internal_error(command: str) -> None:
-    # A managed pane carrying ID, so that commands taking an id get past id resolution.
-    run = Run(["--json", *MINIMAL[command]], FakeGateway(panes=[pane_row(tc_id=ID)]))
+def test_every_command_is_implemented() -> None:
+    assert set(MINIMAL) == IMPLEMENTED
+    # ``placements`` is answered by ``run_command`` itself; every other command has its steps.
+    assert set(cli.COMMAND_STEPS) | {"placements"} == IMPLEMENTED
+
+
+def test_a_command_without_steps_is_internal_error(monkeypatch: pytest.MonkeyPatch) -> None:
+    # The fallback of ``run_command`` for a parsed command that has no steps.
+    monkeypatch.delitem(cli.COMMAND_STEPS, "focus")
+    run = Run(["--json", "focus", ID], FakeGateway(panes=[pane_row(tc_id=ID)]))
     assert run.code == 1
-    envelope = run.json()
-    validate(envelope, "termctl/cli/error.json")
-    assert envelope["error"] == {
-        "code": "internal",
-        "message": f"termctl {command} is not implemented yet",
-    }
-    # Only the tmux checks (none for placements) and, for an id, the one pane read ran.
-    calls = run.gateway.calls
-    if command == "placements":
-        assert calls == []
-    elif command == "open":
-        assert calls == [[TMUX, "-V"]]
-    else:
-        assert calls[0] == [TMUX, "-V"] and len(calls) == 2 and is_list_panes(calls[1])
-
-
-def test_unimplemented_command_golden() -> None:
     expected = json.loads((GOLDEN / "error-not-implemented.json").read_text(encoding="utf-8"))
     validate(expected, "termctl/cli/error.json")
-    assert Run(["--json", "close", ID], FakeGateway(panes=[pane_row(tc_id=ID)])).json() == expected
+    assert run.json() == expected
+    # Only the tmux checks and the one pane read of id resolution ran.
+    calls = run.gateway.calls
+    assert calls[0] == [TMUX, "-V"] and len(calls) == 2 and is_list_panes(calls[1])
 
 
 # --- broken output streams ----------------------------------------------------------------------
