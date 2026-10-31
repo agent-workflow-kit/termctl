@@ -29,7 +29,7 @@ from contextlib import contextmanager
 from dataclasses import dataclass
 from datetime import UTC, datetime
 from types import FrameType
-from typing import Any, NamedTuple, Protocol
+from typing import Any, NamedTuple, NoReturn, Protocol
 
 from . import hookwatch
 from .hookwatch import kill_unreaped
@@ -226,6 +226,19 @@ class Gateway(Protocol):
 
     def stdin_isatty(self) -> bool:
         """Whether stdin (fd 0) is a terminal."""
+        ...
+
+    def stderr_isatty(self) -> bool:
+        """Whether stderr (fd 2) is a terminal."""
+        ...
+
+    def exec_replace(self, argv: list[str], env: Mapping[str, str]) -> NoReturn:
+        """Replace termctl with ``argv`` (an absolute path first) run with exactly ``env``,
+        keeping termctl's terminal, process group and descriptors: the one interactive path,
+        for ``focus``'s attach (interface.md `focus` step 2), which needs the caller's terminal
+        and so never goes through ``run``. SIGPIPE and SIGXFSZ, which Python ignores, are reset
+        to their defaults first, as ``subprocess`` does for a child. Returns only by raising
+        ``OSError`` (or ``ValueError``) when the exec fails."""
         ...
 
     def user_name(self) -> str | None:
@@ -475,6 +488,21 @@ class SystemGateway:
     def stdin_isatty(self) -> bool:
         return os.isatty(0)
 
+    def stderr_isatty(self) -> bool:
+        return os.isatty(2)
+
+    def exec_replace(self, argv: list[str], env: Mapping[str, str]) -> NoReturn:
+        if not argv or not os.path.isabs(argv[0]):
+            raise ValueError(f"exec needs an absolute program path: {argv!r}")
+        restored = _restore_exec_signals()
+        try:
+            os.execve(argv[0], argv, dict(env))
+        except BaseException:
+            # The exec failed: termctl goes on, with the handlers it had.
+            for signum, handler in restored:
+                signal.signal(signum, handler)
+            raise
+
     def user_name(self) -> str | None:
         # The password database, not $USER or $LOGNAME, which the caller's environment can set.
         try:
@@ -669,6 +697,17 @@ class _PidHandle:  # pragma: no cover - macOS only
 
     def close(self) -> None:
         pass
+
+
+def _restore_exec_signals() -> list[tuple[int, Any]]:
+    """Reset the signals Python ignores (SIGPIPE, SIGXFSZ) to their defaults before an exec,
+    which would otherwise keep them ignored; returns the handlers replaced."""
+    replaced: list[tuple[int, Any]] = []
+    for name in ("SIGPIPE", "SIGXFSZ"):
+        signum = getattr(signal, name, None)
+        if signum is not None:
+            replaced.append((signum, signal.signal(signum, signal.SIG_DFL)))
+    return replaced
 
 
 def _kill(proc: subprocess.Popen[bytes]) -> None:
