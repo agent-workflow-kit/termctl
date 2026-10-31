@@ -407,7 +407,8 @@ def check_tmux(args: argparse.Namespace, ctx: Context) -> None:
 
 def resolve_id(args: argparse.Namespace, ctx: Context) -> None:
     """Step 4: resolve the id to one managed pane (exit 10 or 21)."""
-    # TODO: read the managed panes (issue #11) and pick one with ids.resolve - issue #12
+    # TODO(#12): read the managed panes with backend.TmuxBackend.read_panes (no server: exit 10,
+    # no_server) and pick one with ids.resolve.
 
 
 def run_command(args: argparse.Namespace, ctx: Context) -> Result:

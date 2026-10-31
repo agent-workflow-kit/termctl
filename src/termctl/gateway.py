@@ -66,22 +66,27 @@ class SystemGateway:
         timeout: float | None = None,
         env: Mapping[str, str] | None = None,
     ) -> subprocess.CompletedProcess[str]:
-        """Run ``argv`` without a shell and capture its text output.
+        """Run ``argv`` without a shell and capture its output as text.
 
         ``env`` replaces the whole environment when given; ``None`` inherits termctl's own.
+        Output is read as bytes and decoded as ``os.fsdecode`` does (UTF-8, each undecodable
+        byte kept as a lone surrogate, the way argv is decoded), with no newline translation, so
+        a ``\r`` in tmux's output reads back as ``\r`` and no byte makes the call fail.
+        ``stdin`` is encoded the same way.
         """
-        # TODO(#11): text mode turns "\r\n" and "\r" in the output into "\n" and decodes it
-        # strictly in the locale's encoding (raising on undecodable bytes); the pane reader,
-        # the first parser of tmux's text output, must read output that can hold a raw "\r"
-        # or such bytes in bytes mode or with an explicit decoding.
-        return subprocess.run(
+        completed = subprocess.run(
             argv,
-            input=stdin,
+            input=None if stdin is None else os.fsencode(stdin),
             capture_output=True,
-            text=True,
             timeout=timeout,
             env=None if env is None else dict(env),
             check=False,
+        )
+        return subprocess.CompletedProcess(
+            completed.args,
+            completed.returncode,
+            os.fsdecode(completed.stdout),
+            os.fsdecode(completed.stderr),
         )
 
     def current_dir(self) -> str:

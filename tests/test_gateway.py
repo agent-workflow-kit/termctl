@@ -96,3 +96,27 @@ def test_system_gateway_user_name_none_without_passwd_entry(
 
     monkeypatch.setattr(pwd, "getpwuid", missing)
     assert SystemGateway().user_name() is None
+
+
+def test_system_gateway_reads_output_faithfully() -> None:
+    """No newline translation, and undecodable bytes are kept as lone surrogates (#11)."""
+    script = (
+        "import sys; sys.stdout.buffer.write(b'a\\r\\nb\\rc\\xff\\xc3'); "
+        "sys.stderr.buffer.write(b'e\\r\\xfe')"
+    )
+    result = SystemGateway().run([sys.executable, "-c", script])
+    assert result.returncode == 0
+    assert result.stdout == "a\r\nb\rc\udcff\udcc3"
+    assert result.stderr == "e\r\udcfe"
+    assert os.fsencode(result.stdout) == b"a\r\nb\rc\xff\xc3"
+
+
+def test_system_gateway_decodes_utf8_output() -> None:
+    script = "import sys; sys.stdout.buffer.write('é\U0001f514'.encode())"
+    assert SystemGateway().run([sys.executable, "-c", script]).stdout == "é\U0001f514"
+
+
+def test_system_gateway_encodes_stdin_as_utf8() -> None:
+    script = "import sys; sys.stdout.buffer.write(sys.stdin.buffer.read())"
+    result = SystemGateway().run([sys.executable, "-c", script], stdin="é\n")
+    assert result.stdout == "é\n"
