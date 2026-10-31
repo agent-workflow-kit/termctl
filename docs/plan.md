@@ -6,7 +6,7 @@ Status: planned, 2026-10-30. Implements [interface.md](interface.md) (normative)
 
 - Test-first. Every behavior in a task starts as a failing test.
 - All subprocesses, `/proc` reads, `ps` calls and tty writes go through `src/termctl/gateway.py`; unit tests replace it with a fake. Time comes from an injectable clock.
-- Integration tests run real tmux: each test pre-starts its own server with `tmux -f /dev/null -S <tmp path>` and passes `--socket <path>`; they never touch a user's server. They run in CI (tmux from apt, in termctl's own `tmux` job, which sets `TERMCTL_REQUIRE_TMUX` so a missing tmux fails them; the shared `verify` job cannot install packages, so it runs them only when the runner image ships tmux and skips them otherwise) and are not `live`. `make verify-floor` runs them with tmux 3.2 when it is installed locally.
+- Integration tests run real tmux: each test pre-starts its own server with `tmux -f /dev/null -S <tmp path>` and passes `--socket <path>`; they never touch a user's server. They run in CI (tmux from apt, in termctl's own `tmux` matrix, on tmux 3.2a and on the runner image's tmux, which sets `TERMCTL_REQUIRE_TMUX` so a missing tmux fails them; the shared `verify` job cannot install packages, so it runs them only when the runner image ships tmux and skips them otherwise) and are not `live`. `make verify-floor TMUX_FLOOR=<tmux 3.2 binary>` runs the suite with that tmux first on `PATH`.
 - Every `--json` output gets a golden-file test validated against its schema in `schemas/` (with a `referencing` registry keyed by `$id`); every hook payload, log and audit record written in a test is validated too.
 - Every spike finding listed in design.md "Live verification" that the implementation relies on becomes an integration regression test in the stage that relies on it.
 - `make verify` passes before every commit. PR titles are Conventional Commit headers; no `!` before 1.0.
@@ -132,6 +132,32 @@ Interim state: the CLI `open` runs every step: pre-open hooks, creation, PID rec
 - agent-spawn flow script (in this repo's integration tests, using only termctl's CLI).
 
 **Status**: In Progress
+
+## 1.0 readiness
+
+Criteria from the version roadmap below, with their state. This list is the record: update it as blockers close. 1.0 is declared only when every row is met.
+
+| # | Criterion | State |
+|---|---|---|
+| 1 | Stage 1 to 4 features implemented (every command in [interface.md](interface.md#commands)) | Not met: implemented in PRs #31-#56, none merged yet |
+| 2 | `make verify-floor` passes on tmux 3.2a, and `make verify` on the CI tmux | Not met: the `tmux (floor)` and `tmux (latest)` jobs exist (#25) but are red; the test-suite real-home guard in `tests/conftest.py` trips on runner checkouts under the runner's home (run 41221629827) |
+| 3 | The agent-spawn flow runs end to end against real tmux using only the CLI | Not met until merged and green: `tests/test_agent_spawn_flow_integration.py` (#27) is in the unmerged stack, whose CI is red for the reason in row 2 |
+| 4 | macOS checklist run on a Mac and recorded in [design.md](design.md#macos-checklist) | **Blocked:** needs a human run on a Mac; the results table is empty (#26) |
+| 5 | README matches the implemented behavior | Not met until merged: README rewritten and its examples checked against the CLI on a private server (#28) |
+| 6 | agent-spawn has used termctl for its v1 ticket slice without interface changes | **Blocked:** outside this repository; needs agent-spawn's v1 slice to ship on termctl |
+| 7 | The interface is declared stable by a deliberate breaking-change commit (architecture section 18.3) | **Blocked** on 4 and 6; `docs/interface.md` still says `0.1.0-design` and the version is not hand-edited |
+
+A row is met only when its evidence is on `main` and green.
+
+Not a gate: the `macos` CI job is informational and does not gate 1.0 ([design.md](design.md#macos-checklist)); it is currently red for the same real-home guard reason as row 2 (run 41219430832). The manual macOS checklist (row 4) is the macOS gate.
+
+Before the declaring commit also:
+
+- Maintainer: add `tmux (floor)` and `tmux (latest)` to the `main` ruleset's required status checks (currently `ci / ci-ok` and `pr-title / pr-title`); `macos` stays optional.
+- Maintainer: merge the stacked implementation PRs in order; the release job owns the changelog and version.
+- Update `awkit-docs/interface-registry.md` with the declaration (CLAUDE.md rule).
+- Open spec questions to settle or knowingly carry into 1.0 (each is also a candidate for a post-1.0 additive change): config file ownership checks; `--override-escalation` passing on any TTY even with an `auto:` actor; `target: pane` placements and markers on shared-window panes (reserved, 1.x: #29, #30).
+- Residual risks in [interface.md](interface.md#residual-risks) are accepted as written; re-read them once before declaring.
 
 ## Version roadmap
 

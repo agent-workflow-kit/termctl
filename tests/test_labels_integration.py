@@ -3,7 +3,7 @@ gateway, on a private server (``tmux_server`` in conftest.py): the stored value 
 canonical form through the reader, no-ops, the limit, dead panes, guarded writes and the window
 left alone (interface.md `label add` / `label remove`, "Labels").
 
-The CI ``tmux`` job runs these on the runner's tmux; tmux 3.2 runs are TODO(#25).
+The CI ``tmux`` jobs run these on tmux 3.2a (the floor) and on the runner image's tmux.
 """
 
 from __future__ import annotations

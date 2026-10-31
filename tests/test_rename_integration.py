@@ -3,7 +3,7 @@ server (``tmux_server`` in conftest.py): guarded writes (spike F5), rename eligi
 ``#`` doubling round trip, tmux's escaping of window names in the no-op comparison, forged
 control bytes and dead panes (interface.md `rename`, "Names", "tmux argument rules" rule 5).
 
-The CI ``tmux`` job runs these on the runner's tmux; tmux 3.2 runs are TODO(#25).
+The CI ``tmux`` jobs run these on tmux 3.2a (the floor) and on the runner image's tmux.
 """
 
 from __future__ import annotations
@@ -20,22 +20,19 @@ import pytest
 from termctl.cli import main
 from termctl.gateway import SystemGateway
 
-from .conftest import TMUX_VERSION, TmuxServer, wait_for
+from .conftest import TMUX_3_2, TmuxServer, tmux_stored_name, wait_for
 from .schemas import validate
 from .test_cli_read_integration import NO_CONFIG
 from .test_panes_integration import ID, OTHER_ID, new_window, tag, window_of
-from .test_tmux_integration import NAMES, XFAIL_3_2_DOLLAR
+from .test_tmux_integration import NAMES
 
 pytestmark = pytest.mark.tmux
 
-TMUX_3_2 = TMUX_VERSION is not None and TMUX_VERSION < (3, 3)
-# Names with backslashes, which rename-window stores doubled (3.5a), besides the "#", ";",
-# leading "-", quote and non-ASCII names of the argument builder's own tests.
-BACKSLASH_NAMES = ["a\\b", "\\", "a\\\\b", "\\033", "x\\"]
+# Names with backslashes, which rename-window stores doubled (3.2a, 3.5a), besides the "#", ";",
+# leading "-", quote, "$" and non-ASCII names of the argument builder's own tests. On tmux 3.2
+# each of them with a "$" reads back with "\\$" and must still be a no-op the second time (#19).
+BACKSLASH_NAMES = ["a\\b", "\\", "a\\\\b", "\\033", "x\\", "a\\$b", "$\\a"]
 RENAME_NAMES = [*NAMES, *BACKSLASH_NAMES]
-RENAME_PARAMS = [
-    pytest.param(n, marks=XFAIL_3_2_DOLLAR) if "$" in n else pytest.param(n) for n in RENAME_NAMES
-]
 
 
 class Interposing(SystemGateway):
@@ -112,11 +109,6 @@ def managed(server: TmuxServer) -> str:
     return pane_id
 
 
-def as_window_name(name: str) -> str:
-    """How tmux 3.3+ reports a name set by rename-window: backslashes doubled."""
-    return name.replace("\\", "\\\\")
-
-
 # --- a rename -----------------------------------------------------------------------------------
 
 
@@ -147,14 +139,14 @@ def test_rename_keeps_the_marker_in_the_displayed_name(tmux_server: TmuxServer) 
     assert option(tmux_server, pane_id, "@termctl_marker_text") == "\U0001f514 "
 
 
-@pytest.mark.parametrize("name", RENAME_PARAMS)
+@pytest.mark.parametrize("name", RENAME_NAMES)
 def test_names_round_trip_and_renaming_again_is_a_no_op(tmux_server: TmuxServer, name: str) -> None:
     pane_id = managed(tmux_server)
     first = termctl(tmux_server, "--json", "rename", ID, "--", name)
     assert first.code == 0, first.stderr
     assert option(tmux_server, pane_id) == name
-    assert window_name(tmux_server, pane_id) == as_window_name(name)
-    assert first.json()["display_name"] == as_window_name(name)
+    assert window_name(tmux_server, pane_id) == tmux_stored_name(name)
+    assert first.json()["display_name"] == tmux_stored_name(name)
     again = termctl(tmux_server, "--json", "rename", ID, "--", name)
     assert again.code == 0, again.stderr
     assert (again.json()["changed"], again.json()["display_updated"]) == (False, False)
@@ -305,6 +297,7 @@ def test_a_window_split_mid_command_gets_the_option_only(tmux_server: TmuxServer
 # --- forged control bytes -----------------------------------------------------------------------
 
 
+@pytest.mark.skipif(TMUX_3_2, reason="tmux 3.3+ prints the byte escaped; 3.2: the next test")
 def test_a_forged_control_byte_is_replaced_not_taken_for_the_name(tmux_server: TmuxServer) -> None:
     pane_id = managed(tmux_server)
     # Someone with socket access stores "n" ESC "x"; tmux prints it as the text n\033x.
@@ -320,14 +313,27 @@ def test_a_forged_control_byte_is_replaced_not_taken_for_the_name(tmux_server: T
     assert termctl(tmux_server, "--json", "rename", ID, "n\\033x").json()["changed"] is False
 
 
+@pytest.mark.skipif(not TMUX_3_2, reason="tmux 3.2 prints the byte raw; 3.3+: the previous test")
+def test_a_forged_control_byte_makes_the_pane_ignored_on_tmux_3_2(tmux_server: TmuxServer) -> None:
+    # tmux 3.2 prints a raw ESC in an option as it is, so the name breaks the grammar and the
+    # pane is ignored with a warning (interface.md "Residual risks", forged control bytes).
+    pane_id = managed(tmux_server)
+    tmux_server.raw("set", "-p", "-t", pane_id, "@termctl_name", "n\x1bx")
+    assert option(tmux_server, pane_id) == "n\x1bx"
+    result = termctl(tmux_server, "--json", "rename", ID, "n\\033x")
+    assert result.code == 10
+    assert f"ignoring managed pane {pane_id}" in result.stderr and "\x1b" not in result.stderr
+    assert option_bytes(tmux_server, pane_id) == 3  # never rewritten
+
+
 def test_a_forged_control_byte_in_the_window_name_is_replaced(tmux_server: TmuxServer) -> None:
-    # new-window -n keeps a raw ESC, which tmux prints as the text \033: the window name reads
-    # like the recomputed name but is not it.
+    # new-window -n keeps a raw ESC, which tmux 3.3+ prints as the text \033: the window name
+    # reads like the recomputed name but is not it. tmux 3.2 prints it raw.
     tmux_server.start()
     pane_id = new_window(tmux_server, "-n", "n\x1bx")
     tag(tmux_server, pane_id, **{"@termctl_name": "n\\033x"})
     tmux_server.raw("new-session", "-d", "-s", "keep", "--", "/usr/bin/env", "--", "sleep", "600")
-    assert window_name(tmux_server, pane_id) == "n\\033x"
+    assert window_name(tmux_server, pane_id) == ("n\x1bx" if TMUX_3_2 else "n\\033x")
     assert option_bytes(tmux_server, pane_id, "window_name") == 3
     result = termctl(tmux_server, "--json", "rename", ID, "n\\033x")
     assert (result.code, result.json()["changed"]) == (0, True)
@@ -355,8 +361,11 @@ def test_raw_bytes_never_reach_human_output(tmux_server: TmuxServer) -> None:
     pane_id = managed(tmux_server)
     tmux_server.raw("set", "-p", "-t", pane_id, "@termctl_name", "n\x1bx")
     result = termctl(tmux_server, "rename", ID, "plain")
-    assert result.code == 0
+    # tmux 3.2 prints the ESC raw: the pane is ignored, and the warning shows the byte escaped.
+    assert result.code == (10 if TMUX_3_2 else 0)
     assert "\x1b" not in result.stdout + result.stderr
+    if TMUX_3_2:
+        assert "'n\\x1bx'" in result.stderr
 
 
 # --- the lock directory ---------------------------------------------------------------------------
