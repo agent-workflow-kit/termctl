@@ -1,6 +1,6 @@
 [project]
 name = "termctl"
-version = "0.15.0"
+version = "0.16.0"
 description = "Terminal placement with a tmux backend"
 readme = "README.md"
 requires-python = ">=3.12"
