@@ -447,8 +447,9 @@ REAL_TMUX = shutil.which("tmux")
 @pytest.mark.tmux
 def test_probe_real_tmux() -> None:
     if REAL_TMUX is None:
-        # TODO(#25): CI installs tmux and sets TERMCTL_REQUIRE_TMUX=1 so this test cannot be
-        # skipped there; the shared CI workflow does neither yet.
+        # termctl's CI tmux jobs install tmux and set TERMCTL_REQUIRE_TMUX=1 (as make
+        # verify-floor does), so this test cannot be skipped there; the shared CI's verify job
+        # does neither and skips it on an image without tmux.
         if os.environ.get("TERMCTL_REQUIRE_TMUX"):
             pytest.fail("tmux is not installed, and TERMCTL_REQUIRE_TMUX requires the tmux tests")
         pytest.skip("tmux is not installed")

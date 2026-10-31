@@ -3,10 +3,11 @@
 Each test gets its own server, started with ``tmux -f /dev/null -S <tmp path>``, so it never
 loads a user's config or touches a user's server; teardown stops exactly that server with
 ``kill-server`` on its socket. Tests using it are marked ``tmux``. They are not ``live``: a
-missing tmux skips them, but fails them when ``TERMCTL_REQUIRE_TMUX`` is set, so the CI job
-that installs tmux (``tmux`` in .github/workflows/ci.yml) cannot pass by skipping them all.
-The shared CI's ``verify`` job cannot install packages: they run there only when the runner
-image ships tmux (ubuntu-26.04 ships 3.6a) and skip otherwise.
+missing tmux skips them, but fails them when ``TERMCTL_REQUIRE_TMUX`` is set, so the CI jobs
+that install tmux (the ``tmux`` matrix in .github/workflows/ci.yml: tmux 3.2a, the floor, and the
+runner image's tmux) and ``make verify-floor`` cannot pass by skipping them all. The shared CI's
+``verify`` job cannot install packages: they run there only when the runner image ships tmux and
+skip otherwise.
 """
 
 from __future__ import annotations
@@ -42,6 +43,22 @@ def tmux_version(tmux_bin: str | None = TMUX_BIN) -> tuple[int, int] | None:
 
 
 TMUX_VERSION = tmux_version()
+# tmux before 3.3: the 3.2 floor (``make verify-floor``, the CI ``tmux 3.2a`` job). Where it
+# differs from 3.3+, the integration tests assert each version's own behaviour (#25).
+TMUX_3_2 = TMUX_VERSION is not None and TMUX_VERSION < (3, 3)
+# tmux 3.2 prints a C0 or DEL byte, or one that is not valid UTF-8, in a user option or in a
+# window name given to new-window -n raw; 3.3+ prints it as escape text (\033, \377).
+TMUX_ESCAPES_CONTROL_BYTES = not TMUX_3_2
+
+
+def tmux_stored_name(name: str) -> str:
+    """How tmux reports a window or session name that ``rename-window``, ``rename-session`` or
+    ``new-session -s`` stored: vis-escaped, so a backslash reads back doubled and, before 3.3, a
+    ``$`` followed by an ASCII letter, ``_`` or ``{`` as ``\\$`` (checked on 3.2a and 3.5a).
+    ``new-window -n`` keeps a name as given. Written out here rather than taken from
+    ``termctl.display`` so the integration tests check that model against tmux."""
+    stored = name.replace("\\", "\\\\")
+    return re.sub(r"\$(?=[A-Za-z_{])", r"\\$", stored) if TMUX_3_2 else stored
 
 
 # --- the guard against tmux reading the real user's config (review round 1, R1-11) -------------

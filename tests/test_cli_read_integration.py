@@ -2,7 +2,7 @@
 binary and version, socket resolution and safety checks, the pane reader) through ``main``
 with the system gateway, on a private server (``tmux_server`` in conftest.py).
 
-The CI ``tmux`` job runs these on the runner's tmux; tmux 3.2 runs are TODO(#25).
+The CI ``tmux`` jobs run these on tmux 3.2a (the floor) and on the runner image's tmux.
 """
 
 from __future__ import annotations
@@ -19,7 +19,7 @@ import pytest
 
 from termctl.cli import main
 
-from .conftest import TMUX_VERSION, TmuxServer, wait_for
+from .conftest import TMUX_3_2, TMUX_VERSION, TmuxServer, wait_for
 from .schemas import validate
 from .test_panes_integration import ID, OTHER_ID, new_window, tag
 
@@ -155,11 +155,13 @@ def test_a_forged_invalid_pane_is_ignored_with_an_escaped_warning(tmux_server: T
     )
 
 
+@pytest.mark.skipif(TMUX_3_2, reason="tmux 3.3+ prints the byte escaped; 3.2: the next test")
 def test_a_raw_control_byte_in_an_option_is_read_as_tmux_escape_text(
     tmux_server: TmuxServer,
 ) -> None:
-    # interface.md "Residual risks", forged control bytes: tmux -u prints a raw ESC in a user
-    # option as the text \033, which passes the name grammar; nothing raw reaches the output.
+    # interface.md "Residual risks", forged control bytes: tmux 3.3+ -u prints a raw ESC in a
+    # user option as the text \033, which passes the name grammar; nothing raw reaches the
+    # output. tmux 3.2 prints it raw (the next test).
     pane_id = tmux_server.start()
     tag(tmux_server, pane_id, **{"@termctl_name": "n\x1b[2Jx"})
     result = termctl(tmux_server, "--json", "show", ID)
@@ -170,6 +172,24 @@ def test_a_raw_control_byte_in_an_option_is_read_as_tmux_escape_text(
     assert (human.code, human.stderr) == (0, "")
     raw = [c for c in human.stdout if c != "\n" and (ord(c) < 0x20 or 0x7F <= ord(c) <= 0x9F)]
     assert raw == []
+
+
+@pytest.mark.skipif(not TMUX_3_2, reason="tmux 3.2 prints the byte raw; 3.3+: the previous test")
+def test_a_raw_control_byte_in_an_option_makes_the_pane_ignored_on_tmux_3_2(
+    tmux_server: TmuxServer,
+) -> None:
+    # tmux 3.2 prints the raw ESC as it is: the name breaks its grammar, so the pane is ignored
+    # with a warning that shows the byte escaped; nothing raw reaches the output.
+    pane_id = tmux_server.start()
+    tag(tmux_server, pane_id, **{"@termctl_name": "n\x1b[2Jx"})
+    shown = termctl(tmux_server, "--json", "show", ID)
+    assert shown.code == 10 and shown.json()["error"]["code"] == "not_found"
+    assert f"ignoring managed pane {pane_id}" in shown.stderr
+    listed = termctl(tmux_server, "list")
+    assert listed.code == 0 and "n\\x1b[2Jx" in listed.stderr
+    for text in (shown.stdout, shown.stderr, listed.stdout, listed.stderr):
+        raw = [c for c in text if c != "\n" and (ord(c) < 0x20 or 0x7F <= ord(c) <= 0x9F)]
+        assert raw == []
 
 
 # --- dead panes ---------------------------------------------------------------------------------
