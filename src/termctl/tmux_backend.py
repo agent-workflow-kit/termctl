@@ -878,8 +878,13 @@ def guard_outcome(result: subprocess.CompletedProcess[str]) -> GuardOutcome:
 # LC_TIME from the environment, so strerror (the text in parentheses) is not translated.
 _NO_SERVER = "no server running on {}"
 _CONNECT_MISSING = "error connecting to {} (No such file or directory)"
-# What tmux prints when a target is gone (cmd-find.c).
-_GONE_PREFIXES = ("can't find pane: ", "can't find window: ", "can't find session: ")
+# What tmux prints when a target is gone (cmd-find.c), as tmux 3.5a prints it for the targets
+# termctl builds: the pane or window id, or the session id or bare name (``=S:`` gives ``S``).
+_GONE = re.compile(
+    "can't find "
+    f"(pane: {_PANE_ID.pattern}|window: {_WINDOW_ID.pattern}"
+    rf"|session: (\$[0-9]+|{_SESSION_NAME.pattern}))"
+)
 _MESSAGE_MAX = 200
 
 
@@ -898,14 +903,20 @@ def is_no_server(result: subprocess.CompletedProcess[str], socket_path: str) -> 
     if result.returncode == 0:
         return False
     lines = _stderr_lines(result)
+    # tmux got the path as os.fsencode's bytes and stderr is decoded as UTF-8, so a non-ASCII path
+    # under a non-UTF-8 locale comes back as those bytes decode, not as the str.
+    printed = os.fsencode(socket_path).decode("utf-8", "surrogateescape")
     return bool(lines) and lines[0] in (
-        _NO_SERVER.format(socket_path),
-        _CONNECT_MISSING.format(socket_path),
+        _NO_SERVER.format(printed),
+        _CONNECT_MISSING.format(printed),
     )
 
 
 def _is_gone(result: subprocess.CompletedProcess[str]) -> bool:
-    return any(line.startswith(_GONE_PREFIXES) for line in _stderr_lines(result))
+    """Whether stderr's first line is exactly tmux's message for a missing target: a server hook
+    can print any text, even one that starts like it, but only after tmux's own error."""
+    lines = _stderr_lines(result)
+    return bool(lines) and _GONE.fullmatch(lines[0]) is not None
 
 
 def tmux_message(result: subprocess.CompletedProcess[str]) -> str:

@@ -964,9 +964,9 @@ def _failed(stderr: str, rc: int = 1) -> subprocess.CompletedProcess[str]:
         "can't find pane: %9\n",
         "can't find window: @9\n",
         "can't find session: termctl\n",
+        "can't find session: $9\n",
         "no server running on /tmp/tmux-1000/default\n",
         "error connecting to /tmp/tmux-1000/default (No such file or directory)\n",
-        "x\ncan't find pane: %9\n",
     ],
 )
 def test_check_guard_maps_a_vanished_pane_to_not_found(stderr: str) -> None:
@@ -987,6 +987,15 @@ def test_check_guard_maps_a_vanished_pane_to_not_found(stderr: str) -> None:
         "xcan't find pane: %9\n",
         "no server running\n",
         "termctl-nomatch\n",
+        # Only tmux's own first line counts, and only exactly (tmux 3.5a: a hook running
+        # source-file on a file named like the message makes a successful write fail so).
+        "can't find pane: %99: No such file or directory\n",
+        "x\ncan't find pane: %9\n",
+        "hook output\ncan't find window: @9\n",
+        "can't find pane: @9\n",
+        "can't find window: %9\n",
+        "can't find pane: %9 \n",
+        "can't find session: a b\n",
     ],
 )
 def test_check_guard_maps_other_failures_to_server_unavailable(stderr: str) -> None:
@@ -1038,6 +1047,20 @@ def test_is_no_server_only_on_a_refused_connection() -> None:
 )
 def test_is_no_server_only_on_the_exact_first_line_for_this_socket(stderr: str) -> None:
     assert not tb.is_no_server(_failed(stderr), "/tmp/x/s")
+
+
+def test_is_no_server_compares_the_path_as_tmux_received_it(
+    monkeypatch: pytest.MonkeyPatch,
+) -> None:
+    """argv goes out through os.fsencode (the locale encoding) and stderr comes back as UTF-8
+    with surrogateescape, so the path is compared as those bytes decode, not as the str."""
+    monkeypatch.setattr(tb.os, "fsencode", lambda path: path.encode("latin-1"))
+    # "\u00e9" sent as latin-1 b"\xe9" reads back as the lone surrogate "\udce9".
+    assert tb.is_no_server(_failed("no server running on /tmp/\udce9/s\n"), "/tmp/\u00e9/s")
+    assert tb.is_no_server(
+        _failed("error connecting to /tmp/\udce9/s (No such file or directory)\n"), "/tmp/\u00e9/s"
+    )
+    assert not tb.is_no_server(_failed("no server running on /tmp/\u00e9/s\n"), "/tmp/\u00e9/s")
 
 
 # --- the runner ---------------------------------------------------------------------------------
