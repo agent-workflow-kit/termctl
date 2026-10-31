@@ -5,6 +5,7 @@ from __future__ import annotations
 
 import json
 import os
+import subprocess
 from collections.abc import Mapping
 from pathlib import Path
 from typing import Any
@@ -297,6 +298,12 @@ def new_row(**overrides: str) -> dict[str, str]:
     )
 
 
+def tagged(stdout: str = "") -> subprocess.CompletedProcess[str]:
+    """A tagging invocation that ran to the end: ``stdout`` (the query's answer), then the
+    confirmation line."""
+    return completed(f"{stdout}{tb.TAG_CONFIRMATION}\n")
+
+
 def existing_session_flow(
     plan: open_cmd.Plan, tag_result: Any = None, after: list[dict[str, str]] | None = None
 ) -> Flow:
@@ -304,7 +311,7 @@ def existing_session_flow(
         {
             key(tb.has_session(SESSION)): completed(),
             key(tb.new_window(SESSION, plan.window)): completed("%5 @3\n"),
-            tag_key(plan): completed() if tag_result is None else tag_result,
+            tag_key(plan): tagged() if tag_result is None else tag_result,
             key(tb.cleanup_kill("%5", "@3")): completed(),
         },
         panes=[],
@@ -447,7 +454,7 @@ def test_no_server_starts_one_with_the_new_session_invocation() -> None:
 
     gateway = Flow(
         {start: completed("%5 @3\n"), key(tb.has_session(SESSION)): completed(),
-         tag_key(plan): completed()},
+         tag_key(plan): tagged()},
         files=files, executables=TRUE, effects={start: socket_appears}, after=[new_row()],
     )  # fmt: skip
     gateway.tag_key = tag_key(plan)
@@ -524,40 +531,19 @@ def no_tmux_creation(gateway: FakeGateway) -> None:
 
 
 @pytest.mark.usefixtures("fixed_id")
-@pytest.mark.parametrize("hook", ["pre-open", "post-open"])
-def test_open_hooks_in_config_refuse_before_anything_is_created(hook: str, tmp_path: Path) -> None:
-    # R1-1: hooks do not run yet (#17), so a configured veto must not fail open.
-    config = tmp_path / "config.yaml"
-    config.write_text(yaml.safe_dump({"hooks": {hook: [{"cmd": "exit 1"}]}}), encoding="utf-8")
-    gateway = existing_session_flow(make_plan())
-    result = Run(["--json", "--config", str(config), "open", "--", "true"], gateway, ENVIRON)
-    err = error(result, "internal", 1)
-    assert "hooks" in err["message"]
-    no_tmux_creation(gateway)
-
-
-@pytest.mark.usefixtures("fixed_id")
-@pytest.mark.parametrize("hook", ["pre-open=exit 1", "post-open=true"])
-def test_open_hooks_given_with_the_flag_refuse_before_anything_is_created(hook: str) -> None:
-    gateway = existing_session_flow(make_plan())
-    err = error(run(["--hook", hook, "--", "true"], gateway), "internal", 1)
-    assert "hooks" in err["message"]
-    no_tmux_creation(gateway)
-
-
-@pytest.mark.usefixtures("fixed_id")
-def test_close_hooks_do_not_refuse_open(tmp_path: Path) -> None:
+def test_close_hooks_do_not_run_for_open(tmp_path: Path) -> None:
     config = tmp_path / "config.yaml"
     config.write_text(yaml.safe_dump({"hooks": {"pre-close": [{"cmd": "exit 1"}]}}), "utf-8")
     gateway = existing_session_flow(make_plan())
     result = Run(["--json", "--config", str(config), "open", "--", "true"], gateway, ENVIRON)
     assert result.code == 0, result.stderr
+    assert gateway.group_calls == []
 
 
-def test_usage_errors_win_over_the_hook_refusal() -> None:
+def test_usage_errors_come_before_any_hook() -> None:
     gateway = FakeGateway(panes=[], executables=TRUE)
     error(run(["--hook", "pre-open=exit 1", "--", "A=b"], gateway), "usage", 2)
-    assert gateway.calls == []
+    assert gateway.calls == [] and gateway.group_calls == []
 
 
 # An invalid managed pane: the reader ignores it with a warning (interface.md "Pane options").
@@ -622,7 +608,7 @@ RECORDED = {"@termctl_pid": "4242", "@termctl_pid_start": "823520334", "pane_pid
 @pytest.mark.usefixtures("fixed_id")
 def test_open_records_the_servers_child_and_reports_its_pid() -> None:
     plan = make_plan()
-    gateway = existing_session_flow(plan, completed("4242 0 77\n"), after=[new_row(**RECORDED)])
+    gateway = existing_session_flow(plan, tagged("4242 0 77\n"), after=[new_row(**RECORDED)])
     gateway.responses[RECORD] = completed()
     gateway.proc_stats[4242] = proc_stat()
     gateway.peer_pids[SOCK] = 77
@@ -647,7 +633,7 @@ def test_open_records_the_servers_child_and_reports_its_pid() -> None:
 def test_open_records_no_pid_unless_provably_the_servers_live_child(
     query: str, stat: str | None
 ) -> None:
-    gateway = existing_session_flow(make_plan(), completed(query))
+    gateway = existing_session_flow(make_plan(), tagged(query))
     gateway.proc_stats[4242] = stat
     gateway.peer_pids[SOCK] = 77
     result = run(["--", "true"], gateway)
@@ -659,7 +645,7 @@ def test_open_records_no_pid_unless_provably_the_servers_live_child(
 @pytest.mark.usefixtures("fixed_id")
 def test_a_failed_query_takes_the_state_from_the_follow_up_read() -> None:
     dead = new_row(**{"pane_dead": "1", "pane_dead_status": "3", "@termctl_keep": "always"})
-    gateway = existing_session_flow(make_plan(keep="always"), completed("  \n"), after=[dead])
+    gateway = existing_session_flow(make_plan(keep="always"), tagged("  \n"), after=[dead])
     result = run(["--keep-on-exit", "always", "--", "true"], gateway)
     assert result.code == 0, result.stderr
     out = result.json()
@@ -669,7 +655,7 @@ def test_a_failed_query_takes_the_state_from_the_follow_up_read() -> None:
 
 @pytest.mark.usefixtures("fixed_id")
 def test_a_failed_recording_does_not_undo_the_open() -> None:
-    gateway = existing_session_flow(make_plan(), completed("4242 0 77\n"))
+    gateway = existing_session_flow(make_plan(), tagged("4242 0 77\n"))
     gateway.responses[RECORD] = completed(stderr="boom\n", returncode=1)
     gateway.proc_stats[4242] = proc_stat()
     gateway.peer_pids[SOCK] = 77
@@ -683,7 +669,7 @@ def test_a_failed_recording_does_not_undo_the_open() -> None:
 @pytest.mark.usefixtures("fixed_id")
 def test_a_failed_query_and_a_failed_read_report_gone_with_a_warning() -> None:
     plan = make_plan()
-    gateway = existing_session_flow(plan, completed("garbage\n"))
+    gateway = existing_session_flow(plan, tagged("garbage\n"))
     gateway.after = None
     failed_read = completed(stderr="boom\n", returncode=1)
     gateway.effects[tag_key(plan)] = lambda g: setattr(g, "list_panes", failed_read)
@@ -718,8 +704,9 @@ def test_tag_failed_is_logged_with_result_error(tag_result: Any, tmp_path: Path)
     assert record == {
         "ts": CREATED_AT, "level": "error", "event": "open", "id": ID, "socket_path": SOCK,
         "result": "error", "exit_code": 12, "message": err["message"], "actor": "auto:policy",
-        "decision_ids": ["d-1"], "escalation_override": False,
+        "decision_ids": ["d-1"], "escalation_override": False, "hooks": [],
     }  # fmt: skip
+    assert err["decision_ids"] == ["d-1"]
     # No post-open hook runs and no read for an output follows.
     assert calls(gateway).count("list-panes") == 1
 
@@ -752,11 +739,3 @@ def test_a_log_that_cannot_be_written_warns_and_keeps_tag_failed(tmp_path: Path)
     result = run(["--", "true"], gateway, {"XDG_STATE_HOME": str(blocker)})
     error(result, "tag_failed", 12)
     assert "warning: could not write the log record" in result.stderr
-
-
-@pytest.mark.usefixtures("fixed_id")
-def test_a_successful_open_writes_no_log_record_yet(tmp_path: Path) -> None:
-    # TODO(#17) owns the success record; until then only tag_failed is logged.
-    gateway = existing_session_flow(make_plan())
-    assert run(["--", "true"], gateway, {"XDG_STATE_HOME": str(tmp_path)}).code == 0
-    assert not (tmp_path / "termctl" / "log.jsonl").exists()

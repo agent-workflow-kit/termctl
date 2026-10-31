@@ -6,12 +6,13 @@ import errno
 import os
 import stat
 import subprocess
-from collections.abc import Mapping, Sequence
+from collections.abc import Callable, Mapping, Sequence
+from dataclasses import dataclass
 from datetime import UTC, datetime, timedelta
 from typing import Any
 
 from termctl import panes as panes_module
-from termctl.gateway import BoundedOutput, FileInfo
+from termctl.gateway import BoundedOutput, FileInfo, GroupRun
 
 # The tmux binary the fakes know about by default, found on ``PATH=/usr/bin``.
 TMUX = "/usr/bin/tmux"
@@ -116,6 +117,30 @@ def safe_default_server(uid: int = UID, tmpdir: str = "/tmp") -> dict[str, FileI
     return files
 
 
+@dataclass
+class GroupCall:
+    """One ``run_group`` or ``spawn_watched`` call as the fake saw it."""
+
+    argv: list[str]
+    stdin: bytes
+    env: dict[str, str]
+    timeout: float | None
+    stdout_limit: int | None
+    stderr_limit: int | None
+    spawned: bool
+
+
+# A scripted group run: a fixed result, an exception to raise (``KeyboardInterrupt`` and
+# ``Terminated`` included), or a function of the call.
+GroupResponse = GroupRun | BaseException | Callable[[GroupCall], GroupRun]
+
+
+def group_run(
+    returncode: int | None = 0, stdout: bytes = b"", stderr: bytes = b"", pgid: int = 4242
+) -> GroupRun:
+    return GroupRun(pgid, returncode, stdout, stderr, False, False)
+
+
 class FakeGateway:
     """Records every call and answers from a table of scripted results.
 
@@ -191,6 +216,12 @@ class FakeGateway:
         self.mkdirs: list[tuple[str, int]] = []
         self.mkdir_error = mkdir_error
         self.appears: dict[str, FileInfo] = {}
+        # run_group and spawn_watched answers, keyed by argv.
+        self.group_responses: dict[tuple[str, ...], GroupResponse] = {}
+        self.group_calls: list[GroupCall] = []
+        # A stop (or any exception) raised after the call's ``record`` ran, as the real
+        # gateway raises a stop signal that came while the run was being recorded; by argv.
+        self.stops_after_record: dict[tuple[str, ...], BaseException] = {}
 
     def run(
         self,
@@ -237,6 +268,57 @@ class FakeGateway:
         if isinstance(response, BaseException):
             raise response
         return response
+
+    def run_group(
+        self,
+        argv: list[str],
+        *,
+        stdin: bytes,
+        env: Mapping[str, str],
+        timeout: float,
+        stdout_limit: int,
+        stderr_limit: int,
+        record: Callable[[GroupRun], None] | None = None,
+    ) -> GroupRun:
+        call = GroupCall(list(argv), stdin, dict(env), timeout, stdout_limit, stderr_limit, False)
+        self.group_calls.append(call)
+        response = self._group_response(argv)
+        if isinstance(response, BaseException):
+            raise response
+        run = response if isinstance(response, GroupRun) else response(call)
+        if record is not None:
+            record(run)
+        self._stop_after_record(argv)
+        return run
+
+    def spawn_watched(
+        self,
+        argv: list[str],
+        *,
+        stdin: bytes,
+        env: Mapping[str, str],
+        timeout: float,
+        record: Callable[[int], None] | None = None,
+    ) -> int:
+        self.group_calls.append(GroupCall(list(argv), stdin, dict(env), timeout, None, None, True))
+        response = self._group_response(argv)
+        if isinstance(response, BaseException):
+            raise response
+        if record is not None:
+            record(4343)
+        self._stop_after_record(argv)
+        return 4343
+
+    def _stop_after_record(self, argv: list[str]) -> None:
+        stop = self.stops_after_record.get(tuple(argv))
+        if stop is not None:
+            raise stop
+
+    def _group_response(self, argv: list[str]) -> GroupResponse:
+        try:
+            return self.group_responses[tuple(argv)]
+        except KeyError:
+            raise AssertionError(f"unexpected gateway group call: {argv!r}") from None
 
     def current_dir(self) -> str:
         if self.cwd is None:

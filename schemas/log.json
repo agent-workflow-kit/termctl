@@ -62,7 +62,7 @@
     },
     "exit_code": {
       "type": "integer",
-      "description": "Invocations that fail the usage check are not logged; a label limit checked after id resolution is (exit 2)."
+      "description": "Invocations that fail the usage check are not logged; a label limit checked after id resolution is (exit 2), and so are open's exit 2 from step 2 of its open order, its exit 1 (internal) and its exit 128 plus the signal number when a signal stopped it."
     },
     "actor": {
       "$ref": "defs.json#/$defs/actor",
@@ -84,6 +84,43 @@
         "attach"
       ],
       "description": "focus only; attach is logged before the exec."
+    },
+    "hooks": {
+      "type": "array",
+      "items": {
+        "type": "object",
+        "properties": {
+          "hook": {
+            "enum": [
+              "pre-open",
+              "post-open",
+              "pre-close",
+              "post-close"
+            ]
+          },
+          "cmd": {
+            "type": "string",
+            "minLength": 1
+          },
+          "pgid": {
+            "type": "integer",
+            "minimum": 1,
+            "description": "The process group termctl created for the hook; for an async hook, its watchdog's (also its session)."
+          },
+          "async": {
+            "type": "boolean",
+            "description": "true for an async post-hook: pgid is then its watchdog's group."
+          }
+        },
+        "additionalProperties": false,
+        "required": [
+          "hook",
+          "cmd",
+          "pgid",
+          "async"
+        ]
+      },
+      "description": "open and close only (required there): every hook the step started, in the order it started them, with its process group. A hook that could not be started is not listed."
     },
     "message": {
       "type": "string"
@@ -156,7 +193,8 @@
         "required": [
           "actor",
           "decision_ids",
-          "escalation_override"
+          "escalation_override",
+          "hooks"
         ]
       },
       "else": {
@@ -170,6 +208,11 @@
             {
               "required": [
                 "escalation_override"
+              ]
+            },
+            {
+              "required": [
+                "hooks"
               ]
             }
           ]
@@ -242,6 +285,63 @@
             "not": {
               "const": "warning"
             }
+          }
+        }
+      }
+    },
+    {
+      "if": {
+        "properties": {
+          "event": {
+            "const": "hook_failed"
+          }
+        },
+        "required": [
+          "event"
+        ]
+      },
+      "then": {
+        "required": [
+          "details"
+        ],
+        "properties": {
+          "details": {
+            "type": "object",
+            "properties": {
+              "hook": {
+                "enum": [
+                  "pre-open",
+                  "post-open",
+                  "pre-close",
+                  "post-close"
+                ]
+              },
+              "cmd": {
+                "type": "string",
+                "minLength": 1
+              },
+              "problem": {
+                "type": "string",
+                "description": "termctl's own text; never holds hook output."
+              },
+              "pgid": {
+                "type": "integer",
+                "minimum": 1,
+                "description": "The process group termctl created for the hook (for an async hook, its watchdog's); absent if it could not be started."
+              },
+              "hook_stderr": {
+                "type": "string",
+                "maxLength": 4096,
+                "x-untrusted": true,
+                "description": "Untrusted: the hook's stderr, cut to 4096 bytes at a UTF-8 boundary; absent when empty."
+              }
+            },
+            "additionalProperties": false,
+            "required": [
+              "hook",
+              "cmd",
+              "problem"
+            ]
           }
         }
       }

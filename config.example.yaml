@@ -70,7 +70,9 @@ placements:
 rules: []
 
 # Hooks: pre-open, pre-close (lists of {cmd, timeout}); post-open, post-close (lists of
-# {cmd, timeout, async}). Drop-ins append to these lists.
+# {cmd, timeout, async}). Drop-ins append to these lists. cmd runs as /bin/sh -c in its own
+# process group with the JSON payload on stdin; timeout is whole seconds, 1 to 600 (default
+# 30), after which the hook's process group is killed and a pre-hook counts as vetoing.
 # Example:
 #   hooks:
 #     pre-open:
