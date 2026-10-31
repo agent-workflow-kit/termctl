@@ -421,7 +421,9 @@ def test_agent_spawn_flow(caller: Caller) -> None:
     assert wait_for(dead, timeout=15)
     final = caller.ok(*sock("show", agent_id), schema="show")
     assert (final["exit_status"], final["exit_signal"]) == (3, None)
-    assert caller.ok(*sock("list", "--dead"), schema="list")["panes"][0]["id"] == agent_id
+    # The other pane still runs: --dead lists the agent's alone.
+    dead_panes = caller.ok(*sock("list", "--dead"), schema="list")["panes"]
+    assert [pane["id"] for pane in dead_panes] == [agent_id]
 
     closed = caller.ok(
         *sock(
@@ -498,6 +500,10 @@ def test_an_agent_whose_window_closed_is_already_closed(caller: Caller) -> None:
         return caller.run("--json", "--socket", socket_path, "exists", opened["id"]).code == 10
 
     assert wait_for(gone, timeout=15)
+    exists = caller.run("--json", "--socket", socket_path, "exists", opened["id"])
+    assert exists.code == 10
+    validate(exists.json(), "termctl/cli/exists.json")
+    assert exists.json()["exists"] is False
     assert caller.ok("--socket", socket_path, "list", schema="list")["panes"] == []
     error = caller.failed(10, "--socket", socket_path, "close", opened["id"])
     assert error["code"] == "not_found"
