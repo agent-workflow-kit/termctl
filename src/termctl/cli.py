@@ -34,6 +34,8 @@ class Context:
     environ: Mapping[str, str]
     out: Output = field(repr=False)
     config: Config = field(default_factory=config_module.defaults)
+    # `open`'s resolved placement (Open order step 2); None for other commands.
+    selection: placement.Selection | None = None
 
 
 # --- argument parsing ---------------------------------------------------------------------------
@@ -405,6 +407,18 @@ def resolve_server(args: argparse.Namespace, ctx: Context) -> None:
     # TODO: socket resolution - issue #8
 
 
+def resolve_placement(args: argparse.Namespace, ctx: Context) -> None:
+    """Step 2 of ``open``: resolve the placement, without side effects (exit 2, ``usage`` for
+    an undefined ``--placement``, ``not_supported``)."""
+    ctx.selection = placement.select(
+        ctx.config,
+        validate.parse_labels(args.labels),
+        placement=args.placement,
+        session=args.session,
+        target=args.target,
+    )
+
+
 def check_tmux(args: argparse.Namespace, ctx: Context) -> None:
     """Step 3: tmux binary, version and socket safety checks (exit 12)."""
     # TODO: tmux binary and version - issue #10; socket safety - issue #8
@@ -420,7 +434,9 @@ def run_command(args: argparse.Namespace, ctx: Context) -> Result:
     if args.command == "placements":
         labels = validate.parse_labels(args.labels) if args.labels else None
         return placement.report(ctx.config, labels)
-    # TODO: each command lands in its own issue (#12-#24).
+    # TODO: each command lands in its own issue (#12-#24). `open` gets its resolved placement
+    # in ctx.selection: TODO(#14) the session, TODO(#15) the window, TODO(#18) --dry-run's
+    # placement, matched_rule, session and target.
     raise TermctlError("internal", f"{PROG} {args.command} is not implemented yet")
 
 
@@ -431,6 +447,9 @@ def dispatch(args: argparse.Namespace, ctx: Context) -> Result:
     load_config(args, ctx)
     if spec.uses_tmux:
         resolve_server(args, ctx)
+        if args.command == "open":
+            # Open order step 2: the server, then tmux_bin (#10), then the placement.
+            resolve_placement(args, ctx)
         check_tmux(args, ctx)
         if spec.takes_id:
             resolve_id(args, ctx)

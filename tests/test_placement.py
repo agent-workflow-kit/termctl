@@ -10,7 +10,7 @@ import yaml
 
 from termctl import placement
 from termctl.config import Config, defaults, load
-from termctl.errors import TermctlError
+from termctl.errors import TermctlError, UsageError
 
 
 def load_config(tmp_path: Path, main: Any, *dropins: Any) -> Config:
@@ -314,3 +314,115 @@ def test_select_does_not_reject_unmatched_unsupported_placements(tmp_path: Path)
         panes={"target": "pane", "max_panes": 4},
     )
     assert placement.select(cfg, ["kind=y"]).name == "default"
+
+
+# --- open: --placement and the --session/--target overrides -------------------------------------
+
+
+def test_placement_flag_skips_the_rules(tmp_path: Path) -> None:
+    cfg = rules_config(
+        tmp_path, [{"match": {}, "placement": "r"}], r={"session": "rev"}, other={"session": "o"}
+    )
+    selected = placement.select(cfg, ["kind=review"], placement="other")
+    assert selected == placement.Selection(
+        rule=None, name="other", fields={"session": "o", "target": "window"}
+    )
+
+
+def test_placement_flag_may_name_the_built_in_default() -> None:
+    selected = placement.select(defaults(), [], placement="default")
+    assert selected == placement.Selection(
+        rule=None, name="default", fields={"session": "termctl", "target": "window"}
+    )
+
+
+def test_placement_flag_inherits_missing_fields_from_default(tmp_path: Path) -> None:
+    cfg = load_config(tmp_path, {"placements": {"default": {"session": "work"}, "empty": {}}})
+    selected = placement.select(cfg, [], placement="empty")
+    assert selected.fields == {"session": "work", "target": "window"}
+
+
+@pytest.mark.parametrize("name", ["missing", "defaults", "r-"])
+def test_placement_flag_naming_an_undefined_placement_is_a_usage_error(
+    tmp_path: Path, name: str
+) -> None:
+    cfg = rules_config(tmp_path, [{"match": {}, "placement": "r"}])
+    with pytest.raises(UsageError) as caught:
+        placement.select(cfg, [], placement=name)
+    err = caught.value
+    assert (err.code, err.exit_code) == ("usage", 2)
+    assert f"'{name}'" in err.message
+    assert "undefined" in err.message
+
+
+def test_placement_flag_is_checked_before_support(tmp_path: Path) -> None:
+    cfg = load_config(tmp_path, {"placements": {"default": {"target": "pane"}}})
+    with pytest.raises(TermctlError) as caught:
+        placement.select(cfg, [], placement="nope")
+    assert caught.value.code == "usage"
+
+
+def test_placement_flag_naming_an_unsupported_placement_is_not_supported(
+    tmp_path: Path,
+) -> None:
+    cfg = load_config(tmp_path, {"placements": {"panes": {"target": "pane", "max_panes": 2}}})
+    with pytest.raises(TermctlError) as caught:
+        placement.select(cfg, [], placement="panes")
+    assert caught.value.code == "not_supported"
+    assert caught.value.details == {"placement": "panes", "fields": ["target", "max_panes"]}
+
+
+def test_session_override_replaces_the_selected_session(tmp_path: Path) -> None:
+    cfg = rules_config(tmp_path, [{"match": {}, "placement": "r"}], r={"session": "rev"})
+    selected = placement.select(cfg, [], session="mine")
+    assert selected == placement.Selection(
+        rule=0, name="r", fields={"session": "mine", "target": "window"}
+    )
+
+
+def test_overrides_apply_to_a_named_placement(tmp_path: Path) -> None:
+    cfg = load_config(tmp_path, {"placements": {"other": {"session": "o"}}})
+    selected = placement.select(cfg, [], placement="other", session="s", target="window")
+    assert selected.fields == {"session": "s", "target": "window"}
+    assert (selected.session, selected.target) == ("s", "window")
+
+
+def test_target_pane_override_is_not_supported() -> None:
+    with pytest.raises(TermctlError) as caught:
+        placement.select(defaults(), [], target="pane")
+    err = caught.value
+    assert (err.code, err.exit_code) == ("not_supported", 2)
+    assert err.details == {"placement": "default", "fields": ["target"]}
+
+
+def test_target_window_override_makes_a_pane_target_supported(tmp_path: Path) -> None:
+    cfg = load_config(tmp_path, {"placements": {"default": {"target": "pane"}}})
+    selected = placement.select(cfg, [], target="window")
+    assert selected.fields == {"session": "termctl", "target": "window"}
+
+
+def test_target_window_override_keeps_pane_fields_unsupported(tmp_path: Path) -> None:
+    cfg = load_config(tmp_path, {"placements": {"p": {"target": "pane", "layout": "tiled"}}})
+    with pytest.raises(TermctlError) as caught:
+        placement.select(cfg, [], placement="p", target="window")
+    assert caught.value.details == {"placement": "p", "fields": ["layout"]}
+
+
+def test_explicit_null_group_by_stays_unsupported_under_overrides(tmp_path: Path) -> None:
+    cfg = load_config(tmp_path, {"placements": {"p": {"group_by": None}}})
+    with pytest.raises(TermctlError) as caught:
+        placement.select(cfg, [], placement="p", target="window", session="s")
+    assert caught.value.details == {"placement": "p", "fields": ["group_by"]}
+
+
+def test_none_overrides_change_nothing(tmp_path: Path) -> None:
+    cfg = rules_config(tmp_path, [{"match": {}, "placement": "r"}], r={"session": "rev"})
+    assert placement.select(cfg, [], session=None, target=None) == placement.select(cfg, [])
+
+
+def test_overrides_do_not_change_the_effective_placements(tmp_path: Path) -> None:
+    cfg = load_config(tmp_path, {"placements": {"default": {"session": "work"}}})
+    before = placement.effective(cfg)
+    placement.select(cfg, [], session="other")
+    assert placement.effective(cfg) == before
+    assert cfg.placements["default"].session == "work"
