@@ -85,7 +85,7 @@ A summary; [Environment](docs/interface.md#environment) is normative.
 
 - `TERMCTL_<KEY>` sets a top-level scalar config key: `TERMCTL_SOCKET`, `TERMCTL_TMUX_BIN`, `TERMCTL_BACKEND`, `TERMCTL_KEEP_ON_EXIT`, `TERMCTL_CLOSE_GRACE`, `TERMCTL_MARKER_DISPLAY`. Precedence: flags > environment > config > built-in defaults.
 - Hooks get `TERMCTL_HOOK`, `TERMCTL_ID` and `TERMCTL_OBJECT_TYPE` on top of the caller's full environment.
-- tmux runs with your environment filtered by `server_env_allow`, so a pane does not get the rest of your environment. `SSH_AUTH_SOCK` is not in the default list; add it to `server_env_allow` to keep it.
+- termctl runs tmux with your environment filtered by `server_env_allow` (except the attach of `focus`, and hooks), so a server termctl starts, and the panes in it, do not get the rest of your environment (a server started by anyone else keeps its own environment). `SSH_AUTH_SOCK` is not in the default list; add it to `server_env_allow` to keep it.
 - `TMUX_TMPDIR` decides where socket names live: if it is set in your shell profile but not under cron, the two use different tmux servers. Set it the same everywhere, or set `socket` in config.
 - `--env VAR=value` reaches only the new pane and is not safe for secrets (values are briefly visible in process listings).
 - termctl reads no credentials.
@@ -114,7 +114,7 @@ termctl keeps no database: what it knows about a pane is stored on the pane itse
 - **Server and state checks.** The tmux socket path, state directory, log, audit file and lock files are checked for ownership and permissions before use.
 - **Filtered environment.** tmux gets an allow-listed environment (`server_env_allow`), so credentials in your shell are not added to a server termctl starts.
 - **Human gates.** `close --force` and `--override-escalation` need a terminal or `--actor human:<user>`; a pre-hook veto always holds.
-- **Audit.** Mutating runs are logged; every `close --force` that saw a running pane and every `--override-escalation` run are also audited, whatever the outcome ([Audit and log](docs/interface.md#audit-and-log)).
+- **Audit.** Mutating runs are logged; every `close --force` that saw a running pane and every `--override-escalation` run are also audited, whatever the outcome, once the id is generated (`open`) or resolved (`close`) ([Audit and log](docs/interface.md#audit-and-log)).
 
 Residual risks are real and documented, not hidden. The main ones: anyone who can reach the tmux socket has full control of the server (so the displayed name is untrusted), the human gates are advisory against a hostile caller, `--env` values are briefly visible in process listings (not safe for secrets), and `close --force` signals only the recorded process: children that ignore SIGHUP or left its process group survive, and on macOS (no pidfd) a reused PID can be signaled in a narrow race. The complete list is [Residual risks](docs/interface.md#residual-risks).
 
