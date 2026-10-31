@@ -5,6 +5,8 @@ log"). Hooks that really run are in test_cli_open_integration.py."""
 from __future__ import annotations
 
 import json
+import os
+import signal
 from pathlib import Path
 from typing import Any
 
@@ -12,7 +14,7 @@ import pytest
 import yaml
 
 from termctl import tmux_backend as tb
-from termctl.gateway import GroupNotStopped, Terminated
+from termctl.gateway import GroupNotStopped, Terminated, with_pgid
 
 from .fakes import TMUX, FakeGateway, completed, group_run, pane_row
 from .schemas import validate
@@ -34,6 +36,7 @@ from .test_cli_open import (
     no_tmux_creation,
     proc_stat,
     run,
+    tag_key,
 )
 
 pytestmark = pytest.mark.usefixtures("fixed_id")
@@ -254,12 +257,26 @@ def test_an_override_run_without_hooks_is_still_audited(private_state_home: Path
 def test_an_override_run_failing_before_the_id_exists_is_only_logged(
     private_state_home: Path,
 ) -> None:
-    gateway = FakeGateway(panes=[])
-    argv = ["--actor", "human:pat", "--override-escalation", "--", "no-such-tool"]
-    error(run(argv, gateway), "command_not_found", 12)
+    gateway = FakeGateway(panes=[], executables=TRUE)
+    argv = ["--actor", "human:pat", "--override-escalation", "--placement", "nope", "--", "true"]
+    error(run(argv, gateway), "usage", 2)
     [record] = open_records(private_state_home)
     assert (record["id"], record["escalation_override"]) == (None, True)
     assert audit_records(private_state_home) == []
+
+
+def test_an_override_run_ending_in_command_not_found_is_logged_with_the_id_and_audited(
+    private_state_home: Path,
+) -> None:
+    gateway = FakeGateway(panes=[])
+    argv = ["--actor", "human:pat", "--override-escalation", "--", "no-such-tool"]
+    result = run(argv, gateway)
+    error(result, "command_not_found", 12)
+    [record] = open_records(private_state_home)
+    assert (record["id"], record["exit_code"]) == (ID, 12)
+    [audit] = audit_records(private_state_home)
+    assert (audit["target"], audit["result"]) == (ID, result.json())
+    assert audit["inputs"]["argv"] == ["no-such-tool"]
 
 
 def test_an_override_run_ending_in_tag_failed_is_audited(private_state_home: Path) -> None:
@@ -281,6 +298,10 @@ def test_an_audit_that_cannot_be_written_warns_and_keeps_the_exit_code(tmp_path:
     assert result.code == 0
     assert "warning: could not write the audit record" in result.stderr
     assert len(open_records(state)) == 1
+    [warning] = [r for r in records(state) if r["event"] == "warning"]
+    validate(warning, "termctl/log.json")
+    assert "could not write the audit record" in warning["message"]
+    assert warning["id"] == ID
 
 
 # --- decision ids -------------------------------------------------------------------------------
@@ -357,6 +378,19 @@ def test_post_open_payload_is_the_open_output() -> None:
     assert (call.stdout_limit, call.env["TERMCTL_HOOK"]) == (0, "post-open")
     # After the pane exists: the read for the output came first.
     assert calls(gateway)[-1] == "list-panes"
+
+
+def test_post_open_top_level_labels_are_the_given_ones_not_the_read_back_ones() -> None:
+    plan = make_plan(labels=("k=v",))
+    forged = new_row(**{"@termctl_labels": "forged=1 k=v"})
+    gateway = existing_session_flow(plan, after=[forged])
+    gateway.group_responses[sh("notify")] = group_run(0)
+    argv = ["--label", "k=v", "--hook", "post-open=notify", "--", "true"]
+    assert run(argv, gateway).code == 0
+    data = payload(gateway)
+    validate(data, "termctl/hooks/post-open.json")
+    assert data["labels"] == ["k=v"]
+    assert data["pane"]["labels"] == ["forged=1", "k=v"]
 
 
 def test_a_pane_gone_before_the_post_open_hooks_is_reported_to_them() -> None:
@@ -452,12 +486,21 @@ def test_an_open_without_hooks_logs_an_empty_hook_list(private_state_home: Path)
     assert (record["hooks"], record["actor"]) == ([], "auto:unknown")
 
 
-def test_a_failure_in_step_2_is_logged_without_an_id(private_state_home: Path) -> None:
-    gateway = FakeGateway(panes=[])
-    err = error(run(["--", "no-such-tool"], gateway), "command_not_found", 12)
+def test_a_failure_in_step_2_before_the_id_is_logged_without_one(
+    private_state_home: Path,
+) -> None:
+    gateway = FakeGateway(panes=[], executables=TRUE)
+    err = error(run(["--placement", "nope", "--", "true"], gateway), "usage", 2)
     [record] = open_records(private_state_home)
     assert (record["id"], record["socket_path"], record["result"]) == (None, SOCK, "error")
-    assert (record["exit_code"], record["message"]) == (12, err["message"])
+    assert (record["exit_code"], record["message"]) == (2, err["message"])
+
+
+def test_the_command_check_comes_after_the_id(private_state_home: Path) -> None:
+    gateway = FakeGateway(panes=[])
+    error(run(["--", "no-such-tool"], gateway), "command_not_found", 12)
+    [record] = open_records(private_state_home)
+    assert record["id"] == ID
 
 
 def test_a_failure_in_step_3_is_logged_with_the_id(private_state_home: Path) -> None:
@@ -533,6 +576,113 @@ def test_an_open_stopped_by_a_signal_in_a_hook_is_logged(
         exit_code,
         message,
     )
+
+
+def test_a_stop_in_a_later_pre_open_hook_keeps_the_earlier_hooks_and_ids(
+    private_state_home: Path,
+) -> None:
+    gateway = flow(
+        a=group_run(0, stdout=b'{"decision_id": "a-1"}', pgid=11),
+        b=with_pgid(KeyboardInterrupt(), 12),
+    )
+    argv = ["--decision-id", "d-1", "--hook", "pre-open=a", "--hook", "pre-open=b", "--", "true"]
+    assert run(argv, gateway).code == 130
+    [record] = open_records(private_state_home)
+    assert record["decision_ids"] == ["d-1", "a-1"]
+    assert record["hooks"] == [
+        {"hook": "pre-open", "cmd": "a", "pgid": 11, "async": False},
+        {"hook": "pre-open", "cmd": "b", "pgid": 12, "async": False},
+    ]
+
+
+def test_a_stop_in_a_post_open_hook_keeps_the_watchdog_and_the_interrupted_hook(
+    tmp_path: Path, private_state_home: Path
+) -> None:
+    config = config_file(tmp_path, {"post-open": [{"cmd": "bg", "async": True}]})
+    gateway = flow(bg=group_run(0), sync=with_pgid(Terminated(15), 21))
+    argv = ["--json", "--config", config, "open", "--hook", "post-open=sync", "--", "true"]
+    assert Run(argv, gateway, ENVIRON).code == 143
+    [record] = open_records(private_state_home)
+    assert (record["exit_code"], record["message"]) == (143, "terminated by signal 15")
+    assert record["hooks"] == [
+        {"hook": "post-open", "cmd": "bg", "pgid": 4343, "async": True},
+        {"hook": "post-open", "cmd": "sync", "pgid": 21, "async": False},
+    ]
+
+
+def test_an_override_run_stopped_in_a_post_open_hook_has_its_audit_record(
+    private_state_home: Path,
+) -> None:
+    gateway = flow(notify=with_pgid(KeyboardInterrupt(), 5))
+    argv = ["--actor", "human:pat", "--override-escalation", "--hook", "post-open=notify",
+            "--", "true"]  # fmt: skip
+    assert run(argv, gateway).code == 130
+    [audit] = audit_records(private_state_home)
+    validate(audit["result"], "termctl/cli/open.json")
+    assert (audit["target"], audit["result"]["id"], audit["result"]["pane_id"]) == (ID, ID, "%5")
+    [record] = open_records(private_state_home)
+    assert record["exit_code"] == 130
+
+
+def send(signum: int) -> Any:
+    """A fake call's effect: deliver ``signum`` to this process, only with termctl's handler
+    installed (it must never reach the test runner)."""
+
+    def effect(_: Any) -> None:
+        assert signal.getsignal(signum) not in (signal.SIG_DFL, signal.SIG_IGN)
+        assert signal.getsignal(signum) is not signal.default_int_handler
+        os.kill(os.getpid(), signum)
+
+    return effect
+
+
+STOPS = [(signal.SIGINT, "interrupted"), (signal.SIGTERM, "terminated by signal 15"),
+         (signal.SIGHUP, "terminated by signal 1")]  # fmt: skip
+
+
+@pytest.mark.parametrize("step", ["create", "tag"])
+@pytest.mark.parametrize(("signum", "message"), STOPS, ids=["int", "term", "hup"])
+def test_a_stop_signal_from_window_creation_on_is_deferred_until_the_audit(
+    step: str, signum: int, message: str, private_state_home: Path
+) -> None:
+    plan = make_plan()
+    gateway = existing_session_flow(plan)
+    gateway.group_responses[sh("notify")] = group_run(0)
+    trigger = key(tb.new_window("termctl", plan.window)) if step == "create" else tag_key(plan)
+    gateway.effects[trigger] = send(signum)
+    before = {s: signal.getsignal(s) for s, _ in STOPS}
+    argv = ["--actor", "human:pat", "--override-escalation", "--hook", "post-open=notify",
+            "--", "true"]  # fmt: skip
+    result = run(argv, gateway)
+    assert result.code == 128 + signum, result.stderr
+    # The pane was tagged, the output read and audited; no post-open hook ran.
+    assert gateway.tag_key in [tuple(c) for c in gateway.calls]
+    assert calls(gateway)[-1] == "list-panes"
+    assert gateway.group_calls == []
+    [audit] = audit_records(private_state_home)
+    validate(audit["result"], "termctl/cli/open.json")
+    assert audit["result"]["state"] == "running"
+    [record] = open_records(private_state_home)
+    assert (record["result"], record["exit_code"], record["message"]) == (
+        "error",
+        128 + signum,
+        message,
+    )
+    assert {s: signal.getsignal(s) for s, _ in STOPS} == before
+
+
+@pytest.mark.parametrize(("signum", "message"), STOPS[1:], ids=["term", "hup"])
+def test_a_stop_signal_outside_a_hook_before_creation_is_logged_only(
+    signum: int, message: str, private_state_home: Path
+) -> None:
+    gateway = flow()
+    gateway.effects[(TMUX, "-V")] = send(signum)
+    argv = ["--actor", "human:pat", "--override-escalation", "--", "true"]
+    assert run(argv, gateway).code == 128 + signum
+    no_tmux_creation(gateway)
+    [record] = open_records(private_state_home)
+    assert (record["exit_code"], record["message"], record["id"]) == (128 + signum, message, ID)
+    assert audit_records(private_state_home) == []
 
 
 def test_a_log_that_cannot_be_written_warns_and_keeps_success(tmp_path: Path) -> None:

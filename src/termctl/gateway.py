@@ -67,8 +67,8 @@ WATCHDOG_PATH = os.path.abspath(hookwatch.__file__)
 
 
 class Terminated(BaseException):
-    """termctl got SIGTERM or SIGHUP while a hook ran; the hook's group was killed first.
-    termctl exits ``128 + signum``."""
+    """termctl got SIGTERM or SIGHUP (``_hook_signals``, ``stop_signals``); a hook that was
+    running had its group killed first. termctl exits ``128 + signum``."""
 
     def __init__(self, signum: int) -> None:
         super().__init__(f"terminated by signal {signum}")
@@ -155,7 +155,8 @@ class Gateway(Protocol):
         nothing else) and returns ``returncode=None``.
 
         While the program runs, SIGTERM and SIGHUP (unless ignored) raise ``Terminated`` and
-        SIGINT raises ``KeyboardInterrupt``; the group is killed the same way first. Raises
+        SIGINT raises ``KeyboardInterrupt``; the group is killed the same way first, and the
+        exception carries its group (``started_pgid``). Raises
         ``OSError`` or ``ValueError`` if the program cannot be started and ``GroupNotStopped``
         if it was to be killed but could not be.
         """
@@ -461,13 +462,38 @@ def _default_sigchld() -> None:
         signal.signal(signal.SIGCHLD, signal.SIG_DFL)
 
 
-class _StopSignals:
-    """The handler ``_hook_signals`` installs for SIGTERM and SIGHUP: the first signal raises
-    ``Terminated``, unless it is held, in which case ``release`` raises it.
+def _stop_exception(signum: int) -> BaseException:
+    """What a stop signal raises: ``KeyboardInterrupt`` for SIGINT, else ``Terminated``."""
+    if signum == signal.SIGINT:
+        return KeyboardInterrupt()
+    return Terminated(signum)
 
-    Held while the hook starts, so the signal cannot come between the fork and the moment the
-    caller has the process to kill. Not blocked with ``pthread_sigmask``: the hook would inherit
-    the blocked mask.
+
+# The attribute run_group sets on an exception that interrupted a program it had started.
+_PGID_ATTRIBUTE = "termctl_pgid"
+
+
+def with_pgid[E: BaseException](exc: E, pgid: int) -> E:
+    """``exc``, marked as having interrupted ``run_group`` after it created group ``pgid``."""
+    setattr(exc, _PGID_ATTRIBUTE, pgid)
+    return exc
+
+
+def started_pgid(exc: BaseException) -> int | None:
+    """The process group ``run_group`` had created (and killed) when ``exc`` interrupted it, so
+    that a caller can list the interrupted program; None if it had started none."""
+    value = getattr(exc, _PGID_ATTRIBUTE, None)
+    return value if isinstance(value, int) else None
+
+
+class _StopSignals:
+    """A handler for stop signals: the first signal raises ``Terminated`` (``KeyboardInterrupt``
+    for SIGINT), unless it is held, in which case ``release`` raises it.
+
+    ``_hook_signals`` installs one for SIGTERM and SIGHUP while a hook runs, held while the hook
+    starts, so the signal cannot come between the fork and the moment the caller has the
+    process to kill. ``stop_signals`` installs one for a whole run. Not blocked with
+    ``pthread_sigmask``: the hook (or tmux and the pane) would inherit the blocked mask.
     """
 
     def __init__(self) -> None:
@@ -483,24 +509,88 @@ class _StopSignals:
         if self._held:
             self._pending = signum
             return
-        raise Terminated(signum)
+        raise _stop_exception(signum)
 
     def hold(self) -> None:
         self._held = True
 
     def release(self) -> None:
-        """Stop holding; raise ``Terminated`` for a signal that came while held."""
+        """Stop holding; raise the stop of a signal that came while held."""
         self._held = False
         if self._pending is not None:
             signum, self._pending = self._pending, None
-            raise Terminated(signum)
+            raise _stop_exception(signum)
+
+    def ignore_later(self) -> None:
+        """Stop holding, drop a signal that came while held and ignore any later one."""
+        self._raised = True
+        self._held, self._pending = False, None
+
+
+def _is_stop_handler(handler: Any) -> bool:
+    """Whether ``handler`` is a ``_StopSignals`` handler (``stop_signals``'), which a hook's
+    own handler may replace for as long as the hook runs."""
+    return isinstance(getattr(handler, "__self__", None), _StopSignals)
+
+
+class RunSignals:
+    """The stop-signal handling of a whole run (``stop_signals``)."""
+
+    def __init__(self, stops: _StopSignals) -> None:
+        self._stops = stops
+
+    @contextmanager
+    def deferred(self) -> Iterator[None]:
+        """Within the block, a stop signal is only recorded; when the block ends normally its
+        stop (``KeyboardInterrupt`` or ``Terminated``) is raised. A block that ends with an
+        exception ends the run anyway: that exception is what the caller sees, and later stop
+        signals are ignored, as after ``finish``."""
+        self._stops.hold()
+        try:
+            yield
+        except BaseException:
+            self._stops.ignore_later()
+            raise
+        self._stops.release()
+
+    def finish(self) -> None:
+        """The run is ending (its last record is being written): ignore later stop signals."""
+        self._stops.ignore_later()
+
+
+@contextmanager
+def stop_signals() -> Iterator[RunSignals]:
+    """For a whole run: SIGINT (when Python's own handler is installed), SIGTERM and SIGHUP
+    (unless ignored or handled already) raise ``KeyboardInterrupt`` or ``Terminated`` through a
+    handler that ``RunSignals.deferred`` can hold, and that a running hook's handler replaces
+    for as long as the hook runs (``_hook_signals``). The previous handlers are restored
+    afterwards."""
+    stops = _StopSignals()
+    if threading.current_thread() is not threading.main_thread():
+        yield RunSignals(stops)
+        return
+    previous: dict[int, Any] = {}
+    defaults = {
+        signal.SIGINT: signal.default_int_handler,
+        signal.SIGTERM: signal.SIG_DFL,
+        signal.SIGHUP: signal.SIG_DFL,
+    }
+    try:
+        for signum, default in defaults.items():
+            if signal.getsignal(signum) == default:
+                previous[signum] = signal.signal(signum, stops.handle)
+        yield RunSignals(stops)
+    finally:
+        for signum, handler in previous.items():
+            signal.signal(signum, handler)
 
 
 @contextmanager
 def _hook_signals() -> Iterator[_StopSignals]:
     """While a hook runs: ``SIGCHLD`` at its default, and ``SIGTERM`` and ``SIGHUP`` (unless
-    ignored or handled already) raise ``Terminated`` (see ``_StopSignals``), so the hook's group
-    is killed before termctl exits. The previous handlers are restored afterwards."""
+    ignored or handled already, other than by ``stop_signals``) raise ``Terminated`` (see
+    ``_StopSignals``), so the hook's group is killed before termctl exits. The previous
+    handlers are restored afterwards."""
     stops = _StopSignals()
     if threading.current_thread() is not threading.main_thread():
         yield stops
@@ -508,7 +598,8 @@ def _hook_signals() -> Iterator[_StopSignals]:
     _default_sigchld()
     previous: dict[int, Any] = {}
     for signum in (signal.SIGTERM, signal.SIGHUP):
-        if signal.getsignal(signum) == signal.SIG_DFL:
+        current = signal.getsignal(signum)
+        if current == signal.SIG_DFL or _is_stop_handler(current):
             previous[signum] = signal.signal(signum, stops.handle)
     try:
         yield stops
@@ -552,11 +643,12 @@ def _run_group(
                 proc.wait(timeout=max(deadline - time.monotonic(), 0))
             except subprocess.TimeoutExpired:
                 finished = False
-    except BaseException:
+    except BaseException as exc:
         try:
             _stop(proc)
         except GroupNotStopped:
             pass  # the interruption is what the caller must see
+        with_pgid(exc, proc.pid)
         raise
     finally:
         leader.close()

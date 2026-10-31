@@ -225,7 +225,7 @@ def test_pre_close_payload_matches_its_schema() -> None:
 
 def test_post_open_payload_matches_its_schema() -> None:
     output = {**PANE, "focused": False, "decision_ids": ["d-1"]}
-    payload = hooks.post_open_payload(pane=output)
+    payload = hooks.post_open_payload(pane=output, labels=output["labels"])
     validate(payload, "termctl/hooks/post-open.json")
     assert payload["pane"] == output
 
@@ -423,7 +423,9 @@ def test_hooks_never_run_while_the_server_lock_is_held(tmp_path: Path) -> None:
         with pytest.raises(RuntimeError, match="lock"):
             hooks.run_post_hooks(
                 [Hook("post-open", "a", 30)],
-                hooks.post_open_payload(pane={**PANE, "focused": False, "decision_ids": []}),
+                hooks.post_open_payload(
+                    pane={**PANE, "focused": False, "decision_ids": []}, labels=PANE["labels"]
+                ),
                 gateway=gateway,
                 environ={},
             )
@@ -690,7 +692,9 @@ def test_hook_failed_record_carries_the_stderr_apart_from_the_problem() -> None:
 
 
 def post_payload() -> dict[str, Any]:
-    return hooks.post_open_payload(pane={**PANE, "focused": False, "decision_ids": []})
+    return hooks.post_open_payload(
+        pane={**PANE, "focused": False, "decision_ids": []}, labels=PANE["labels"]
+    )
 
 
 def test_post_hooks_run_in_order_and_failures_only_warn() -> None:

@@ -61,7 +61,6 @@ def _raw_controls(text: str) -> list[str]:
     return [c for c in text if c != "\n" and (ord(c) < 0x20 or 0x7F <= ord(c) <= 0x9F)]
 
 
-# TODO(#6): once hook_stderr lines are printed (PR #41), this invariant covers their escaping.
 def test_human_error_output_never_carries_raw_controls_from_hook_text() -> None:
     stdout, stderr = _error_output(json_mode=False)
     assert stdout == ""

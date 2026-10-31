@@ -28,6 +28,8 @@ from termctl.gateway import (
     SystemClock,
     SystemGateway,
     Terminated,
+    started_pgid,
+    stop_signals,
 )
 
 from .fakes import FakeClock, FakeGateway
@@ -521,9 +523,84 @@ def test_run_group_kills_the_group_on_a_stop_signal_while_it_starts(
     monkeypatch: pytest.MonkeyPatch,
 ) -> None:
     seen = _send_term_after(monkeypatch)
-    with pytest.raises(Terminated):
+    with pytest.raises(Terminated) as info:
         group("sleep 10", timeout=10)
     assert group_is_gone(seen[0])
+    assert started_pgid(info.value) == seen[0]
+
+
+def test_run_group_takes_the_stop_signals_over_from_a_run(
+    monkeypatch: pytest.MonkeyPatch,
+) -> None:
+    # The run's handler would raise at once; the hook's holds the signal while it starts.
+    with stop_signals():
+        outer = signal.getsignal(signal.SIGTERM)
+        seen = _send_term_after(monkeypatch)
+        with pytest.raises(Terminated) as info:
+            group("sleep 10", timeout=10)
+        assert signal.getsignal(signal.SIGTERM) == outer
+    assert group_is_gone(seen[0])
+    assert started_pgid(info.value) == seen[0]
+
+
+def test_a_failure_to_start_carries_no_group() -> None:
+    with pytest.raises(OSError) as info:
+        SystemGateway().run_group(
+            ["/nonexistent/program"], stdin=b"", env={}, timeout=1, stdout_limit=0,
+            stderr_limit=0,
+        )  # fmt: skip
+    assert started_pgid(info.value) is None
+
+
+STOPS = (signal.SIGINT, signal.SIGTERM, signal.SIGHUP)
+
+
+def test_stop_signals_raise_for_a_run_and_restore_the_handlers() -> None:
+    before = {signum: signal.getsignal(signum) for signum in STOPS}
+    with stop_signals():
+        assert signal.getsignal(signal.SIGTERM) not in (signal.SIG_DFL, signal.SIG_IGN)
+        with pytest.raises(Terminated) as info:
+            os.kill(os.getpid(), signal.SIGTERM)  # this process: exact, and handled
+            time.sleep(1)
+    assert info.value.signum == signal.SIGTERM
+    assert {signum: signal.getsignal(signum) for signum in STOPS} == before
+
+
+@pytest.mark.parametrize("signum", STOPS)
+def test_a_deferred_stop_signal_is_raised_when_the_block_ends(signum: int) -> None:
+    done: list[str] = []
+    with stop_signals() as signals:
+        assert signal.getsignal(signum) not in (signal.SIG_DFL, signal.SIG_IGN)
+        with pytest.raises((KeyboardInterrupt, Terminated)) as info:
+            with signals.deferred():
+                os.kill(os.getpid(), signum)  # this process: exact, and handled
+                time.sleep(0.05)
+                done.append("block")
+            done.append("after")  # never reached
+    assert done == ["block"]
+    if signum == signal.SIGINT:
+        assert isinstance(info.value, KeyboardInterrupt)
+    else:
+        assert isinstance(info.value, Terminated) and info.value.signum == signum
+
+
+def test_an_error_in_a_deferred_block_wins_and_later_signals_are_ignored() -> None:
+    with stop_signals() as signals:
+        with pytest.raises(RuntimeError):
+            with signals.deferred():
+                os.kill(os.getpid(), signal.SIGTERM)  # this process: exact, and handled
+                raise RuntimeError("step failed")
+        os.kill(os.getpid(), signal.SIGTERM)  # ignored now
+        time.sleep(0.05)
+
+
+def test_stop_signals_leave_an_ignored_signal_alone() -> None:
+    previous = signal.signal(signal.SIGHUP, signal.SIG_IGN)
+    try:
+        with stop_signals():
+            assert signal.getsignal(signal.SIGHUP) == signal.SIG_IGN
+    finally:
+        signal.signal(signal.SIGHUP, previous)
 
 
 def test_run_group_reports_a_stop_signal_that_came_while_it_failed_to_start(

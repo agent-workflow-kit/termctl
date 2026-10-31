@@ -32,7 +32,15 @@ from .argv import Scan, scan
 from .backend import Backend, Created, TmuxBackend
 from .config import Config
 from .errors import TermctlError, UsageError
-from .gateway import Clock, Gateway, SystemClock, SystemGateway, Terminated
+from .gateway import (
+    Clock,
+    Gateway,
+    RunSignals,
+    SystemClock,
+    SystemGateway,
+    Terminated,
+    stop_signals,
+)
 from .output import PROG, Output, Result, flush_standard_streams
 from .panes import ManagedPane, PaneRead
 from .statedir import StateDirError
@@ -78,6 +86,10 @@ class Context:
     # and every hook it started (interface.md "Hooks").
     decision_ids: list[str] = field(default_factory=list[str])
     hook_processes: list[hooks.HookProcess] = field(default_factory=list[hooks.HookProcess])
+    # ``open``: whether its audit record was written (it is written once).
+    audited: bool = False
+    # A logged ``open``: its stop-signal handling (``gateway.stop_signals``).
+    signals: RunSignals | None = None
 
     def socket_path(self) -> str | None:
         """The resolved server's socket path; None before step 2 resolved it."""
@@ -108,11 +120,12 @@ class Context:
             self.out.warn(f"could not write the log record: {exc}")
 
     def audit(self, record: dict[str, Any]) -> None:
-        """Append an ``audit.jsonl`` record; like ``log``, a failure only warns."""
+        """Append an ``audit.jsonl`` record; like ``log``, a failure only warns (and, in a
+        logged command, gets a ``warning`` log record)."""
         try:
             jsonlog.append_audit(self.environ, record)
         except StateDirError as exc:
-            self.out.warn(f"could not write the audit record: {exc}")
+            self.warn(f"could not write the audit record: {exc}")
 
 
 # --- argument parsing ---------------------------------------------------------------------------
@@ -507,13 +520,10 @@ def resolve_placement(args: argparse.Namespace, ctx: Context) -> None:
 
 
 def resolve_command(args: argparse.Namespace, ctx: Context) -> None:
-    """Step 2 of ``open``, after the placement: the command check (exit 12,
-    ``command_not_found``) and the size check (exit 2), without side effects."""
+    """Step 2 of ``open``, after the placement: the plan and the id, then the command check
+    (exit 12, ``command_not_found``) and the size check (exit 2), without side effects."""
     assert ctx.selection is not None and ctx.server is not None and ctx.tmux_path is not None
     env = validate.parse_env(args.env)
-    if args.argv:
-        path = open_cmd.command_path(env, ctx.environ, ctx.config.server_env_allow)
-        open_cmd.check_command(args.argv[0], args.cwd, path, ctx.gateway)
     name = args.name if args.name is not None else open_cmd.default_name(args.argv)
     ctx.plan = open_cmd.Plan(
         name=name,
@@ -527,6 +537,9 @@ def resolve_command(args: argparse.Namespace, ctx: Context) -> None:
     ctx.window = ctx.plan.window
     # The id; step 3 checks it against the managed panes (a replacement has the same length).
     ctx.open_id = ids.generate()
+    if args.argv:
+        path = open_cmd.command_path(env, ctx.environ, ctx.config.server_env_allow)
+        open_cmd.check_command(args.argv[0], args.cwd, path, ctx.gateway)
     invocations = open_cmd.size_invocations(
         ctx.selection.session, ctx.plan, ctx.open_id, server_env(ctx)
     )
@@ -691,24 +704,29 @@ def open_pane(args: argparse.Namespace, ctx: Context) -> Result:
         # placement, matched_rule, session and target are in ctx.selection, its id in
         # ctx.open_id, the window in ctx.window.
         raise TermctlError("internal", f"{PROG} open --dry-run is not implemented yet")
-    assert ctx.plan is not None and ctx.open_id is not None
+    assert ctx.plan is not None and ctx.open_id is not None and ctx.signals is not None
     run_pre_open_hooks(args, ctx)
-    backend = unchecked_backend(ctx)
-    created = open_cmd.create_window(
-        backend, ctx.server, ctx.gateway, ctx.selection.session, ctx.window
-    )
-    created_at = open_cmd.timestamp(ctx.clock.now())
-    # tag_failed raises here, after the guarded cleanup; no post-open hook runs then.
-    query = open_cmd.tag(backend, created, ctx.open_id, ctx.plan, created_at, ctx.warn)
-    open_cmd.record(
-        backend, ctx.gateway, ctx.server.socket_path, created, ctx.open_id, query, ctx.warn
-    )
-    # TODO(#24): step 8, --focus.
-    result = _opened(ctx, backend, created, created_at)
+    # Steps 5 to 8 run with stop signals deferred: a signal there is raised only once the
+    # output exists and its audit record is written, so it never leaves an untagged window or
+    # an override run's pane without an audit record (interface.md "Audit and log").
+    with ctx.signals.deferred():
+        backend = unchecked_backend(ctx)
+        created = open_cmd.create_window(
+            backend, ctx.server, ctx.gateway, ctx.selection.session, ctx.window
+        )
+        created_at = open_cmd.timestamp(ctx.clock.now())
+        # tag_failed raises here, after the guarded cleanup; no post-open hook runs then.
+        query = open_cmd.tag(backend, created, ctx.open_id, ctx.plan, created_at, ctx.warn)
+        open_cmd.record(
+            backend, ctx.gateway, ctx.server.socket_path, created, ctx.open_id, query, ctx.warn
+        )
+        # TODO(#24): step 8, --focus.
+        result = _opened(ctx, backend, created, created_at)
+        _audit_open(args, ctx, result.data)
     # Step 9: the post-open hooks, the log record and the output.
     run_post_open_hooks(args, ctx, result.data)
+    ctx.signals.finish()
     ctx.log(_open_record(args, ctx, result="ok", exit_code=0))
-    _audit_open(args, ctx, result.data)
     return result
 
 
@@ -746,6 +764,7 @@ def run_pre_open_hooks(args: argparse.Namespace, ctx: Context) -> None:
         decision_ids=args.decision_ids,
         override_escalation=override,
     )
+    # The ids and processes go straight into ctx, so a stop signal loses neither.
     outcome = hooks.run_pre_hooks(
         hooks.hooks_for(ctx.config, "pre-open", args.flag_hooks),
         payload,
@@ -753,23 +772,25 @@ def run_pre_open_hooks(args: argparse.Namespace, ctx: Context) -> None:
         override_escalation=override,
         gateway=ctx.gateway,
         environ=ctx.environ,
+        ids=ctx.decision_ids,
+        processes=ctx.hook_processes,
     )
-    ctx.hook_processes.extend(outcome.processes)
-    ctx.decision_ids = list(outcome.decision_ids)
     _hook_warnings(ctx, outcome.warnings)
     outcome.check()
 
 
 def run_post_open_hooks(args: argparse.Namespace, ctx: Context, output: dict[str, Any]) -> None:
-    """Step 9: the ``post-open`` hooks, with the ``open`` output as their payload's ``pane``;
-    a failure is a warning and a ``hook_failed`` record, never an error."""
+    """Step 9: the ``post-open`` hooks, with the ``open`` output as their payload's ``pane``
+    and the labels termctl was given as its top-level ``labels``; a failure is a warning and
+    a ``hook_failed`` record, never an error."""
+    assert ctx.plan is not None
     outcome = hooks.run_post_hooks(
         hooks.hooks_for(ctx.config, "post-open", args.flag_hooks),
-        hooks.post_open_payload(pane=output),
+        hooks.post_open_payload(pane=output, labels=ctx.plan.labels),
         gateway=ctx.gateway,
         environ=ctx.environ,
+        processes=ctx.hook_processes,
     )
-    ctx.hook_processes.extend(outcome.processes)
     _hook_warnings(ctx, outcome.warnings)
 
 
@@ -812,10 +833,11 @@ def _open_record(
 
 
 def _audit_open(args: argparse.Namespace, ctx: Context, result: Mapping[str, Any]) -> None:
-    """The audit record of an ``--override-escalation`` run, once its id exists (step 2);
-    ``result`` is the ``--json`` output or the error envelope."""
-    if not args.override_escalation or ctx.open_id is None:
+    """The audit record of an ``--override-escalation`` run, once its id exists (step 2), and
+    only once; ``result`` is the ``--json`` output or the error envelope."""
+    if not args.override_escalation or ctx.open_id is None or ctx.audited:
         return
+    ctx.audited = True
     assert ctx.plan is not None and ctx.selection is not None and ctx.server is not None
     actor = resolve_actor(args, ctx)
     ctx.audit(
@@ -855,8 +877,9 @@ def _open_failed(args: argparse.Namespace, ctx: Context, err: TermctlError) -> N
 
 
 def _open_stopped(args: argparse.Namespace, ctx: Context, stop: BaseException) -> None:
-    """Log an ``open`` stopped by a signal (exit 128 plus its number). No audit record: it
-    holds the output or an error object, and a stopped run has neither."""
+    """Log an ``open`` stopped by a signal (exit 128 plus its number). Its audit record, if
+    any, was written once the output existed (``open_pane``); a run stopped before then has
+    neither output nor error object, and gets none."""
     if isinstance(stop, Terminated):
         signum, message = stop.signum, f"terminated by signal {stop.signum}"
     else:
@@ -961,18 +984,24 @@ def _logged_open(args: argparse.Namespace, ctx: Context) -> Result:
     and log"). Warnings become ``warning`` records from here on."""
     ctx.logged = True
     ctx.decision_ids = list(args.decision_ids)
-    try:
-        return _resolve_and_run(args, ctx)
-    except TermctlError as err:
-        _open_failed(args, ctx, err)
-        raise
-    except (KeyboardInterrupt, Terminated) as stop:
-        _open_stopped(args, ctx, stop)
-        raise
-    except Exception as exc:
-        err = internal_error(exc)
-        _open_failed(args, ctx, err)
-        raise err from exc
+    # SIGINT, SIGTERM and SIGHUP raise for the whole run, so it is logged whenever one stops it.
+    with stop_signals() as signals:
+        ctx.signals = signals
+        try:
+            return _resolve_and_run(args, ctx)
+        except TermctlError as err:
+            signals.finish()
+            _open_failed(args, ctx, err)
+            raise
+        except (KeyboardInterrupt, Terminated) as stop:
+            signals.finish()
+            _open_stopped(args, ctx, stop)
+            raise
+        except Exception as exc:
+            signals.finish()
+            err = internal_error(exc)
+            _open_failed(args, ctx, err)
+            raise err from exc
 
 
 def internal_error(exc: Exception) -> TermctlError:
