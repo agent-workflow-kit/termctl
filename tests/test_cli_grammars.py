@@ -41,12 +41,18 @@ def later_steps(monkeypatch: pytest.MonkeyPatch) -> list[str]:
     seen: list[str] = []
 
     def recorder(step: str):
-        def record(args: Any, ctx: Context) -> None:
+        def record(*_: Any) -> None:
             seen.append(step)
 
         return record
 
-    for step in ("load_config", "resolve_server", "check_tmux", "resolve_id"):
+    for step in (
+        "load_config",
+        "resolve_server",
+        "resolve_tmux_bin",
+        "check_tmux",
+        "resolve_id",
+    ):
         monkeypatch.setattr(cli, step, recorder(step))
 
     def handler(args: Any, ctx: Context) -> Result:
