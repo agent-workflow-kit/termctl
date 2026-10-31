@@ -138,7 +138,7 @@ def test_origin_values(tmp_path: Path) -> None:
     config_only_other = {"placements": {"other": {}}}
     data = Run(["placements", "--json"], config_only_other, tmp_path).json()["placements"]
     assert data["default"]["origin"] == "built-in"
-    assert data["other"]["origin"] == "config"
+    assert data["other"]["origin"] == "built-in"  # no field of it comes from config
     data = Run(["placements", "--json"], CONFIG, tmp_path).json()["placements"]
     assert {name: value["origin"] for name, value in data.items()} == {
         "default": "config",
@@ -253,12 +253,34 @@ def test_human_output_without_a_matching_rule(tmp_path: Path) -> None:
 
 
 def test_human_output_quotes_free_text_fields(tmp_path: Path) -> None:
-    config = {"placements": {"x": {"layout": "a b\x1bé", "group_by": None}}}
+    config = {"placements": {"x": {"layout": 'a b\x1b\x7f\x85é"\\', "group_by": None}}}
     run = Run(["placements"], config, tmp_path)
     assert run.code == 0
     assert run.stdout.splitlines()[1] == (
-        'placement x: session=termctl target=window layout="a b\\u001bé" group_by=null (config)'
+        "placement x: session=termctl target=window"
+        ' layout="a b\\x1b\\x7f\\x85é\\"\\\\" group_by=null (config)'
     )
+
+
+def test_human_output_keeps_a_line_break_in_free_text_on_one_line(tmp_path: Path) -> None:
+    config = {"placements": {"x": {"layout": "a\nb"}}}
+    run = Run(["placements"], config, tmp_path)
+    assert run.code == 0
+    assert run.stdout.splitlines()[1].endswith(' layout="a\\x0ab" (config)')
+
+
+@pytest.mark.parametrize("text", ["null", "true", "false", "12", "-3", "0", "1e5", "-0E7"])
+def test_human_output_quotes_strings_that_read_as_json_literals(tmp_path: Path, text: str) -> None:
+    run = Run(["placements"], f'placements: {{x: {{group_by: "{text}"}}}}\n', tmp_path)
+    assert run.code == 0
+    assert f'group_by="{text}" (config)' in run.stdout
+
+
+def test_human_output_shows_a_null_bare_and_plain_text_bare(tmp_path: Path) -> None:
+    config = {"placements": {"x": {"group_by": None}, "y": {"group_by": "nulls", "layout": "1x"}}}
+    lines = Run(["placements"], config, tmp_path).stdout.splitlines()
+    assert lines[1].endswith(" group_by=null (config)")
+    assert lines[2].endswith(" layout=1x group_by=nulls (config)")
 
 
 def test_human_output_escapes_control_characters_in_free_text(tmp_path: Path) -> None:

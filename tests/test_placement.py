@@ -150,10 +150,26 @@ def test_origin_of_default_set_only_in_a_dropin(tmp_path: Path) -> None:
     assert placement.origin(cfg, "default") == "config"
 
 
-def test_origin_of_a_configured_placement(tmp_path: Path) -> None:
-    cfg = load_config(tmp_path, {"placements": {"review": {"session": "r"}, "empty": {}}})
+def test_origin_of_a_placement_that_sets_a_field(tmp_path: Path) -> None:
+    cfg = load_config(tmp_path, {"placements": {"review": {"session": "r"}}})
     assert placement.origin(cfg, "review") == "config"
+
+
+def test_origin_of_an_empty_placement_without_a_configured_default(tmp_path: Path) -> None:
+    cfg = load_config(tmp_path, {"placements": {"empty": {}}})
+    assert placement.origin(cfg, "empty") == "built-in"
+
+
+def test_origin_of_an_empty_placement_inheriting_a_configured_default(tmp_path: Path) -> None:
+    cfg = load_config(tmp_path, {"placements": {"default": {"target": "window"}, "empty": {}}})
     assert placement.origin(cfg, "empty") == "config"
+
+
+def test_origin_of_a_placement_overriding_every_configured_default_field(
+    tmp_path: Path,
+) -> None:
+    config = {"placements": {"default": {"session": "d"}, "p": {"session": "p"}}}
+    assert placement.origin(load_config(tmp_path, config), "p") == "config"
 
 
 # --- rule matching ------------------------------------------------------------------------------

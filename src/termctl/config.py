@@ -652,6 +652,10 @@ def load(environ: Mapping[str, str], explicit: str | None = None) -> Config:
         dropin = _read(path)
         data = merge(data, dropin)
         files = merge(files, dropin)
+    if isinstance(data.get("placements"), dict):
+        # A scalar replaced by a later map (in a file, or for placements.default) dropped the
+        # built-in placements, or the built-in default's fields: merge them back beneath.
+        data["placements"] = merge(copy.deepcopy(DEFAULTS["placements"]), data["placements"])
 
     _check_unicode(data)
     _check_pre_hooks(data)

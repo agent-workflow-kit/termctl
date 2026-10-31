@@ -7,7 +7,6 @@ by field, and every other placement's missing fields taken from that effective `
 
 from __future__ import annotations
 
-import json
 import re
 from collections.abc import Iterable
 from dataclasses import dataclass
@@ -30,6 +29,9 @@ FIELDS = ("session", "target", "max_panes", "layout", "group_by")
 PANE_FIELDS = ("max_panes", "layout", "group_by")
 
 _PLAIN = re.compile(r"[A-Za-z0-9_-]+")
+
+# Plain strings that would read as a JSON literal or number when shown bare.
+_JSON_TOKEN = re.compile(r"null|true|false|-?(?:0|[1-9][0-9]*)(?:[eE][0-9]+)?")
 
 Origin = Literal["built-in", "config"]
 
@@ -56,11 +58,11 @@ def effective(cfg: Config) -> dict[str, dict[str, Any]]:
 
 
 def origin(cfg: Config, name: str) -> Origin:
-    """``config`` when any field of ``name`` comes from config, else ``built-in``. A placement
-    other than ``default`` exists only because config defines it, so it is always ``config``."""
-    if name != DEFAULT or cfg.configured_default_fields:
-        return "config"
-    return "built-in"
+    """``config`` when any field of ``name`` comes from config, else ``built-in``. A field of
+    another placement comes from config when the placement sets it, or when it inherits it from
+    a ``default`` field that config set."""
+    own = _set_fields(cfg.placements[name]) if name != DEFAULT else {}
+    return "config" if own or cfg.configured_default_fields else "built-in"
 
 
 def _pair(label: str) -> tuple[str, str]:
@@ -120,14 +122,24 @@ def select(cfg: Config, labels: Iterable[str]) -> Selection:
 # --- the placements command ---------------------------------------------------------------------
 
 
-def _show_value(value: Any) -> str:
-    """Session names, targets and integers as they are; free text (``layout``, ``group_by``)
-    and null as JSON, so a line stays unambiguous."""
-    if isinstance(value, str) and _PLAIN.fullmatch(value):
-        return value
+def _quote(text: str) -> str:
+    """``text`` in double quotes with ``"`` and ``\\`` backslash-escaped. Control characters
+    are left to the output layer, which shows them as ``\\xNN``; a line break is written as
+    ``\\x0a`` here, since the output layer keeps line breaks."""
+    quoted = text.replace("\\", "\\\\").replace('"', '\\"').replace("\n", "\\x0a")
+    return f'"{quoted}"'
+
+
+def _show_value(value: str | int | None) -> str:
+    """Integers and null bare; a string bare when it is plain and cannot read as null, a
+    boolean or a number, else quoted, so a line stays unambiguous."""
+    if value is None:
+        return "null"
     if isinstance(value, int):
         return str(value)
-    return json.dumps(value, ensure_ascii=False)
+    if _PLAIN.fullmatch(value) and not _JSON_TOKEN.fullmatch(value):
+        return value
+    return _quote(value)
 
 
 def _placement_line(name: str, fields: dict[str, Any], origin: Origin) -> str:
