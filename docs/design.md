@@ -80,6 +80,7 @@ Terminal placement, tmux backend. Layer 1 (primitive), fully standalone (archite
 | `procs.py` | process start time and parent check for the recorded PID, the `close --force` signal sequence |
 | `gateway.py` | the only module that runs subprocesses or touches the filesystem outside config and logs (tmux, `ps`, `/proc`, socket `stat` and `SO_PEERCRED`, the default directory's `mkdir`, the cwd check, stdin TTY test and OS user name, BEL write); also holds the injectable clock |
 | `hooks.py` | hook execution per the design guide |
+| `hookwatch.py` | the detached watchdog that runs an async post-hook and enforces its timeout; started by `gateway.py` as `python -I` with its absolute file path and importing only the standard library, it is the one other module that starts a process |
 | `jsonlog.py` | `log.jsonl` and `audit.jsonl` |
 | `statedir.py` | the state directory: its path, and opening `log.jsonl`, `audit.jsonl` and `locks/` without following symlinks, creating missing directories 0700 and files 0600, refusing entries not owned by the user, writable by group or others, or (files) hard-linked |
 | `lock.py` | per-server `flock` (D20) |

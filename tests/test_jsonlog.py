@@ -182,8 +182,15 @@ def test_force_only_on_close_and_action_only_on_focus() -> None:
 
 @pytest.mark.parametrize("event", ["hook_failed", "warning"])
 def test_warning_events_carry_result_warning(event: str) -> None:
+    details = {"hook": "post-open", "cmd": "c", "problem": "exited 1"}
     record = jsonlog.log_record(
-        TS, event=event, result="warning", id=None, socket_path=None, message="m"
+        TS,
+        event=event,
+        result="warning",
+        id=None,
+        socket_path=None,
+        message="m",
+        details=details if event == "hook_failed" else None,
     )
     validate(record, "termctl/log.json")
     assert record["level"] == "warn"

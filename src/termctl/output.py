@@ -17,6 +17,7 @@ from typing import Any, TextIO
 from .errors import TermctlError, UsageError
 
 PROG = "termctl"
+HOOK_STDERR_PREFIX = "hook stderr: "
 
 _CONTROL = re.compile("[\x00-\x1f\x7f-\x9f]")
 _SURROGATE = re.compile("[\ud800-\udfff]")
@@ -123,8 +124,24 @@ class Output:
             _flush(self.stdout)
         # TODO(#6): hook_stderr is not printed in human mode yet (PR #41 adds its lines).
         self._stderr(err.message)
+        if err.hook_stderr and not self.json:
+            self.hook_stderr(err.hook_stderr)
         if isinstance(err, UsageError) and err.usage and not self.json:
             _write(self.stderr, _escape_lines(err.usage))
+
+    def hook_stderr(self, text: str) -> None:
+        """A hook's stderr (untrusted), after the message it belongs to: each of its lines on
+        a line of its own behind the fixed prefix ``termctl: hook stderr: ``, escaped (a CR
+        included), so no line of it can pass for one of termctl's."""
+        if not text.strip():
+            return
+        for line in text.rstrip("\n").split("\n"):
+            self._stderr(f"{HOOK_STDERR_PREFIX}{line}")
+
+    def interrupted(self, message: str) -> None:
+        """termctl was stopped by a signal (exit 128 + the signal number): a short message,
+        even with ``--quiet``, and no error object."""
+        self._stderr(message)
 
     def warn(self, message: str) -> None:
         if not self.quiet:

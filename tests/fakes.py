@@ -6,30 +6,13 @@ import errno
 import os
 import stat
 import subprocess
-from collections.abc import Mapping, Sequence
+from collections.abc import Callable, Mapping, Sequence
+from dataclasses import dataclass
 from datetime import UTC, datetime, timedelta
 from typing import Any
 
 from termctl import panes as panes_module
-from termctl.gateway import BoundedOutput, FileInfo
-
-# The tmux binary the fakes know about by default, found on ``PATH=/usr/bin``.
-TMUX = "/usr/bin/tmux"
-
-# A scripted result: text for ``run``; text or bytes for ``run_bounded``.
-Response = subprocess.CompletedProcess[Any] | BaseException
-
-
-def completed(
-    stdout: str | bytes = "", *, stderr: str | bytes = "", returncode: int = 0
-) -> subprocess.CompletedProcess[Any]:
-    """A scripted result of one ``run`` or ``run_bounded`` call."""
-    return subprocess.CompletedProcess([], returncode, stdout, stderr)
-
-
-def _as_bytes(output: str | bytes) -> bytes:
-    return output.encode() if isinstance(output, str) else output
-
+from termctl.gateway import BoundedOutput, FileInfo, GroupRun
 
 UID = 1000
 
@@ -116,6 +99,47 @@ def safe_default_server(uid: int = UID, tmpdir: str = "/tmp") -> dict[str, FileI
     return files
 
 
+# The tmux binary the fakes know about by default, found on ``PATH=/usr/bin``.
+TMUX = "/usr/bin/tmux"
+
+# A scripted result: text for ``run``; text or bytes for ``run_bounded``.
+Response = subprocess.CompletedProcess[Any] | BaseException
+
+
+def completed(
+    stdout: str | bytes = "", *, stderr: str | bytes = "", returncode: int = 0
+) -> subprocess.CompletedProcess[Any]:
+    """A scripted result of one ``run`` or ``run_bounded`` call."""
+    return subprocess.CompletedProcess([], returncode, stdout, stderr)
+
+
+def _as_bytes(output: str | bytes) -> bytes:
+    return output.encode() if isinstance(output, str) else output
+
+
+@dataclass
+class GroupCall:
+    """One ``run_group`` or ``spawn_watched`` call as the fake saw it."""
+
+    argv: list[str]
+    stdin: bytes
+    env: dict[str, str]
+    timeout: float | None
+    stdout_limit: int | None
+    stderr_limit: int | None
+    spawned: bool
+
+
+# A scripted group run: a fixed result, an exception to raise, or a function of the call.
+GroupResponse = GroupRun | Exception | Callable[[GroupCall], GroupRun]
+
+
+def group_run(
+    returncode: int | None = 0, stdout: bytes = b"", stderr: bytes = b"", pgid: int = 4242
+) -> GroupRun:
+    return GroupRun(pgid, returncode, stdout, stderr, False, False)
+
+
 class FakeGateway:
     """Records every call and answers from a table of scripted results.
 
@@ -138,10 +162,10 @@ class FakeGateway:
         dirs: set[str] | None = None,
         tty: bool = False,
         user: str | None = "user",
+        executables: set[str] | None = None,
         uid: int = UID,
         files: Mapping[str, FileInfo] | None = None,
         links: Mapping[str, str] | None = None,
-        executables: set[str] | None = None,
         panes: Sequence[Mapping[str, str]] | None = None,
         list_panes: Response | None = None,
         mkdir_error: OSError | None = None,
@@ -169,7 +193,14 @@ class FakeGateway:
         self.executable_checks: list[str] = []
         self.calls: list[list[str]] = []
         # The ``env`` argument of each call, in the order of ``calls``.
-        self.envs: list[Mapping[str, str] | None] = []
+        self.envs: list[dict[str, str] | None] = []
+        self.uid = uid
+        # A fake filesystem for lstat and real_path: absolute normalized paths to their
+        # FileInfo, and symlinks to their targets (a link's owner is the uid unless ``files``
+        # has a ``symlink`` entry for it). By default a safe default server exists.
+        self.files = dict(safe_default_server(uid) if files is None else files)
+        self.links = dict(links or {})
+        self.lstats: list[str] = []
         self.cwd = cwd
         # By default only the caller's current directory exists.
         if dirs is None:
@@ -178,19 +209,15 @@ class FakeGateway:
         self.tty = tty
         self.user = user
         self.dir_checks: list[str] = []
-        self.uid = uid
-        # A fake filesystem for lstat and real_path: absolute normalized paths to their
-        # FileInfo, and symlinks to their targets (a link's owner is the uid unless ``files``
-        # has a ``symlink`` entry for it). By default a safe default server exists.
-        self.files = dict(safe_default_server(uid) if files is None else files)
-        self.links = dict(links or {})
-        self.lstats: list[str] = []
         # ``make_dir`` calls as (path, mode); ``mkdir_error`` is raised by the next one, and
         # ``appears`` (paths with their lstat) is added to ``files`` just before it, as another
         # process creating them meanwhile would.
         self.mkdirs: list[tuple[str, int]] = []
         self.mkdir_error = mkdir_error
         self.appears: dict[str, FileInfo] = {}
+        # run_group and spawn_watched answers, keyed by argv.
+        self.group_responses: dict[tuple[str, ...], GroupResponse] = {}
+        self.group_calls: list[GroupCall] = []
 
     def run(
         self,
@@ -238,6 +265,40 @@ class FakeGateway:
             raise response
         return response
 
+    def run_group(
+        self,
+        argv: list[str],
+        *,
+        stdin: bytes,
+        env: Mapping[str, str],
+        timeout: float,
+        stdout_limit: int,
+        stderr_limit: int,
+    ) -> GroupRun:
+        call = GroupCall(list(argv), stdin, dict(env), timeout, stdout_limit, stderr_limit, False)
+        self.group_calls.append(call)
+        response = self._group_response(argv)
+        if isinstance(response, Exception):
+            raise response
+        if isinstance(response, GroupRun):
+            return response
+        return response(call)
+
+    def spawn_watched(
+        self, argv: list[str], *, stdin: bytes, env: Mapping[str, str], timeout: float
+    ) -> int:
+        self.group_calls.append(GroupCall(list(argv), stdin, dict(env), timeout, None, None, True))
+        response = self._group_response(argv)
+        if isinstance(response, Exception):
+            raise response
+        return 4343
+
+    def _group_response(self, argv: list[str]) -> GroupResponse:
+        try:
+            return self.group_responses[tuple(argv)]
+        except KeyError:
+            raise AssertionError(f"unexpected gateway group call: {argv!r}") from None
+
     def current_dir(self) -> str:
         if self.cwd is None:
             raise FileNotFoundError("current directory removed")
@@ -250,12 +311,6 @@ class FakeGateway:
     def is_executable_file(self, path: str) -> bool:
         self.executable_checks.append(path)
         return path in self.executables
-
-    def stdin_isatty(self) -> bool:
-        return self.tty
-
-    def user_name(self) -> str | None:
-        return self.user
 
     def real_uid(self) -> int:
         return self.uid
@@ -332,6 +387,12 @@ class FakeGateway:
             elif current not in self.files:
                 raise FileNotFoundError(errno.ENOENT, os.strerror(errno.ENOENT), current)
         return current
+
+    def stdin_isatty(self) -> bool:
+        return self.tty
+
+    def user_name(self) -> str | None:
+        return self.user
 
 
 class FakeClock:
