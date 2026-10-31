@@ -10,7 +10,8 @@ implements it:
 - ``session_state``, ``create_session`` and ``create_window``: ``open``'s server and session
   (``open_cmd.create_window`` runs them in the order of interface.md "Open order" step 5).
 - ``tag_pane`` and ``cleanup_pane``: ``open``'s pane (Open order step 6, ``open_cmd.tag``).
-- TODO(#16, #17): the rest of ``open`` (PID recording, hooks).
+- ``record_process``: ``open``'s PID recording (Open order step 7, ``open_cmd.record``).
+- TODO(#17): the rest of ``open`` (hooks).
 - TODO(#19): ``rename``; TODO(#20): ``mark`` and ``unmark``; TODO(#21): label changes.
 - TODO(#23): ``close``; TODO(#24): ``focus``.
 """
@@ -90,11 +91,12 @@ class Backend(Protocol):
         options: Sequence[tuple[str, str]],
         remain_on_exit: str,
         respawn: tb.Respawn | None,
-    ) -> None:
+    ) -> tb.ProcessQuery | None:
         """Tag the pane step 5 created, guarded by its being untagged and in the window step 5
         reported, and, with ``respawn``, replace its placeholder with the real command. A guard
         that does not match or a failing tmux call exits 12 (``tag_failed``); a call that found
-        no server raises ``NoServerTagFailure``."""
+        no server raises ``NoServerTagFailure``. Returns the answer of the query of step 7
+        that ends the invocation, or None when the query failed."""
         ...
 
     def cleanup_pane(self, created: Created) -> bool:
@@ -102,6 +104,15 @@ class Backend(Protocol):
         whether the pane is gone: the guarded kill ran, or tmux reported the pane or its
         window gone. False when it may still exist: the guard did not match, or the kill
         failed otherwise (review round 2, R2-2). Never raises for a tmux failure."""
+        ...
+
+    def record_process(
+        self, created: Created, termctl_id: str, pid: int, start: str
+    ) -> tb.GuardOutcome:
+        """Write the pane's ``@termctl_pid`` and ``@termctl_pid_start`` in one invocation,
+        guarded by its being managed as ``termctl_id``, not dead and still running ``pid``.
+        A tmux call that cannot be made (timeout, missing binary) is ``FAILED``; never
+        raises for a tmux failure."""
         ...
 
 
@@ -151,7 +162,7 @@ class TmuxBackend:
         options: Sequence[tuple[str, str]],
         remain_on_exit: str,
         respawn: tb.Respawn | None,
-    ) -> None:
+    ) -> tb.ProcessQuery | None:
         invocation = tb.tag_pane(
             created.pane_id, created.window_id, options, remain_on_exit, respawn
         )
@@ -168,6 +179,7 @@ class TmuxBackend:
                 f"pane {created.pane_id} was gone, moved or already tagged before termctl"
                 " could tag it",
             )
+        return tb.parse_process_query(result.stdout)
 
     def cleanup_pane(self, created: Created) -> bool:
         try:
@@ -175,6 +187,16 @@ class TmuxBackend:
         except TermctlError:
             return False
         return tb.guard_outcome(result) is tb.GuardOutcome.MATCHED or tb.is_gone(result)
+
+    def record_process(
+        self, created: Created, termctl_id: str, pid: int, start: str
+    ) -> tb.GuardOutcome:
+        invocation = tb.record_process(created.pane_id, termctl_id, str(pid), start)
+        try:
+            result = self.tmux.run(invocation)
+        except TermctlError:
+            return tb.GuardOutcome.FAILED
+        return tb.guard_outcome(result)
 
     def _created(self, result: subprocess.CompletedProcess[str]) -> Created:
         """The ids a successful creation printed. A failed chain is never taken as created,

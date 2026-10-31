@@ -15,7 +15,18 @@ from collections.abc import Mapping, Sequence
 from dataclasses import dataclass, field
 from typing import Any, NoReturn, TextIO
 
-from . import __version__, hooks, ids, open_cmd, panes, placement, tmux_bin, tmux_socket, validate
+from . import (
+    __version__,
+    hooks,
+    ids,
+    jsonlog,
+    open_cmd,
+    panes,
+    placement,
+    tmux_bin,
+    tmux_socket,
+    validate,
+)
 from . import config as config_module
 from .argv import Scan, scan
 from .backend import Backend, Created, TmuxBackend
@@ -24,6 +35,7 @@ from .errors import TermctlError, UsageError
 from .gateway import Clock, Gateway, SystemClock, SystemGateway, Terminated
 from .output import PROG, Output, Result, flush_standard_streams
 from .panes import ManagedPane, PaneRead
+from .statedir import StateDirError
 from .tmux_backend import Tmux, WindowSpec
 from .tmux_bin import TmuxBinary
 
@@ -483,7 +495,7 @@ def check_tmux(args: argparse.Namespace, ctx: Context) -> None:
     """Step 3: tmux binary, version and socket safety checks (exit 12)."""
     if ctx.tmux is None:
         resolve_tmux_bin(ctx)
-        # TODO(#5): a version warning also gets a `warning` log record in logged commands.
+        # TODO(#17): a version warning also gets a `warning` log record in logged commands.
         ctx.tmux = tmux_bin.probe(
             ctx.config.tmux_bin,
             ctx.environ,
@@ -561,7 +573,7 @@ def read_panes(ctx: Context) -> PaneRead:
         else:
             ctx.pane_read = backend.read_panes()
         for warning in ctx.pane_read.warnings:
-            # TODO(#5): logged commands also write each warning as a `warning` log record.
+            # TODO(#17): logged commands also write each warning as a `warning` log record.
             ctx.out.warn(warning)
     return ctx.pane_read
 
@@ -646,10 +658,51 @@ def open_pane(args: argparse.Namespace, ctx: Context) -> Result:
         backend, ctx.server, ctx.gateway, ctx.selection.session, ctx.window
     )
     created_at = open_cmd.timestamp(ctx.clock.now())
-    open_cmd.tag(backend, created, ctx.open_id, ctx.plan, created_at, ctx.out.warn)
-    # TODO(#16): step 7 records the process; TODO(#24): step 8, --focus;
-    # TODO(#17): post-open hooks, the log record and the final output.
+    try:
+        query = open_cmd.tag(backend, created, ctx.open_id, ctx.plan, created_at, ctx.out.warn)
+    except TermctlError as err:
+        # tag_failed: the guarded cleanup ran in open_cmd.tag; no post-open hook runs.
+        _log_open_error(args, ctx, err)
+        raise
+    open_cmd.record(
+        backend, ctx.gateway, ctx.server.socket_path, created, ctx.open_id, query, ctx.out.warn
+    )
+    # TODO(#24): step 8, --focus;
+    # TODO(#17): post-open hooks, the log record of every other outcome and the final output.
     return _opened(args, ctx, backend, created, created_at)
+
+
+def _log_open_error(args: argparse.Namespace, ctx: Context, err: TermctlError) -> None:
+    """The ``log.jsonl`` record of an ``open`` that failed after its id was generated
+    (``result: error``; interface.md "Audit and log"). A record that cannot be written only
+    warns: the exit code stays the error's ("Records").
+    TODO(#17): the ids pre-open hooks returned follow the --decision-id values.
+    TODO(#17): resolve the actor once per run in shared context and reuse it here (warn once,
+    for the gate, audit and success records too); audit records for `--override-escalation`
+    runs must cover this tag_failed path (none is written yet).
+    TODO(#17): open-path warnings (the PID warnings of open_cmd.record, the unmanaged-window
+    warning of open_cmd.tag's cleanup, the `human:unknown` actor warning) also need their own
+    `event: warning` log records."""
+    actor, warning = validate.resolve_actor(args.actor, ctx.gateway)
+    if warning is not None:
+        ctx.out.warn(warning)
+    record = jsonlog.log_record(
+        ctx.clock.now(),
+        event="open",
+        result="error",
+        id=ctx.open_id,
+        socket_path=_socket_path(ctx),
+        exit_code=err.exit_code,
+        message=err.message,
+        details=err.details,
+        actor=actor,
+        decision_ids=list(args.decision_ids),
+        escalation_override=bool(args.override_escalation),
+    )
+    try:
+        jsonlog.append_log(ctx.environ, record)
+    except StateDirError as exc:
+        ctx.out.warn(f"could not write the log record: {exc}")
 
 
 _OPEN_HOOKS = ("pre-open", "post-open")

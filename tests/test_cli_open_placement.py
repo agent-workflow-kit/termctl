@@ -13,6 +13,7 @@ import yaml
 from termctl import cli, placement
 from termctl.cli import Context, Result, main
 
+from .conftest import private_environ
 from .fakes import FakeClock, FakeGateway
 from .schemas import validate
 
@@ -68,7 +69,7 @@ class Run:
             ["--json", *argv] if json_mode else argv,
             gateway=self.gateway,
             clock=FakeClock(),
-            environ=environ,
+            environ=private_environ(environ),
             stdout=stdout,
             stderr=stderr,
         )

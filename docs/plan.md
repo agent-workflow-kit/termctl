@@ -23,7 +23,7 @@ Status: planned, 2026-10-30. Implements [interface.md](interface.md) (normative)
 | `config.py` | 0 | YAML + `config.d` merge (maps deep, hook lists appended, other lists replaced), Pydantic models, `TERMCTL_*` scalars, load-time checks |
 | `validate.py` | 0 | grammars: ids, names, marker names and texts, labels, sessions, placement names, env names, durations, actor, decision ids, client names, socket names and paths, cwd |
 | `ids.py` | 0 | id generation, input normalization, prefix resolution (10/21, candidates) |
-| `gateway.py` | 0 | the only boundary: subprocess (tmux, `ps`), `/proc`, `stat`/`lstat`/`mkdir`, tty writes, `pidfd` (config file reads in `config.py` are the documented exception, see design.md Internal architecture) |
+| `gateway.py` | 0 | the only boundary: subprocess (tmux, `ps`), `/proc`, the server socket's `SO_PEERCRED`, `stat`/`lstat`/`mkdir`, tty writes, `pidfd` (config file reads in `config.py` are the documented exception, see design.md Internal architecture) |
 | `procs.py` | 0, 4 | process start time and parent PID (Linux `/proc`, macOS `ps`), zombie detection, the `close --force` signal sequence |
 | `jsonlog.py` | 0 | `log.jsonl` (level derived from result) and `audit.jsonl` |
 | `lock.py` | 0 | per-server `flock` with 10 s wait, canonical-path hashing |
@@ -91,7 +91,7 @@ Status: planned, 2026-10-30. Implements [interface.md](interface.md) (normative)
 - hooks: pre-open payload fields (env names only), veto/escalate/override, decision ids in output, log and audit (override runs).
 - `--dry-run`: read-only tmux queries only, tmux checks, `%NEW`/`@NEW` tokens, no hooks, nothing created.
 
-Interim state: the CLI `open` runs steps 1 to 3, 5 and 6 (no hooks yet; until #17 it refuses, exit 1 `internal`, before anything is created whenever a `pre-open` or `post-open` hook is configured or given with `--hook`), then reads the pane back for its output, with `pid: null` until the process is recorded (#16), `focused: false` until focus-on-open lands (#24) and only the `--decision-id` values (#17). `open --dry-run` still refuses (exit 1, `internal`) until #18.
+Interim state: the CLI `open` runs steps 1 to 3, 5, 6 and 7 (no hooks yet; until #17 it refuses, exit 1 `internal`, before anything is created whenever a `pre-open` or `post-open` hook is configured or given with `--hook`), then reads the pane back for its output. Its only `log.jsonl` record is the `result: error` record of `tag_failed` (#17 adds the others); output has `focused: false` until focus-on-open lands (#24) and only the `--decision-id` values (#17). `open --dry-run` still refuses (exit 1, `internal`) until #18.
 
 **Status**: Not Started
 

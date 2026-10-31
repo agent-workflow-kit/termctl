@@ -265,8 +265,8 @@ def default_actor(*, stdin_is_tty: bool, user: str | None) -> tuple[str, str | N
 def resolve_actor(given: str | None, gateway: Gateway) -> tuple[str, str | None]:
     """``--actor`` if given, else the default; returns the actor and a warning, if any.
 
-    No caller yet: the ``--override-escalation`` gate and audit records of ``open`` (#17) and
-    the ``close --force`` gate (#23) will call it.
+    ``open``'s ``tag_failed`` log record calls it; the ``--override-escalation`` gate and
+    audit records of ``open`` (#17) and the ``close --force`` gate (#23) will too.
     """
     if given is not None:
         return check_actor(given), None

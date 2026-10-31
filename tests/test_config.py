@@ -20,6 +20,7 @@ from termctl.cli import Context, Result, main
 from termctl.config import DEFAULTS, ENV_KEYS, Config, ConfigError, load
 from termctl.validate import show
 
+from .conftest import private_environ
 from .fakes import FakeClock, FakeGateway
 from .schemas import SCHEMAS, validate
 
@@ -1307,7 +1308,7 @@ def run(
         argv,
         gateway=gateway or FakeGateway(),
         clock=FakeClock(),
-        environ=environ,
+        environ=private_environ(environ),
         stdout=stdout,
         stderr=stderr,
     )

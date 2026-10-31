@@ -13,6 +13,7 @@ import pytest
 from termctl import cli
 from termctl.cli import Context, Result, main
 
+from .conftest import private_environ
 from .fakes import TMUX, UID, FakeClock, FakeGateway, directory, safe_default_server, socket_file
 from .schemas import validate
 
@@ -42,7 +43,9 @@ def run(
         ["--json", *argv],
         gateway=gateway,
         clock=FakeClock(),
-        environ={**NO_CONFIG, "PATH": "/usr/bin", **(environ or {})},  # PATH: where tmux is
+        environ=private_environ(
+            {**NO_CONFIG, "PATH": "/usr/bin", **(environ or {})}
+        ),  # PATH: where tmux is
         stdout=stdout,
         stderr=stderr,
     )

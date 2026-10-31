@@ -26,6 +26,7 @@ from typing import Any
 
 import pytest
 
+from termctl import statedir
 from termctl.gateway import SystemGateway
 from termctl.tmux_backend import Tmux
 
@@ -150,6 +151,43 @@ def private_home() -> Iterator[Path]:
             yield root
         finally:
             shutil.rmtree(root, ignore_errors=True)
+
+
+# --- the guard against writing the real user's state directory (review round 1, R1-1) ---------
+
+
+def real_state_dir_problem(path: Path) -> str | None:
+    """Why a state directory at ``path`` must not be used by a test, or None when it may."""
+    if _under_real_home(str(path)):
+        return f"state directory {path} is under a real home directory"
+    return None
+
+
+def private_environ(environ: Mapping[str, str]) -> dict[str, str]:
+    """``environ`` for ``main`` with this test's private ``XDG_STATE_HOME`` added when it sets
+    none (see ``private_state_home``)."""
+    return {"XDG_STATE_HOME": os.environ["XDG_STATE_HOME"], **environ}
+
+
+@pytest.fixture(autouse=True)
+def private_state_home(tmp_path: Path, monkeypatch: pytest.MonkeyPatch) -> Iterator[Path]:
+    """Each test gets a private ``XDG_STATE_HOME`` in this process's environment, which the
+    environ helpers (``tests.test_cli.ENVIRON`` users) pass on to ``main``, and every state
+    directory termctl resolves is checked by ``real_state_dir_problem``: a test whose environ
+    would let termctl write the real ``~/.local/state/termctl`` fails instead."""
+    state_home = tmp_path / "state-home"
+    monkeypatch.setenv("XDG_STATE_HOME", str(state_home))
+    resolve = statedir.state_dir
+
+    def guarded(environ: Mapping[str, str]) -> Path:
+        path = resolve(environ)
+        problem = real_state_dir_problem(path)
+        if problem is not None:
+            raise AssertionError(f"test guard: {problem}")
+        return path
+
+    monkeypatch.setattr(statedir, "state_dir", guarded)
+    yield state_home
 
 
 @dataclass

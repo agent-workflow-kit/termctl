@@ -78,7 +78,7 @@ Terminal placement, tmux backend. Layer 1 (primitive), fully standalone (archite
 | `tmux_socket.py` | server selection, the canonical socket path and the socket safety checks (D12, D26) |
 | `panes.py` | the pane reader: parses `list-panes -a -F` records, applies the ownership check and validates every `@termctl_*` value (D27) |
 | `procs.py` | process start time and parent check for the recorded PID, the `close --force` signal sequence |
-| `gateway.py` | the only module that runs subprocesses or touches the filesystem outside config and logs (tmux, `ps`, `/proc`, socket `stat`, the default directory's `mkdir`, the cwd check, stdin TTY test and OS user name, BEL write); also holds the injectable clock |
+| `gateway.py` | the only module that runs subprocesses or touches the filesystem outside config and logs (tmux, `ps`, `/proc`, socket `stat` and `SO_PEERCRED`, the default directory's `mkdir`, the cwd check, stdin TTY test and OS user name, BEL write); also holds the injectable clock |
 | `hooks.py` | hook execution per the design guide |
 | `hookwatch.py` | the detached watchdog that runs an async post-hook and enforces its timeout; started by `gateway.py` as `python -I` with its absolute file path and importing only the standard library, it is the one other module that starts a process |
 | `jsonlog.py` | `log.jsonl` and `audit.jsonl` |
@@ -91,6 +91,7 @@ Error handling: usage and config problems are detected before any tmux call; tmu
 
 ## Implementation notes
 
+- Process reading (`procs.py`): Linux and WSL parse `/proc/<pid>/stat` after the last `)` (the command name may contain anything); a state of `Z`, `X` or `x` is a zombie. Before reading, `open` confirms through the gateway that the server socket's `SO_PEERCRED` PID equals `#{pid}`: tmux reports PIDs in the server's PID namespace, `/proc` is in termctl's, and an unrelated pid/parent pair in termctl's namespace could otherwise pass the parent check. A check that cannot be made, or does not match (0 when the server is not visible), records nothing; `close --force` repeats it before signaling (#23). macOS runs `/bin/ps -o ppid= -o stat= -o lstart= -p <pid>` with `LC_ALL=C` and `TZ=UTC0` and converts `lstart` to seconds since the epoch; that path is not run in CI (manual macOS checklist, plan stage 4). The PID options are written by a second invocation, after the parent check, guarded by the pane being managed, not dead and still running that PID, both options in one invocation so a reader never sees one without the other.
 - Signaling (`procs.py`): on Linux termctl opens a `pidfd_open` handle on the recorded PID before `kill-pane`, verifies the start time, and signals through `pidfd_send_signal`, so a PID reused after the handle was opened is never signaled. A zombie counts as exited.
 - BEL (`bell` marker, `gateway.py`): the pane's tty is opened with `O_WRONLY|O_NOCTTY|O_NONBLOCK` and must be a character device; anything else is not written to.
 

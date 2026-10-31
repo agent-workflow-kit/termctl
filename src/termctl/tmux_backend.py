@@ -41,7 +41,7 @@ import shlex
 import subprocess
 from collections.abc import Callable, Collection, Mapping, Sequence
 from dataclasses import dataclass, field
-from typing import Literal, Self
+from typing import Literal, NamedTuple, Self
 
 from .errors import TermctlError
 from .gateway import Gateway
@@ -1091,10 +1091,8 @@ def tag_pane(
     """The tagging invocation of Open order step 6, guarded by ``untagged_in_window``: the
     pane options ``options`` (each written with ``set -p``, an empty value as ``''``), the
     window options ``automatic-rename off`` and ``allow-rename off``, the pane option
-    ``remain-on-exit``, then, with argv, ``respawn-pane -k`` with the real command.
-
-    TODO(#16): the query of step 7 (``display -p '#{pane_pid} #{pane_dead} #{pid}'``) ends
-    this invocation.
+    ``remain-on-exit``, then, with argv, ``respawn-pane -k`` with the real command, and last
+    the query of step 7 (``PROCESS_QUERY``; ``parse_process_query`` reads its output).
     """
     if remain_on_exit not in ("off", "failed", "on"):
         raise ValueError(f"invalid remain-on-exit value: {remain_on_exit!r}")
@@ -1110,7 +1108,68 @@ def tag_pane(
     )
     if respawn is not None:
         inner.append(_respawn(target, respawn))
+    inner.append(_process_query(target))
     return Invocation.of(guarded(target, untagged_in_window(window_id), *inner))
+
+
+# --- open: the process (interface.md "Open order" step 7) ---------------------------------------
+
+# The query of step 7: the pane's process, whether the pane is dead, and the server's PID.
+PROCESS_QUERY = fields("pane_pid", "pane_dead", "pid")
+# What PROCESS_QUERY prints: PIDs in the @termctl_pid grammar (interface.md "Pane options").
+_PROCESS_QUERY = re.compile(r"([1-9][0-9]{0,9}) ([01]) ([1-9][0-9]{0,9})\n?")
+_PID = re.compile(r"[1-9][0-9]{0,9}")
+_PID_START = re.compile(r"[0-9]{1,20}")
+
+
+class ProcessQuery(NamedTuple):
+    """What the query of step 7 reported: the pane's PID, whether the pane is dead, and the
+    tmux server's PID."""
+
+    pane_pid: int
+    dead: bool
+    server_pid: int
+
+
+def _process_query(target: Target) -> Command:
+    return command("display").flag("-p").target(target).format_arg(PROCESS_QUERY).build()
+
+
+def parse_process_query(stdout: str) -> ProcessQuery | None:
+    """The query's answer, or None for anything but exactly one such line: the query failed
+    (``display`` of a missing pane prints empty fields, spike E6; anything else that printed
+    is not trusted)."""
+    match = _PROCESS_QUERY.fullmatch(stdout)
+    if match is None:
+        return None
+    return ProcessQuery(int(match.group(1)), match.group(2) == "1", int(match.group(3)))
+
+
+def owned_process(termctl_id: str, pid: str) -> Format:
+    """``owned`` plus: the pane is not dead and still runs ``pid`` (the PID recording guard of
+    Open order step 7)."""
+    _fullmatch(_TERMCTL_ID, termctl_id, "termctl id")
+    _fullmatch(_PID, pid, "PID")
+    return all_of(
+        owned(termctl_id),
+        _format(_eq("#{pane_dead}", "0")),
+        _format(_eq("#{pane_pid}", pid)),
+    )
+
+
+def record_process(pane_id: str, termctl_id: str, pid: str, start: str) -> Invocation:
+    """Write ``@termctl_pid`` and ``@termctl_pid_start`` together, in one guarded invocation,
+    so no reader ever sees one without the other (#11), guarded by ``owned_process``."""
+    _fullmatch(_PID_START, start, "process start time")
+    target = pane(pane_id)
+    return Invocation.of(
+        guarded(
+            target,
+            owned_process(termctl_id, pid),
+            command("set").flag("-p").target(target).arg("@termctl_pid").arg(pid).build(),
+            command("set").flag("-p").target(target).arg("@termctl_pid_start").arg(start).build(),
+        )
+    )
 
 
 def cleanup_kill(pane_id: str, window_id: str) -> Invocation:

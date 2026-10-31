@@ -5,6 +5,7 @@ import os
 import pwd
 import selectors
 import signal
+import socket
 import stat
 import subprocess
 import sys
@@ -797,3 +798,17 @@ def test_system_gateway_make_dir_refuses_an_existing_path(tmp_path: Path) -> Non
 def test_system_gateway_make_dir_never_creates_parents(tmp_path: Path) -> None:
     with pytest.raises(FileNotFoundError):
         SystemGateway().make_dir(str(tmp_path / "a" / "b"), 0o700)
+
+
+@pytest.mark.skipif(sys.platform != "linux", reason="SO_PEERCRED is Linux-only")
+def test_system_gateway_socket_peer_pid(tmp_path: Path) -> None:
+    path = str(tmp_path / "sock")
+    with socket.socket(socket.AF_UNIX, socket.SOCK_STREAM) as server:
+        server.bind(path)
+        server.listen(1)
+        assert SystemGateway().socket_peer_pid(path) == os.getpid()
+
+
+def test_system_gateway_socket_peer_pid_without_a_listener(tmp_path: Path) -> None:
+    with pytest.raises(OSError):
+        SystemGateway().socket_peer_pid(str(tmp_path / "missing"))

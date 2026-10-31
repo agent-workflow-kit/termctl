@@ -15,9 +15,11 @@ failure to write raises ``StateDirError``; what a command does about it is the c
 decision.
 """
 
-# TODO(#17): open is the first caller; it decides what a write failure does (the action has
-# already happened by then) and #19-#24 follow it. Each command builds its record with the
-# builders below and appends it with the CLI context's environ and clock.
+# open's tag_failed record (cli._log_open_error) is the first caller. interface.md "Audit and
+# log" ("Records"): a record that cannot be written produces a warning and does not change the
+# exit code.
+# TODO(#17): open's other records follow that rule, and #19-#24 too. Each command builds its
+# record with the builders below and appends it with the CLI context's environ and clock.
 
 from __future__ import annotations
 

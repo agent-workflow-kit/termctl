@@ -13,6 +13,7 @@ from termctl import cli
 from termctl.cli import Context, Result, main
 from termctl.hooks import Hook
 
+from .conftest import private_environ
 from .fakes import FakeClock, FakeGateway
 from .schemas import validate
 
@@ -29,7 +30,7 @@ def run(argv: list[str], gateway: FakeGateway | None = None) -> tuple[int, str, 
         argv,
         gateway=gateway or FakeGateway(dirs=DIRS),
         clock=FakeClock(),
-        environ={},
+        environ=private_environ({}),
         stdout=stdout,
         stderr=stderr,
     )

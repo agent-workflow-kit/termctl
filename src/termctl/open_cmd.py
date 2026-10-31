@@ -14,8 +14,8 @@ from collections.abc import Callable, Iterable, Mapping, Sequence
 from dataclasses import dataclass
 from datetime import UTC, datetime
 
+from . import procs, tmux_socket, validate
 from . import tmux_backend as tb
-from . import tmux_socket, validate
 from .backend import Backend, Created, NoServerTagFailure, SessionState
 from .errors import TermctlError, UsageError
 from .gateway import Gateway
@@ -166,8 +166,8 @@ class Plan:
     def options(self, termctl_id: str, created: Created, created_at: str) -> list[tuple[str, str]]:
         """The pane options of step 6 (interface.md "Pane options"), the ownership marker
         ``@termctl_pane`` last, so a chain that stops early never leaves a managed pane with
-        some options missing. No marker yet; the PID options stay empty (TODO(#16) records
-        the process)."""
+        some options missing. No marker yet; the PID options stay empty until step 7 records
+        the process (``record``)."""
         return [
             ("@termctl_v", SCHEMA_VERSION),
             ("@termctl_window", created.window_id),
@@ -319,9 +319,10 @@ def tag(
     plan: Plan,
     created_at: str,
     warn: Callable[[str], None],
-) -> None:
+) -> tb.ProcessQuery | None:
     """Open order step 6: tag the pane step 5 created and, with argv, respawn it with the real
-    command, in one guarded invocation.
+    command, in one guarded invocation that ends with the query of step 7, whose answer this
+    returns (None when the query failed).
 
     If tmux fails or the guard does not match, the pane is killed by its exact id, guarded by
     its being in the window step 5 reported with an empty or its own ``@termctl_pane``, and
@@ -329,11 +330,11 @@ def tag(
     a no-server result is never followed by a connect without the socket checks. When the
     cleanup kill does not run (its guard did not match, a forged ``@termctl_pane`` say, or
     it failed with anything but tmux reporting the pane gone), ``warn`` names the window
-    that may be left behind (interface.md "Residual risks", forged options).
-    TODO(#16): the ``tag_failed`` log record (``result: error``) and the step 7 query.
+    that may be left behind (interface.md "Residual risks", forged options). The caller logs
+    the ``tag_failed`` record (``result: error``) and runs no ``post-open`` hook.
     """
     try:
-        backend.tag_pane(
+        return backend.tag_pane(
             created,
             plan.options(termctl_id, created, created_at),
             REMAIN_ON_EXIT[plan.keep_on_exit],
@@ -351,3 +352,59 @@ def tag(
             raise
         message = f"tagging pane {created.pane_id} failed: {err.message}"
         raise TermctlError("tag_failed", message) from None
+
+
+# --- step 7: the process ------------------------------------------------------------------------
+
+
+def record(
+    backend: Backend,
+    gateway: Gateway,
+    socket_path: str,
+    created: Created,
+    termctl_id: str,
+    query: tb.ProcessQuery | None,
+    warn: Callable[[str], None],
+) -> bool:
+    """Open order step 7: record the pane's process in ``@termctl_pid`` and
+    ``@termctl_pid_start``, only if the query of step 6's invocation answered, the pane was not
+    dead, on Linux the server at ``socket_path`` is the queried server as termctl's PID
+    namespace sees it, and the process is alive (not a zombie) with the tmux server as its
+    parent, so the PID cannot belong to an unrelated process (spike E6). Whether it was
+    recorded.
+
+    Otherwise both options stay empty (``pid: null``). Nothing here undoes the open: a server
+    or process that cannot be checked, or a recording that tmux fails, only warns. A server
+    that is not the queried one (another PID namespace) and a recording guard that no longer
+    matches (the pane died, closed or changed meanwhile) record nothing, silently: the read for
+    the output reports the pane's state.
+    """
+    if query is None or query.dead:
+        return False
+    if gateway.platform() != "darwin":
+        # #{pid} and #{pane_pid} are in the server's PID namespace, /proc in termctl's: the
+        # server's PID as the kernel shows it to termctl must be #{pid} (macOS has no PID
+        # namespaces). TODO(#23): close --force repeats this check before signaling.
+        try:
+            peer = gateway.socket_peer_pid(socket_path)
+        except OSError as err:
+            warn(
+                f"could not check the server of pane {created.pane_id}: "
+                f"{err.strerror or err}; its PID is not recorded"
+            )
+            return False
+        if peer != query.server_pid:
+            return False
+    try:
+        process = procs.read(gateway, query.pane_pid)
+    except procs.ProcessError as err:
+        warn(
+            f"could not check the process of pane {created.pane_id}: {err}; its PID is not recorded"
+        )
+        return False
+    if process is None or process.zombie or process.ppid != query.server_pid:
+        return False
+    outcome = backend.record_process(created, termctl_id, query.pane_pid, process.start)
+    if outcome is tb.GuardOutcome.FAILED:
+        warn(f"could not record the PID of pane {created.pane_id}")
+    return outcome is tb.GuardOutcome.MATCHED
