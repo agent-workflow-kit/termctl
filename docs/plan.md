@@ -91,7 +91,7 @@ Status: planned, 2026-10-30. Implements [interface.md](interface.md) (normative)
 - hooks: pre-open payload fields (env names only), veto/escalate/override, decision ids in output, log and audit (override runs).
 - `--dry-run`: read-only tmux queries only, tmux checks, `%NEW`/`@NEW` tokens, no hooks, nothing created.
 
-Interim state: the CLI `open` runs every step: pre-open hooks, creation, PID recording, the read for its output, focus (#24), post-open hooks, and the log and audit records. `open --dry-run` still refuses (exit 1, `internal`) until #18.
+Interim state: the CLI `open` runs every step: pre-open hooks, creation, PID recording, the read for its output, focus (#24), post-open hooks, and the log and audit records. `open --dry-run` stops after step 3 and reports the plan with `%NEW`/`@NEW` tokens (#18).
 
 **Status**: Not Started
 

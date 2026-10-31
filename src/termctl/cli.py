@@ -33,7 +33,7 @@ from . import (
 )
 from . import config as config_module
 from .argv import Scan, scan
-from .backend import Backend, Created, TmuxBackend
+from .backend import Backend, Created, SessionState, TmuxBackend
 from .config import Config
 from .errors import TermctlError, UsageError
 from .gateway import (
@@ -45,7 +45,7 @@ from .gateway import (
     Terminated,
     stop_signals,
 )
-from .output import PROG, Output, Result, flush_standard_streams
+from .output import PROG, Output, Result, escape, flush_standard_streams
 from .pane_change import Change, Outcome, change_pane, preview_change
 from .panes import ManagedPane, PaneRead
 from .statedir import StateDirError
@@ -739,10 +739,7 @@ def open_pane(args: argparse.Namespace, ctx: Context) -> Result:
     """Steps 4 on of the open order (steps 1 to 3 ran in ``dispatch``)."""
     assert ctx.selection is not None and ctx.server is not None and ctx.window is not None
     if args.dry_run:
-        # TODO(#18): the dry run stops after step 3 and prints what a real run would do: its
-        # placement, matched_rule, session and target are in ctx.selection, its id in
-        # ctx.open_id, the window in ctx.window.
-        raise TermctlError("internal", f"{PROG} open --dry-run is not implemented yet")
+        return _dry_run_open(args, ctx)
     assert ctx.plan is not None and ctx.open_id is not None and ctx.signals is not None
     run_pre_open_hooks(args, ctx)
     # Steps 5 to 8 run with stop signals deferred: a signal there is raised only once the
@@ -769,6 +766,57 @@ def open_pane(args: argparse.Namespace, ctx: Context) -> Result:
     ctx.signals.finish()
     ctx.log(_open_record(args, ctx, result="ok", exit_code=0))
     return result
+
+
+def _dry_run_open(args: argparse.Namespace, ctx: Context) -> Result:
+    """``open --dry-run``: stops after step 3 and reports what a real run would do, having
+    run only read-only tmux queries: the step-3 ones and, with a server, one ``has-session``
+    for ``session_exists``. No hooks, no log or audit record, nothing created (interface.md
+    ``open``, "Dry runs")."""
+    assert ctx.plan is not None and ctx.selection is not None and ctx.open_id is not None
+    assert ctx.server is not None and ctx.tmux is not None
+    plan, session = ctx.plan, ctx.selection.session
+    state = SessionState.NO_SERVER
+    if read_panes(ctx).server_running:
+        backend = connect(ctx)
+        if backend is not None:
+            state = backend.session_state(session)
+    commands = open_cmd.dry_run_commands(
+        session,
+        plan,
+        ctx.open_id,
+        open_cmd.timestamp(ctx.clock.now()),
+        state,
+        server_env(ctx),
+        ctx.tmux.path,
+        ctx.server.socket_path,
+    )
+    data = {
+        "dry_run": True,
+        "id": ctx.open_id,
+        "name": plan.name,
+        "socket_path": ctx.server.socket_path,
+        "tmux_version": ctx.tmux.version_text,
+        "placement": ctx.selection.name,
+        "matched_rule": ctx.selection.rule,
+        "session": session,
+        "session_exists": None if state is SessionState.NO_SERVER else state is SessionState.EXISTS,
+        "target": ctx.selection.target,
+        "cwd": plan.cwd,
+        "argv": list(plan.argv),
+        "env_names": [name for name, _ in plan.env],
+        "labels": list(plan.labels),
+        "keep_on_exit": plan.keep_on_exit,
+        "focus": bool(args.focus),
+        "actor": resolve_actor(args, ctx),
+        "decision_ids": list(args.decision_ids),
+        "override_escalation": bool(args.override_escalation),
+        "tmux_commands": commands,
+    }
+    # One line per command: each is escaped as a whole, so a line break inside an argument
+    # (a filtered environment value in set-environment) prints as \x0a (interface.md "Human
+    # output").
+    return Result(data, "\n".join(escape(shlex.join(argv)) for argv in commands))
 
 
 def resolve_actor(args: argparse.Namespace, ctx: Context) -> str:
