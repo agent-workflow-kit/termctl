@@ -70,6 +70,10 @@ class SystemGateway:
 
         ``env`` replaces the whole environment when given; ``None`` inherits termctl's own.
         """
+        # TODO(#11): text mode turns "\r\n" and "\r" in the output into "\n" and decodes it
+        # strictly in the locale's encoding (raising on undecodable bytes); the pane reader,
+        # the first parser of tmux's text output, must read output that can hold a raw "\r"
+        # or such bytes in bytes mode or with an explicit decoding.
         return subprocess.run(
             argv,
             input=stdin,
