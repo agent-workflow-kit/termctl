@@ -14,24 +14,6 @@ from typing import Any
 from termctl import panes as panes_module
 from termctl.gateway import BoundedOutput, FileInfo, GroupRun
 
-# The tmux binary the fakes know about by default, found on ``PATH=/usr/bin``.
-TMUX = "/usr/bin/tmux"
-
-# A scripted result: text for ``run``; text or bytes for ``run_bounded``.
-Response = subprocess.CompletedProcess[Any] | BaseException
-
-
-def completed(
-    stdout: str | bytes = "", *, stderr: str | bytes = "", returncode: int = 0
-) -> subprocess.CompletedProcess[Any]:
-    """A scripted result of one ``run`` or ``run_bounded`` call."""
-    return subprocess.CompletedProcess([], returncode, stdout, stderr)
-
-
-def _as_bytes(output: str | bytes) -> bytes:
-    return output.encode() if isinstance(output, str) else output
-
-
 UID = 1000
 
 # One managed pane as ``list-panes`` prints it for the pane reader's format (``panes.FIELDS``):
@@ -117,6 +99,24 @@ def safe_default_server(uid: int = UID, tmpdir: str = "/tmp") -> dict[str, FileI
     return files
 
 
+# The tmux binary the fakes know about by default, found on ``PATH=/usr/bin``.
+TMUX = "/usr/bin/tmux"
+
+# A scripted result: text for ``run``; text or bytes for ``run_bounded``.
+Response = subprocess.CompletedProcess[Any] | BaseException
+
+
+def completed(
+    stdout: str | bytes = "", *, stderr: str | bytes = "", returncode: int = 0
+) -> subprocess.CompletedProcess[Any]:
+    """A scripted result of one ``run`` or ``run_bounded`` call."""
+    return subprocess.CompletedProcess([], returncode, stdout, stderr)
+
+
+def _as_bytes(output: str | bytes) -> bytes:
+    return output.encode() if isinstance(output, str) else output
+
+
 @dataclass
 class GroupCall:
     """One ``run_group`` or ``spawn_watched`` call as the fake saw it."""
@@ -163,10 +163,10 @@ class FakeGateway:
         dirs: set[str] | None = None,
         tty: bool = False,
         user: str | None = "user",
+        executables: set[str] | None = None,
         uid: int = UID,
         files: Mapping[str, FileInfo] | None = None,
         links: Mapping[str, str] | None = None,
-        executables: set[str] | None = None,
         panes: Sequence[Mapping[str, str]] | None = None,
         list_panes: Response | None = None,
         mkdir_error: OSError | None = None,
@@ -194,7 +194,14 @@ class FakeGateway:
         self.executable_checks: list[str] = []
         self.calls: list[list[str]] = []
         # The ``env`` argument of each call, in the order of ``calls``.
-        self.envs: list[Mapping[str, str] | None] = []
+        self.envs: list[dict[str, str] | None] = []
+        self.uid = uid
+        # A fake filesystem for lstat and real_path: absolute normalized paths to their
+        # FileInfo, and symlinks to their targets (a link's owner is the uid unless ``files``
+        # has a ``symlink`` entry for it). By default a safe default server exists.
+        self.files = dict(safe_default_server(uid) if files is None else files)
+        self.links = dict(links or {})
+        self.lstats: list[str] = []
         self.cwd = cwd
         # By default only the caller's current directory exists.
         if dirs is None:
@@ -203,13 +210,6 @@ class FakeGateway:
         self.tty = tty
         self.user = user
         self.dir_checks: list[str] = []
-        self.uid = uid
-        # A fake filesystem for lstat and real_path: absolute normalized paths to their
-        # FileInfo, and symlinks to their targets (a link's owner is the uid unless ``files``
-        # has a ``symlink`` entry for it). By default a safe default server exists.
-        self.files = dict(safe_default_server(uid) if files is None else files)
-        self.links = dict(links or {})
-        self.lstats: list[str] = []
         # ``make_dir`` calls as (path, mode); ``mkdir_error`` is raised by the next one, and
         # ``appears`` (paths with their lstat) is added to ``files`` just before it, as another
         # process creating them meanwhile would.
@@ -333,12 +333,6 @@ class FakeGateway:
         self.executable_checks.append(path)
         return path in self.executables
 
-    def stdin_isatty(self) -> bool:
-        return self.tty
-
-    def user_name(self) -> str | None:
-        return self.user
-
     def real_uid(self) -> int:
         return self.uid
 
@@ -414,6 +408,12 @@ class FakeGateway:
             elif current not in self.files:
                 raise FileNotFoundError(errno.ENOENT, os.strerror(errno.ENOENT), current)
         return current
+
+    def stdin_isatty(self) -> bool:
+        return self.tty
+
+    def user_name(self) -> str | None:
+        return self.user
 
 
 class FakeClock:

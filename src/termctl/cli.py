@@ -62,6 +62,8 @@ class Context:
     # Set by step 2 (the resolved server) and step 3 (False when there is no server).
     server: tmux_socket.Server | None = None
     socket_present: bool | None = None
+    # `open`'s resolved placement (Open order step 2); None for other commands.
+    selection: placement.Selection | None = None
     # `tmux_bin` resolved to an absolute path, once: by `open`'s resolve step or the tmux checks.
     tmux_path: str | None = None
     # The resolved tmux binary and version, set by the tmux checks (step 3) after `tmux -V`.
@@ -443,7 +445,7 @@ def check_args(args: argparse.Namespace, ctx: Context) -> None:
     config (a marker or placement being defined) or the pane list (the label limit of
     ``label add``) belong to later steps. Some step-1 checks are not here yet (see the TODO).
     """
-    # TODO(#23): remaining step-1 usage check: the `close --force` gate.
+    # TODO: remaining step-1 usage checks, owned by later issues: the `close --force` gate (#23).
     if args.socket is not None:
         validate.check_socket_flag(args.socket)
     command = args.command
@@ -940,12 +942,12 @@ COMMAND_STEPS = {"show": show, "exists": exists, "list": list_panes, "open": ope
 
 def run_command(args: argparse.Namespace, ctx: Context) -> Result:
     """Step 5: the command's own steps."""
-    step = COMMAND_STEPS.get(args.command)
-    if step is not None:
-        return step(args, ctx)
     if args.command == "placements":
         labels = validate.parse_labels(args.labels) if args.labels else None
         return placement.report(ctx.config, labels)
+    step = COMMAND_STEPS.get(args.command)
+    if step is not None:
+        return step(args, ctx)
     # TODO: each remaining command lands in its own issue (#19-#24).
     raise TermctlError("internal", f"{PROG} {args.command} is not implemented yet")
 

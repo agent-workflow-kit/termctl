@@ -261,7 +261,6 @@ def test_flag_hooks_are_parsed_in_step_1(monkeypatch: pytest.MonkeyPatch) -> Non
         "load_config",
         "resolve_server",
         "resolve_tmux_bin",
-        "resolve_placement",
         "resolve_command",
         "check_tmux",
         "check_id_collision",
