@@ -23,6 +23,7 @@ from datetime import UTC, datetime
 from types import FrameType
 from typing import Any, NamedTuple, Protocol
 
+from . import hookwatch
 from .hookwatch import kill_unreaped
 
 _CHUNK = 65536
@@ -33,7 +34,9 @@ LEADER_EXIT_GRACE_S = 1.0
 _EXIT_POLL_S = 0.05
 # How long a killed program may take to be reaped before GroupNotStopped.
 STOP_WAIT_S = 5.0
-WATCHDOG_MODULE = "termctl.hookwatch"
+# The watchdog runs by file path, so it works where the interpreter cannot import termctl (a
+# user-site install, PYTHONPATH); it imports only the standard library.
+WATCHDOG_PATH = os.path.abspath(hookwatch.__file__)
 
 
 class Terminated(BaseException):
@@ -118,7 +121,8 @@ class Gateway(Protocol):
     def spawn_watched(
         self, argv: list[str], *, stdin: bytes, env: Mapping[str, str], timeout: float
     ) -> int:
-        """Start ``argv`` detached under a watchdog (``termctl.hookwatch``) in a new session,
+        """Start ``argv`` detached under a watchdog (``hookwatch.py``, run by its file path) in a
+        new session,
         with exactly ``env``, ``stdin`` as its input and no output, and return the watchdog's
         PID (also its process group and session id) without waiting. The watchdog runs
         ``argv`` in a process group of its own and kills that group after ``timeout`` seconds.
@@ -187,8 +191,8 @@ class SystemGateway:
         stdout_limit: int,
         stderr_limit: int,
     ) -> GroupRun:
-        with _hook_signals():
-            return _run_group(argv, stdin, env, timeout, stdout_limit, stderr_limit)
+        with _hook_signals() as stops:
+            return _run_group(argv, stdin, env, timeout, stdout_limit, stderr_limit, stops)
 
     def spawn_watched(
         self, argv: list[str], *, stdin: bytes, env: Mapping[str, str], timeout: float
@@ -201,7 +205,7 @@ class SystemGateway:
             data.write(stdin)
             data.seek(0)
             proc = subprocess.Popen(
-                [sys.executable, "-I", "-m", WATCHDOG_MODULE, str(timeout), *argv],
+                [sys.executable, "-I", WATCHDOG_PATH, str(timeout), *argv],
                 stdin=data,
                 stdout=subprocess.DEVNULL,
                 stderr=subprocess.DEVNULL,
@@ -251,30 +255,57 @@ def _default_sigchld() -> None:
         signal.signal(signal.SIGCHLD, signal.SIG_DFL)
 
 
-@contextmanager
-def _hook_signals() -> Iterator[None]:
-    """While a hook runs: ``SIGCHLD`` at its default, and ``SIGTERM`` and ``SIGHUP`` (unless
-    ignored or handled already) raise ``Terminated``, so the hook's group is killed before
-    termctl exits. The previous handlers are restored afterwards."""
-    if threading.current_thread() is not threading.main_thread():
-        yield
-        return
-    _default_sigchld()
-    raised = False
+class _StopSignals:
+    """The handler ``_hook_signals`` installs for SIGTERM and SIGHUP: the first signal raises
+    ``Terminated``, unless it is held, in which case ``release`` raises it.
 
-    def terminate(signum: int, frame: FrameType | None) -> None:
+    Held while the hook starts, so the signal cannot come between the fork and the moment the
+    caller has the process to kill. Not blocked with ``pthread_sigmask``: the hook would inherit
+    the blocked mask.
+    """
+
+    def __init__(self) -> None:
+        self._raised = False
+        self._held = False
+        self._pending: int | None = None
+
+    def handle(self, signum: int, frame: FrameType | None) -> None:
         # Only the first signal raises, so a second one cannot interrupt the cleanup.
-        nonlocal raised
-        if not raised:
-            raised = True
+        if self._raised:
+            return
+        self._raised = True
+        if self._held:
+            self._pending = signum
+            return
+        raise Terminated(signum)
+
+    def hold(self) -> None:
+        self._held = True
+
+    def release(self) -> None:
+        """Stop holding; raise ``Terminated`` for a signal that came while held."""
+        self._held = False
+        if self._pending is not None:
+            signum, self._pending = self._pending, None
             raise Terminated(signum)
 
+
+@contextmanager
+def _hook_signals() -> Iterator[_StopSignals]:
+    """While a hook runs: ``SIGCHLD`` at its default, and ``SIGTERM`` and ``SIGHUP`` (unless
+    ignored or handled already) raise ``Terminated`` (see ``_StopSignals``), so the hook's group
+    is killed before termctl exits. The previous handlers are restored afterwards."""
+    stops = _StopSignals()
+    if threading.current_thread() is not threading.main_thread():
+        yield stops
+        return
+    _default_sigchld()
     previous: dict[int, Any] = {}
     for signum in (signal.SIGTERM, signal.SIGHUP):
         if signal.getsignal(signum) == signal.SIG_DFL:
-            previous[signum] = signal.signal(signum, terminate)
+            previous[signum] = signal.signal(signum, stops.handle)
     try:
-        yield
+        yield stops
     finally:
         for signum, handler in previous.items():
             signal.signal(signum, handler)
@@ -287,20 +318,28 @@ def _run_group(
     timeout: float,
     stdout_limit: int,
     stderr_limit: int,
+    stops: _StopSignals,
 ) -> GroupRun:
     deadline = time.monotonic() + timeout
-    proc = subprocess.Popen(
-        argv,
-        stdin=subprocess.PIPE,
-        stdout=subprocess.PIPE,
-        stderr=subprocess.PIPE,
-        env=dict(env),
-        process_group=0,  # setpgid(0, 0) in the child: the group id is proc.pid
-    )
+    # A stop signal before proc is assigned would leave the group with nobody to kill it.
+    stops.hold()
+    try:
+        proc = subprocess.Popen(
+            argv,
+            stdin=subprocess.PIPE,
+            stdout=subprocess.PIPE,
+            stderr=subprocess.PIPE,
+            env=dict(env),
+            process_group=0,  # setpgid(0, 0) in the child: the group id is proc.pid
+        )
+    except BaseException:
+        stops.release()  # a stop signal that came meanwhile is what the caller must see
+        raise
     out = _Capture(stdout_limit)
     err = _Capture(stderr_limit)
     leader = _LeaderExit(proc.pid)
     try:
+        stops.release()
         finished = _exchange(proc, stdin, out, err, deadline, leader)
         if finished:
             try:
@@ -338,19 +377,28 @@ class _LeaderExit:
     group it leads) stays reserved until the caller reaps it.
 
     ``os.waitid`` with ``WNOWAIT`` where Python has it (Linux, and macOS from Python 3.13);
-    else a kqueue ``NOTE_EXIT`` filter (macOS before Python 3.13). Where neither works,
-    ``available`` is False and the exit is only seen when the streams close.
+    else a kqueue ``NOTE_EXIT`` filter (macOS before Python 3.13). Where neither works, or
+    setting it up fails, ``available`` is False and the exit is only seen when the streams
+    close. Never raises.
     """
 
     def __init__(self, pid: int) -> None:
         self._pid = pid
         self._exited = False
         self._kqueue: Any = None
+        self.available = False
+        try:
+            self._watch()
+        except OSError:
+            self.close()
+            self.available = False
+
+    def _watch(self) -> None:
         self.available = hasattr(os, "waitid") and hasattr(os, "WNOWAIT")
         if not self.available and sys.platform == "darwin":  # pragma: no cover - macOS only
             self._kqueue = select.kqueue()
             event = select.kevent(
-                pid,
+                self._pid,
                 filter=select.KQ_FILTER_PROC,
                 flags=select.KQ_EV_ADD | select.KQ_EV_ONESHOT,
                 fflags=select.KQ_NOTE_EXIT,
@@ -360,8 +408,6 @@ class _LeaderExit:
                 self.available = True
             except ProcessLookupError:  # already a zombie
                 self._exited = self.available = True
-            except OSError:
-                self.close()
 
     def exited(self) -> bool:
         if self._exited or not self.available:

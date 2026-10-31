@@ -1,17 +1,19 @@
 """The watchdog of an async post-hook (interface.md "Hooks").
 
-``Gateway.spawn_watched`` starts this module detached, in a session of its own, as
-``python -I -m termctl.hookwatch TIMEOUT ARGV...``, with the hook's payload on stdin, its output
-discarded and exactly the hook's environment. ``-I`` keeps the caller's current directory and
-``PYTHON*`` variables from choosing the code that runs here; the installed package (an editable
-install included) is still found through the interpreter's own site-packages.
+``Gateway.spawn_watched`` starts this file detached, in a session of its own, by its absolute
+path as ``python -I /path/to/hookwatch.py TIMEOUT ARGV...``, with the hook's payload on stdin,
+its output discarded and exactly the hook's environment. ``-I`` keeps the caller's current
+directory and ``PYTHON*`` variables from choosing the code that runs here; running by path means
+the interpreter need not be able to import termctl (a user-site install, PYTHONPATH). So this
+file imports only the standard library, never termctl.
 
 The watchdog starts ARGV in a new process group, hands its own stdin over unread and waits at
 most TIMEOUT seconds. On timeout, or when it gets SIGTERM, SIGHUP or SIGINT itself, it sends
 SIGKILL to the hook's process group and to the hook's leader while the leader is still
 unreaped (until then the leader's PID, the group's id, cannot be reused), then reaps the leader
-and exits. A hook that exits in time is not touched further: what it left in its group keeps
-running. Kept minimal: it imports nothing else from termctl.
+and exits. A stop signal that comes while the hook starts takes effect once the watchdog has the
+hook's process, so the hook is killed then. A hook that exits in time is not touched further:
+what it left in its group keeps running.
 """
 
 from __future__ import annotations
@@ -48,13 +50,30 @@ class _Stop(BaseException):
 
 
 _stopping = False
+# While the hook starts, a stop signal is held (not raised) until _release. Not blocked with
+# pthread_sigmask: the hook would inherit the blocked mask.
+_held = False
+_pending = False
 
 
 def _stop(signum: int, frame: FrameType | None) -> None:
     # Only the first stop signal raises, so a second one cannot interrupt the cleanup.
-    global _stopping
-    if not _stopping:
-        _stopping = True
+    global _stopping, _pending
+    if _stopping:
+        return
+    _stopping = True
+    if _held:
+        _pending = True
+        return
+    raise _Stop
+
+
+def _release() -> None:
+    """Stop holding stop signals; raise ``_Stop`` for one that came while held."""
+    global _held, _pending
+    _held = False
+    if _pending:
+        _pending = False
         raise _Stop
 
 
@@ -70,6 +89,8 @@ def main(argv: list[str]) -> int:
     # An inherited SIG_IGN would let the kernel reap the hook, so its PID could be reused
     # before the group is signaled.
     signal.signal(signal.SIGCHLD, signal.SIG_DFL)
+    global _held
+    _held = True
     for signum in _STOP_SIGNALS:
         signal.signal(signum, _stop)
     try:
@@ -80,11 +101,10 @@ def main(argv: list[str]) -> int:
             stderr=subprocess.DEVNULL,
             process_group=0,
         )
-    except _Stop:
-        return 1
     except (OSError, ValueError):
-        return 127
+        return 127  # nothing started, so nothing to kill, stopped or not
     try:
+        _release()
         proc.wait(timeout)
         return 0
     except (subprocess.TimeoutExpired, _Stop):

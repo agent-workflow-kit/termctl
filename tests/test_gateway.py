@@ -22,6 +22,7 @@ from termctl.gateway import (
     GroupRun,
     SystemClock,
     SystemGateway,
+    Terminated,
 )
 
 from .fakes import FakeClock, FakeGateway
@@ -274,6 +275,77 @@ def test_run_group_kills_the_group_when_interrupted(monkeypatch: pytest.MonkeyPa
     assert group_is_gone(seen[0])
 
 
+def _send_term_after(monkeypatch: pytest.MonkeyPatch, *, fail: bool = False) -> list[int]:
+    """Make the next ``subprocess.Popen`` send this process SIGTERM right after it starts the
+    program (or, with ``fail``, instead of starting it); return the started PIDs."""
+    seen: list[int] = []
+    real_popen = subprocess.Popen
+
+    def popen(*args: Any, **kwargs: Any) -> Any:
+        monkeypatch.setattr(subprocess, "Popen", real_popen)  # only the first call
+        # Only with termctl's handler installed: SIGTERM must not reach the test runner itself.
+        assert signal.getsignal(signal.SIGTERM) not in (signal.SIG_DFL, signal.SIG_IGN)
+        if fail:
+            os.kill(os.getpid(), signal.SIGTERM)
+            raise FileNotFoundError(2, "No such file or directory")
+        proc = real_popen(*args, **kwargs)
+        seen.append(proc.pid)
+        os.kill(os.getpid(), signal.SIGTERM)  # this process: exact, and handled
+        return proc
+
+    monkeypatch.setattr(subprocess, "Popen", popen)
+    return seen
+
+
+def test_run_group_kills_the_group_on_a_stop_signal_while_it_starts(
+    monkeypatch: pytest.MonkeyPatch,
+) -> None:
+    seen = _send_term_after(monkeypatch)
+    with pytest.raises(Terminated):
+        group("sleep 10", timeout=10)
+    assert group_is_gone(seen[0])
+
+
+def test_run_group_reports_a_stop_signal_that_came_while_it_failed_to_start(
+    monkeypatch: pytest.MonkeyPatch,
+) -> None:
+    _send_term_after(monkeypatch, fail=True)
+    with pytest.raises(Terminated):
+        group("exit 0")
+
+
+def test_run_group_without_a_leader_watch_still_reports_the_exit_status(
+    monkeypatch: pytest.MonkeyPatch,
+) -> None:
+    def unavailable(self: Any) -> None:
+        raise OSError(24, "Too many open files")
+
+    monkeypatch.setattr(gateway_module._LeaderExit, "_watch", unavailable)
+    assert group("exit 3").returncode == 3
+
+
+def test_run_group_without_a_leader_watch_still_kills_at_the_timeout(
+    monkeypatch: pytest.MonkeyPatch,
+) -> None:
+    def unavailable(self: Any) -> None:
+        raise OSError(24, "Too many open files")
+
+    monkeypatch.setattr(gateway_module._LeaderExit, "_watch", unavailable)
+    seen: list[int] = []
+    real_popen = subprocess.Popen
+
+    def popen(*args: Any, **kwargs: Any) -> Any:
+        monkeypatch.setattr(subprocess, "Popen", real_popen)  # only the first call
+        proc = real_popen(*args, **kwargs)
+        seen.append(proc.pid)
+        return proc
+
+    monkeypatch.setattr(subprocess, "Popen", popen)
+    run = group("sleep 10", timeout=0.3)
+    assert run.returncode is None
+    assert group_is_gone(seen[0])
+
+
 @pytest.mark.filterwarnings("ignore::ResourceWarning")
 def test_run_group_reports_a_group_it_cannot_stop(monkeypatch: pytest.MonkeyPatch) -> None:
     def refuse(pid: int, signum: int) -> None:
@@ -447,3 +519,76 @@ def test_spawn_watched_resets_an_ignored_sigchld(tmp_path: Path) -> None:
 def test_watchdog_rejects_bad_arguments(argv: list[str]) -> None:
     # Checked before the watchdog touches any signal handler, so this runs in-process.
     assert hookwatch.main(argv) == 2
+
+
+def test_spawn_watched_runs_the_watchdog_by_its_file_path(monkeypatch: pytest.MonkeyPatch) -> None:
+    calls: list[list[str]] = []
+
+    class Proc:
+        pid = 1234
+
+    def popen(argv: list[str], **kwargs: Any) -> Any:
+        calls.append(argv)
+        return Proc()
+
+    monkeypatch.setattr(subprocess, "Popen", popen)
+    assert SystemGateway().spawn_watched([SH, "-c", "true"], stdin=b"", env={}, timeout=5) == 1234
+    path = os.path.abspath(hookwatch.__file__)
+    assert calls == [[sys.executable, "-I", path, "5", SH, "-c", "true"]]
+
+
+@pytest.mark.filterwarnings("ignore::ResourceWarning")
+def test_spawn_watched_works_where_termctl_is_not_importable(
+    tmp_path: Path, monkeypatch: pytest.MonkeyPatch
+) -> None:
+    # The base interpreter of the test venv runs with -I, so it cannot import termctl (as with
+    # a user-site install or PYTHONPATH); the watchdog must still run.
+    base = getattr(sys, "_base_executable", sys.executable)
+    probe = subprocess.run([base, "-I", "-c", "import termctl"], capture_output=True, check=False)
+    if probe.returncode == 0:
+        pytest.skip("termctl is importable by the base interpreter")
+    monkeypatch.setattr(sys, "executable", base)
+    out = tmp_path / "out"
+    watchdog = watched(f"echo ran > '{out}.tmp'; mv '{out}.tmp' '{out}'")
+    assert read_when_ready(out) == "ran\n"
+    assert reap(watchdog)
+
+
+_WATCHDOG_STOPPED_WHILE_STARTING = """
+import os, signal, subprocess, sys
+sys.path.insert(0, os.path.dirname(sys.argv[1]))
+import hookwatch
+
+real_popen = subprocess.Popen
+
+def popen(*args, **kwargs):
+    proc = real_popen(*args, **kwargs)
+    with open(sys.argv[2] + ".tmp", "w") as f:
+        f.write(str(proc.pid))
+    os.rename(sys.argv[2] + ".tmp", sys.argv[2])
+    os.kill(os.getpid(), signal.SIGTERM)  # this process, with the watchdog's handler
+    return proc
+
+subprocess.Popen = popen
+sys.exit(hookwatch.main(["30", "/bin/sh", "-c", "sleep 10"]))
+"""
+
+
+def test_watchdog_kills_the_hook_on_a_stop_signal_while_it_starts(tmp_path: Path) -> None:
+    marker = tmp_path / "pid"
+    proc = subprocess.run(
+        [
+            sys.executable,
+            "-I",
+            "-c",
+            _WATCHDOG_STOPPED_WHILE_STARTING,
+            os.path.abspath(hookwatch.__file__),
+            str(marker),
+        ],
+        capture_output=True,
+        text=True,
+        timeout=30,
+        check=False,
+    )
+    assert proc.returncode == 1, proc.stderr
+    assert wait_gone(int(read_when_ready(marker)))
