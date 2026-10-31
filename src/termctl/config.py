@@ -222,20 +222,33 @@ def config_path(environ: Mapping[str, str], explicit: str | None) -> Path:
     entry's home, which must be absolute)."""
     if explicit is not None:
         return Path(explicit)
-    xdg = environ.get("XDG_CONFIG_HOME", "")
-    if xdg and os.path.isabs(xdg):
-        base = Path(xdg)
-    else:
-        home = environ.get("HOME", "")
-        if not os.path.isabs(home):
-            try:
-                home = pwd.getpwuid(os.getuid()).pw_dir
-            except KeyError:
-                raise ConfigError(_HOME_UNKNOWN) from None
-            if not os.path.isabs(home):
-                raise ConfigError(_HOME_UNKNOWN)
-        base = Path(home) / ".config"
+    base = xdg_base(environ, "XDG_CONFIG_HOME", ".config")
+    if base is None:
+        raise ConfigError(_HOME_UNKNOWN)
     return base / "termctl" / "config.yaml"
+
+
+def home_dir(environ: Mapping[str, str]) -> Path | None:
+    """An absolute ``HOME``, else the passwd entry's home if it is absolute, else None."""
+    home = environ.get("HOME", "")
+    if not os.path.isabs(home):
+        try:
+            home = pwd.getpwuid(os.getuid()).pw_dir
+        except KeyError:
+            return None
+        if not os.path.isabs(home):
+            return None
+    return Path(home)
+
+
+def xdg_base(environ: Mapping[str, str], variable: str, fallback: str) -> Path | None:
+    """``$variable`` when it is set and absolute (XDG base directory spec), else
+    ``<home>/<fallback>``; None when the home directory cannot be determined."""
+    value = environ.get(variable, "")
+    if value and os.path.isabs(value):
+        return Path(value)
+    home = home_dir(environ)
+    return None if home is None else home / fallback
 
 
 def merge(base: Mapping[Any, Any], over: Mapping[Any, Any], path: tuple[Any, ...] = ()) -> Any:

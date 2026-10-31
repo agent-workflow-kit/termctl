@@ -25,6 +25,7 @@ Status: planned, 2026-10-30. Implements [interface.md](interface.md) (normative)
 | `procs.py` | 0, 4 | process start time and parent PID (Linux `/proc`, macOS `ps`), zombie detection, the `close --force` signal sequence |
 | `jsonlog.py` | 0 | `log.jsonl` (level derived from result) and `audit.jsonl` |
 | `lock.py` | 0 | per-server `flock` with 10 s wait, canonical-path hashing |
+| `statedir.py` | 0 | state directory path and safe opening of its files (no symlinks, owner and mode checks) |
 | `hooks.py` | 0 | hook execution (process group, timeout, stdin payload, env vars, decision id parsing and validation), `--hook` and `--override-escalation` handling |
 | `tmux_backend.py` | 1 | tmux argument builder (all tmux argument rules), guarded-write wrapper, version check, socket resolution and safety checks, command chains |
 | `panes.py` | 1 | the single `list-panes -a` read, field sanitizing, ownership check, option validation, deduplication, in-process filters |

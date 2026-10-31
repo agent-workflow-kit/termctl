@@ -58,7 +58,7 @@ def _without_surrogates(value: Any) -> Any:
     return value
 
 
-def _to_json(data: dict[str, Any]) -> str:
+def to_json(data: dict[str, Any]) -> str:
     # interface.md "Human output": JSON string encoding escapes the control characters, so
     # --json output is never escaped as human output is. ensure_ascii also escapes C1 and
     # every other non-ASCII character; it is the default, but stated so it is not lost.
@@ -106,7 +106,7 @@ class Output:
 
     def result(self, result: Result) -> None:
         if self.json:
-            _write(self.stdout, _to_json(result.data))
+            _write(self.stdout, to_json(result.data))
         elif result.human:
             _write(self.stdout, _escape_lines(result.human) + "\n")
 
@@ -117,7 +117,7 @@ class Output:
     def error(self, err: TermctlError) -> None:
         """Errors always reach stderr (even with ``--quiet``); with ``--json`` stdout first."""
         if self.json:
-            _write(self.stdout, _to_json(err.envelope()))
+            _write(self.stdout, to_json(err.envelope()))
             # Flushed now so that it precedes the message when both go to one pipe or file.
             _flush(self.stdout)
         self._stderr(err.message)
