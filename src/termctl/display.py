@@ -18,6 +18,7 @@ changed something (``ring_bell``); a failure is only a warning (interface.md "Ma
 
 from __future__ import annotations
 
+import re
 from typing import TYPE_CHECKING, Protocol
 
 from .tmux_bin import TmuxVersion
@@ -79,6 +80,9 @@ def shows(reported: str, computed: str, version: TmuxVersion | None) -> bool:
 # --- the bell -----------------------------------------------------------------------------------
 
 BEL = b"\a"
+# The pseudo-terminal device paths the bell is written to: Linux, WSL and the BSDs (/dev/pts/N)
+# and macOS (/dev/ttysN). Anything else is never opened.
+_PSEUDO_TERMINAL = re.compile(r"/dev/(?:pts/[0-9]{1,10}|ttys[0-9]{1,10})")
 
 
 class _TtyReader(Protocol):
@@ -93,7 +97,8 @@ def ring_bell(backend: _TtyReader, gateway: _TtyWriter, pane: ManagedPane) -> st
     """Write one BEL to the terminal of ``pane`` if it is running; returns the warning to give
     when that fails, or None. The terminal is read again right before the write, so a pane
     that died, vanished or is no longer the one resolved gets nothing (``Backend.pane_tty``);
-    the gateway writes only to a character device (``Gateway.write_tty``)."""
+    only a pseudo-terminal path is opened, and the gateway writes only to a character device
+    (``Gateway.write_tty``)."""
     if pane.dead:
         return None
     tty = backend.pane_tty(pane)
@@ -101,6 +106,10 @@ def ring_bell(backend: _TtyReader, gateway: _TtyWriter, pane: ManagedPane) -> st
         return (
             f"bell not written: cannot read the terminal of managed pane {pane.id} "
             "(it is gone, dead or no longer the pane resolved)"
+        )
+    if not _PSEUDO_TERMINAL.fullmatch(tty):
+        return (
+            f"bell not written: terminal {tty} of managed pane {pane.id} is not a pseudo-terminal"
         )
     try:
         gateway.write_tty(tty, BEL)

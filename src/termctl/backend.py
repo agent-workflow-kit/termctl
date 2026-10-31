@@ -146,8 +146,9 @@ class Backend(Protocol):
         ...
 
     def pane_tty(self, pane: ManagedPane) -> str | None:
-        """The pseudo-terminal device of ``pane`` while it is still the managed pane resolved
-        and running (read-only), or None otherwise or when it cannot be read."""
+        """The terminal device path of ``pane`` while it is still the managed pane resolved
+        and running (read-only), or None otherwise or when it cannot be read. Any path is
+        reported; ``display.ring_bell`` writes only to a pseudo-terminal."""
         ...
 
 

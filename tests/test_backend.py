@@ -330,6 +330,13 @@ def test_pane_tty_of_a_running_managed_pane(tty: str) -> None:
     assert _backend({TTY_ARGV: answer}).pane_tty(PANE) == tty
 
 
+@pytest.mark.parametrize("tty", ["/dev/sda", "/dev/pts/../sda", "/tmp/x"])
+def test_pane_tty_reports_a_path_that_is_not_a_pty_as_it_is(tty: str) -> None:
+    # The bell checks the path (display.ring_bell), so it can name the cause in its warning.
+    answer = completed(f"{PANE.pane_id} {PANE.pane_id} {ID} 0 {tty}\n")
+    assert _backend({TTY_ARGV: answer}).pane_tty(PANE) == tty
+
+
 @pytest.mark.parametrize(
     "result",
     [
@@ -341,10 +348,8 @@ def test_pane_tty_of_a_running_managed_pane(tty: str) -> None:
         completed(f"{PANE.pane_id} %9 {ID} 0 /dev/pts/3\n"),
         completed(f"{PANE.pane_id} {PANE.pane_id} tc-zzzzzzzz 0 /dev/pts/3\n"),
         completed(f"%9 {PANE.pane_id} {ID} 0 /dev/pts/3\n"),
-        # Anything but a pty device path is never written to.
-        completed(f"{PANE.pane_id} {PANE.pane_id} {ID} 0 /dev/sda\n"),
-        completed(f"{PANE.pane_id} {PANE.pane_id} {ID} 0 /dev/pts/../sda\n"),
-        completed(f"{PANE.pane_id} {PANE.pane_id} {ID} 0 /tmp/x\n"),
+        # No terminal path at all.
+        completed(f"{PANE.pane_id} {PANE.pane_id} {ID} 0 \n"),
         completed(f"{PANE.pane_id} {PANE.pane_id} {ID} 0 /dev/pts/3 extra\n"),
         completed(f"{PANE.pane_id} {PANE.pane_id} {ID} 0 /dev/pts/3\nsecond line\n"),
         completed(f"{PANE.pane_id} {PANE.pane_id} {ID} 0 /dev/pts/3\n", returncode=1),

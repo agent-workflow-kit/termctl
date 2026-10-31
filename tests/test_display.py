@@ -156,6 +156,23 @@ def test_ring_bell_without_a_terminal_warns_and_writes_nothing() -> None:
     assert terminals.written == []
 
 
+@pytest.mark.parametrize("tty", ["/dev/sda", "/dev/pts/../sda", "/tmp/x", "/dev/pts/", "/dev/tty1"])
+def test_ring_bell_never_writes_to_a_terminal_that_is_not_a_pseudo_terminal(tty: str) -> None:
+    terminals = _Terminals(tty)
+    warning = display.ring_bell(terminals, terminals, pane())
+    assert warning == (
+        f"bell not written: terminal {tty} of managed pane tc-abcdefgh is not a pseudo-terminal"
+    )
+    assert terminals.written == []
+
+
+@pytest.mark.parametrize("tty", ["/dev/pts/0", "/dev/pts/17", "/dev/ttys003"])
+def test_ring_bell_writes_to_a_pseudo_terminal(tty: str) -> None:
+    terminals = _Terminals(tty)
+    assert display.ring_bell(terminals, terminals, pane()) is None
+    assert terminals.written == [(tty, b"\a")]
+
+
 @pytest.mark.parametrize(
     "error",
     [
