@@ -54,7 +54,7 @@ class FakeGateway:
         self.executable_checks: list[str] = []
         self.calls: list[list[str]] = []
         # The ``env`` argument of each call, in the order of ``calls``.
-        self.envs: list[Mapping[str, str] | None] = []
+        self.envs: list[dict[str, str] | None] = []
         self.cwd = cwd
         # By default only the caller's current directory exists.
         if dirs is None:

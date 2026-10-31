@@ -14,7 +14,7 @@ from collections.abc import Mapping, Sequence
 from dataclasses import dataclass, field
 from typing import Any, NoReturn, TextIO
 
-from . import __version__, ids, tmux_bin, validate
+from . import __version__, ids, placement, tmux_bin, validate
 from . import config as config_module
 from .argv import Scan, scan
 from .config import Config
@@ -372,7 +372,7 @@ def check_args(args: argparse.Namespace, ctx: Context) -> None:
         validate.check_decision_ids(args.decision_ids)
     if hasattr(args, "labels"):
         labels = validate.parse_labels(args.labels)
-        if command == "open":
+        if command in ("open", "placements"):
             validate.check_label_count(labels)
 
     if command == "open":
@@ -434,6 +434,9 @@ def resolve_id(args: argparse.Namespace, ctx: Context) -> None:
 
 def run_command(args: argparse.Namespace, ctx: Context) -> Result:
     """Step 5: the command's own steps."""
+    if args.command == "placements":
+        labels = validate.parse_labels(args.labels) if args.labels else None
+        return placement.report(ctx.config, labels)
     # TODO: each command lands in its own issue (#7, #12-#24).
     raise TermctlError("internal", f"{PROG} {args.command} is not implemented yet")
 

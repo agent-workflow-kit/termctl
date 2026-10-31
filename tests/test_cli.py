@@ -806,7 +806,7 @@ def test_context_carries_injected_gateway_and_clock(monkeypatch: pytest.MonkeyPa
 # --- unimplemented commands ---------------------------------------------------------------------
 
 
-@pytest.mark.parametrize("command", sorted(MINIMAL))
+@pytest.mark.parametrize("command", sorted(set(MINIMAL) - {"placements"}))
 def test_unimplemented_command_is_internal_error(command: str) -> None:
     run = Run(["--json", *MINIMAL[command]])
     assert run.code == 1
@@ -816,8 +816,8 @@ def test_unimplemented_command_is_internal_error(command: str) -> None:
         "code": "internal",
         "message": f"termctl {command} is not implemented yet",
     }
-    # Only the tmux checks ran (none for placements).
-    assert run.gateway.calls == ([] if command == "placements" else [[TMUX, "-V"]])
+    # Only the tmux checks ran.
+    assert run.gateway.calls == [[TMUX, "-V"]]
 
 
 def test_unimplemented_command_golden() -> None:
