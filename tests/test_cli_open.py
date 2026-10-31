@@ -5,6 +5,7 @@ from __future__ import annotations
 
 import json
 import os
+import subprocess
 from collections.abc import Mapping
 from pathlib import Path
 from typing import Any
@@ -297,6 +298,12 @@ def new_row(**overrides: str) -> dict[str, str]:
     )
 
 
+def tagged(stdout: str = "") -> subprocess.CompletedProcess[str]:
+    """A tagging invocation that ran to the end: ``stdout`` (the query's answer), then the
+    confirmation line."""
+    return completed(f"{stdout}{tb.TAG_CONFIRMATION}\n")
+
+
 def existing_session_flow(
     plan: open_cmd.Plan, tag_result: Any = None, after: list[dict[str, str]] | None = None
 ) -> Flow:
@@ -304,7 +311,7 @@ def existing_session_flow(
         {
             key(tb.has_session(SESSION)): completed(),
             key(tb.new_window(SESSION, plan.window)): completed("%5 @3\n"),
-            tag_key(plan): completed() if tag_result is None else tag_result,
+            tag_key(plan): tagged() if tag_result is None else tag_result,
             key(tb.cleanup_kill("%5", "@3")): completed(),
         },
         panes=[],
@@ -447,7 +454,7 @@ def test_no_server_starts_one_with_the_new_session_invocation() -> None:
 
     gateway = Flow(
         {start: completed("%5 @3\n"), key(tb.has_session(SESSION)): completed(),
-         tag_key(plan): completed()},
+         tag_key(plan): tagged()},
         files=files, executables=TRUE, effects={start: socket_appears}, after=[new_row()],
     )  # fmt: skip
     gateway.tag_key = tag_key(plan)
@@ -601,7 +608,7 @@ RECORDED = {"@termctl_pid": "4242", "@termctl_pid_start": "823520334", "pane_pid
 @pytest.mark.usefixtures("fixed_id")
 def test_open_records_the_servers_child_and_reports_its_pid() -> None:
     plan = make_plan()
-    gateway = existing_session_flow(plan, completed("4242 0 77\n"), after=[new_row(**RECORDED)])
+    gateway = existing_session_flow(plan, tagged("4242 0 77\n"), after=[new_row(**RECORDED)])
     gateway.responses[RECORD] = completed()
     gateway.proc_stats[4242] = proc_stat()
     gateway.peer_pids[SOCK] = 77
@@ -626,7 +633,7 @@ def test_open_records_the_servers_child_and_reports_its_pid() -> None:
 def test_open_records_no_pid_unless_provably_the_servers_live_child(
     query: str, stat: str | None
 ) -> None:
-    gateway = existing_session_flow(make_plan(), completed(query))
+    gateway = existing_session_flow(make_plan(), tagged(query))
     gateway.proc_stats[4242] = stat
     gateway.peer_pids[SOCK] = 77
     result = run(["--", "true"], gateway)
@@ -638,7 +645,7 @@ def test_open_records_no_pid_unless_provably_the_servers_live_child(
 @pytest.mark.usefixtures("fixed_id")
 def test_a_failed_query_takes_the_state_from_the_follow_up_read() -> None:
     dead = new_row(**{"pane_dead": "1", "pane_dead_status": "3", "@termctl_keep": "always"})
-    gateway = existing_session_flow(make_plan(keep="always"), completed("  \n"), after=[dead])
+    gateway = existing_session_flow(make_plan(keep="always"), tagged("  \n"), after=[dead])
     result = run(["--keep-on-exit", "always", "--", "true"], gateway)
     assert result.code == 0, result.stderr
     out = result.json()
@@ -648,7 +655,7 @@ def test_a_failed_query_takes_the_state_from_the_follow_up_read() -> None:
 
 @pytest.mark.usefixtures("fixed_id")
 def test_a_failed_recording_does_not_undo_the_open() -> None:
-    gateway = existing_session_flow(make_plan(), completed("4242 0 77\n"))
+    gateway = existing_session_flow(make_plan(), tagged("4242 0 77\n"))
     gateway.responses[RECORD] = completed(stderr="boom\n", returncode=1)
     gateway.proc_stats[4242] = proc_stat()
     gateway.peer_pids[SOCK] = 77
@@ -662,7 +669,7 @@ def test_a_failed_recording_does_not_undo_the_open() -> None:
 @pytest.mark.usefixtures("fixed_id")
 def test_a_failed_query_and_a_failed_read_report_gone_with_a_warning() -> None:
     plan = make_plan()
-    gateway = existing_session_flow(plan, completed("garbage\n"))
+    gateway = existing_session_flow(plan, tagged("garbage\n"))
     gateway.after = None
     failed_read = completed(stderr="boom\n", returncode=1)
     gateway.effects[tag_key(plan)] = lambda g: setattr(g, "list_panes", failed_read)

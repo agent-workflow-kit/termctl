@@ -744,6 +744,9 @@ _GUARDED_WINDOW_OPTIONS = frozenset({"automatic-rename", "allow-rename"})
 _GUARDED_DISPLAY_FIELDS = ("pane_pid", "pane_dead", "pid", "pane_id", "window_id")
 _GUARDED_DISPLAY_FIELD = "#{(?:" + "|".join(_GUARDED_DISPLAY_FIELDS) + ")}"
 _GUARDED_DISPLAY_FORMAT = re.compile(f"{_GUARDED_DISPLAY_FIELD}( {_GUARDED_DISPLAY_FIELD})*")
+# The constant line the tagging invocation of Open order step 6 ends with: the only fixed
+# text a guarded display may print besides those fields (review round 2 of #17, R2-1).
+TAG_CONFIRMATION = "termctl-tagged"
 
 
 def _check_guarded_arguments(inner: Command) -> None:
@@ -757,11 +760,13 @@ def _check_guarded_arguments(inner: Command) -> None:
     if inner.name in _FORMAT_POSITIONAL_COMMANDS:
         if "-p" not in inner.flags:
             raise ValueError(f"{inner.name} inside a guard takes -p")
-        if len(inner.positionals) != 1 or not _GUARDED_DISPLAY_FORMAT.fullmatch(
-            inner.positionals[0]
+        if len(inner.positionals) != 1 or not (
+            _GUARDED_DISPLAY_FORMAT.fullmatch(inner.positionals[0])
+            or inner.positionals[0] == TAG_CONFIRMATION
         ):
             raise ValueError(
                 f"{inner.name} inside a guard prints only {', '.join(_GUARDED_DISPLAY_FIELDS)}"
+                f" or {TAG_CONFIRMATION}"
             )
 
 
@@ -1091,8 +1096,10 @@ def tag_pane(
     """The tagging invocation of Open order step 6, guarded by ``untagged_in_window``: the
     pane options ``options`` (each written with ``set -p``, an empty value as ``''``), the
     window options ``automatic-rename off`` and ``allow-rename off``, the pane option
-    ``remain-on-exit``, then, with argv, ``respawn-pane -k`` with the real command, and last
-    the query of step 7 (``PROCESS_QUERY``; ``parse_process_query`` reads its output).
+    ``remain-on-exit``, then, with argv, ``respawn-pane -k`` with the real command, the
+    query of step 7 (``PROCESS_QUERY``), and last ``display -p termctl-tagged``
+    (``TAG_CONFIRMATION``), which says the chain ran to the end; ``tagged_query`` reads the
+    output.
     """
     if remain_on_exit not in ("off", "failed", "on"):
         raise ValueError(f"invalid remain-on-exit value: {remain_on_exit!r}")
@@ -1109,7 +1116,22 @@ def tag_pane(
     if respawn is not None:
         inner.append(_respawn(target, respawn))
     inner.append(_process_query(target))
+    inner.append(
+        command("display").flag("-p").target(target).format_arg(_format(TAG_CONFIRMATION)).build()
+    )
     return Invocation.of(guarded(target, untagged_in_window(window_id), *inner))
+
+
+def tagged_query(stdout: str) -> str | None:
+    """What a tagging invocation (``tag_pane``) that exited 0 printed before its last line
+    (the query's answer, for ``parse_process_query``), or None when that last line is not
+    ``TAG_CONFIRMATION``: tmux dropped the rest of the chain (its client was killed, say), so
+    the pane may be untagged."""
+    text = stdout.removesuffix("\n")
+    head, newline, last = text.rpartition("\n")
+    if last != TAG_CONFIRMATION:
+        return None
+    return head + newline
 
 
 # --- open: the process (interface.md "Open order" step 7) ---------------------------------------

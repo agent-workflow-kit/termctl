@@ -34,12 +34,13 @@ import json
 from collections.abc import Mapping, Sequence
 from dataclasses import dataclass, field
 from datetime import datetime
+from functools import partial
 from typing import Any, Literal, NoReturn
 
 from . import jsonlog, lock, validate
 from .config import DEFAULT_HOOK_TIMEOUT_S, Config, PostHook, PreHook
 from .errors import TermctlError, UsageError
-from .gateway import Gateway, GroupNotStopped, GroupRun
+from .gateway import Gateway, GroupNotStopped, GroupRun, started_pgid
 from .ids import is_id
 from .output import to_json
 
@@ -204,9 +205,10 @@ def pre_close_payload(
     }
 
 
-def post_open_payload(*, pane: Mapping[str, Any]) -> dict[str, Any]:
-    """``schemas/hooks/post-open.json``: ``pane`` is the ``open`` output."""
-    return {**_common("post-open", pane["id"], pane["labels"]), "pane": dict(pane)}
+def post_open_payload(*, pane: Mapping[str, Any], labels: Sequence[str]) -> dict[str, Any]:
+    """``schemas/hooks/post-open.json``: ``pane`` is the ``open`` output (read from the pane,
+    so forgeable); ``labels`` are the labels termctl was given, not the ones read back."""
+    return {**_common("post-open", pane["id"], labels), "pane": dict(pane)}
 
 
 def post_close_payload(*, result: Mapping[str, Any], labels: Sequence[str]) -> dict[str, Any]:
@@ -424,6 +426,14 @@ def _start_problem(exc: OSError | ValueError) -> str:
     return str(exc)
 
 
+def _record_interrupted(hook: Hook, exc: BaseException, processes: list[HookProcess]) -> None:
+    """List the hook that ``exc`` (a stop signal, say) interrupted after its group (for an
+    async hook, its watchdog) existed and before the gateway's ``record`` took it."""
+    pgid = started_pgid(exc)
+    if pgid is not None:
+        processes.append(HookProcess(hook.name, hook.cmd, pgid, watchdog=hook.async_))
+
+
 @dataclass
 class PreHookOutcome:
     """The verdict of a run of pre-hooks.
@@ -433,6 +443,7 @@ class PreHookOutcome:
     escalated (and was not overridden). ``message`` is termctl's own text; it never holds hook
     output. ``overridden`` lists the hooks whose escalation an ``--override-escalation`` run
     treated as allow. ``processes`` lists every hook started, with its process group.
+    ``decision_ids`` and ``processes`` may be lists the caller owns (``run_pre_hooks``).
     """
 
     verdict: Verdict
@@ -474,8 +485,16 @@ def run_pre_hooks(
     override_escalation: bool,
     gateway: Gateway,
     environ: Mapping[str, str],
+    ids: list[str] | None = None,
+    processes: list[HookProcess] | None = None,
 ) -> PreHookOutcome:
     """Run ``hooks`` (all named ``payload["hook"]``) in order and return the verdict.
+
+    ``ids``, if given, is the caller's list of decision ids, holding ``decision_ids``; the ids
+    hooks return are appended to it as each hook ends. ``processes``, if given, is the
+    caller's list that each hook started is appended to as soon as it exists (the one a stop
+    signal interrupted included, ``started_pgid``). So a stop (``KeyboardInterrupt``,
+    ``Terminated``) loses neither.
 
     Raises ``RuntimeError`` while a server lock is held and ``ValueError`` when the payload
     does not fit the hooks; both are programming errors and no hook runs.
@@ -483,10 +502,23 @@ def run_pre_hooks(
     _check_payload(hooks, payload, PRE_HOOKS)
     if payload["override_escalation"] is not override_escalation:
         raise ValueError("the payload's override_escalation must equal the run's")
+    if ids is not None and ids != list(decision_ids):
+        raise ValueError("ids must hold exactly the decision_ids")
     data = _encode(payload)
     env = _environment(environ, payload)
-    outcome = PreHookOutcome("allow", list(decision_ids))
+    outcome = PreHookOutcome(
+        "allow",
+        list(decision_ids) if ids is None else ids,
+        processes=[] if processes is None else processes,
+    )
     name = payload["hook"]
+
+    def record(hook: Hook, run: GroupRun) -> None:
+        # Called by the gateway with stop signals held, so a stop loses neither.
+        outcome.processes.append(HookProcess(hook.name, hook.cmd, run.pgid))
+        if run.returncode is not None:
+            _collect_ids(hook, run, outcome.decision_ids, outcome.warnings)
+
     for hook in hooks:
         try:
             run = gateway.run_group(
@@ -496,6 +528,7 @@ def run_pre_hooks(
                 timeout=hook.timeout,
                 stdout_limit=STDOUT_LIMIT,
                 stderr_limit=STDERR_LIMIT,
+                record=partial(record, hook),
             )
         except (OSError, ValueError) as exc:
             message = (
@@ -512,13 +545,14 @@ def run_pre_hooks(
             )
             outcome._decide("vetoed", hook, "", message)
             return outcome
-        outcome.processes.append(HookProcess(hook.name, hook.cmd, run.pgid))
+        except BaseException as exc:
+            _record_interrupted(hook, exc, outcome.processes)
+            raise
         stderr = cut_stderr(run.stderr)
         if run.returncode is None:
             message = f"{name} hook timed out after {hook.timeout} s, counted as a veto: {hook.cmd}"
             outcome._decide("vetoed", hook, stderr, message)
             return outcome
-        _collect_ids(hook, run, outcome.decision_ids, outcome.warnings)
         if run.returncode == 0:
             continue
         if run.returncode == ESCALATE_EXIT:
@@ -541,7 +575,8 @@ def run_pre_hooks(
 @dataclass
 class PostHookOutcome:
     """A run of post-hooks: a warning for each that failed, and every hook started with its
-    process group (for an async hook, its watchdog's)."""
+    process group (for an async hook, its watchdog's); ``processes`` may be the caller's list
+    (``run_post_hooks``)."""
 
     warnings: list[HookWarning] = field(default_factory=list[HookWarning])
     processes: list[HookProcess] = field(default_factory=list[HookProcess])
@@ -553,24 +588,38 @@ def run_post_hooks(
     *,
     gateway: Gateway,
     environ: Mapping[str, str],
+    processes: list[HookProcess] | None = None,
 ) -> PostHookOutcome:
     """Run ``hooks`` (all named ``payload["hook"]``) in order; return a warning for each that
     failed. An async hook is started detached under a watchdog that enforces its timeout, and
-    is not waited for. Raises like ``run_pre_hooks``."""
+    is not waited for. ``processes`` is as for ``run_pre_hooks``. Raises like
+    ``run_pre_hooks``."""
     _check_payload(hooks, payload, POST_HOOKS)
     data = _encode(payload)
     env = _environment(environ, payload)
-    outcome = PostHookOutcome()
+    outcome = PostHookOutcome(processes=[] if processes is None else processes)
 
     def warn(hook: Hook, problem: str, pgid: int | None, stderr: str = "") -> None:
         outcome.warnings.append(HookWarning(hook.name, hook.cmd, problem, pgid, stderr))
+
+    # Called by the gateway with stop signals held, so a stop never loses a started hook.
+    def record_watchdog(hook: Hook, pgid: int) -> None:
+        outcome.processes.append(HookProcess(hook.name, hook.cmd, pgid, watchdog=True))
+
+    def record(hook: Hook, run: GroupRun) -> None:
+        outcome.processes.append(HookProcess(hook.name, hook.cmd, run.pgid))
 
     for hook in hooks:
         argv = [SHELL, "-c", hook.cmd]
         try:
             if hook.async_:
-                pgid = gateway.spawn_watched(argv, stdin=data, env=env, timeout=hook.timeout)
-                outcome.processes.append(HookProcess(hook.name, hook.cmd, pgid, watchdog=True))
+                gateway.spawn_watched(
+                    argv,
+                    stdin=data,
+                    env=env,
+                    timeout=hook.timeout,
+                    record=partial(record_watchdog, hook),
+                )
                 continue
             run = gateway.run_group(
                 argv,
@@ -579,6 +628,7 @@ def run_post_hooks(
                 timeout=hook.timeout,
                 stdout_limit=0,
                 stderr_limit=STDERR_LIMIT,
+                record=partial(record, hook),
             )
         except (OSError, ValueError) as exc:
             warn(hook, f"could not be started: {_start_problem(exc)}", None)
@@ -588,7 +638,9 @@ def run_post_hooks(
             problem = f"timed out after {hook.timeout} s; its process group could not be stopped"
             warn(hook, problem, exc.pgid)
             continue
-        outcome.processes.append(HookProcess(hook.name, hook.cmd, run.pgid))
+        except BaseException as exc:
+            _record_interrupted(hook, exc, outcome.processes)
+            raise
         stderr = cut_stderr(run.stderr)
         if run.returncode is None:
             problem = f"timed out after {hook.timeout} s; its process group was killed"
