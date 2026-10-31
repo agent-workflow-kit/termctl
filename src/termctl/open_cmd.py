@@ -369,7 +369,8 @@ def record(
     """Open order step 7: record the pane's process in ``@termctl_pid`` and
     ``@termctl_pid_start``, only if the query of step 6's invocation answered, the pane was not
     dead, on Linux the server at ``socket_path`` is the queried server as termctl's PID
-    namespace sees it, and the process is alive (not a zombie) with the tmux server as its
+    namespace sees it and ``/proc`` shows that namespace (``procs.namespace_problem``), and
+    the process is alive (not a zombie) with the tmux server as its
     parent, so the PID cannot belong to an unrelated process (spike E6). Whether it was
     recorded.
 
@@ -394,6 +395,13 @@ def record(
             )
             return False
         if peer != query.server_pid:
+            return False
+        problem = procs.namespace_problem(gateway)
+        if problem is not None:
+            warn(
+                f"could not check the process of pane {created.pane_id}: {problem};"
+                " its PID is not recorded"
+            )
             return False
     try:
         process = procs.read(gateway, query.pane_pid)

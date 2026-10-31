@@ -636,6 +636,99 @@ def test_a_stop_signal_during_a_hook_kills_its_group(tmp_path: Path, signum: int
     assert wait_gone(child)
 
 
+_GUARD_SCRIPT = """
+import os, signal, sys, time
+from termctl.gateway import SystemGateway, Terminated
+
+for signum in (signal.SIGTERM, signal.SIGHUP):
+    signal.signal(signum, signal.SIG_DFL)
+gateway, seen = SystemGateway(), []
+
+def deliver(signum):
+    os.kill(os.getpid(), signum)  # this process: exact
+    time.sleep(0.2)
+
+with gateway.stop_signal_guard() as guard:
+    deliver(signal.SIGHUP)
+    seen.append("hup-ignored")
+    try:
+        deliver(signal.SIGTERM)
+    except Terminated as stop:
+        seen.append(f"term-raised-{stop.signum}")
+    deliver(signal.SIGTERM)
+    deliver(signal.SIGINT)
+    seen.append("later-ignored")
+with gateway.stop_signal_guard() as guard:
+    try:
+        deliver(signal.SIGINT)
+    except KeyboardInterrupt:
+        seen.append("int-raised")
+with gateway.stop_signal_guard() as guard:
+    guard.drop()
+    deliver(signal.SIGTERM)
+    seen.append("dropped")
+with gateway.stop_signal_guard() as guard:
+    # A program termctl runs gets SIGHUP at its default.
+    child = gateway.run(["/bin/sh", "-c", "kill -HUP $$; echo alive"])
+    seen.append(f"child-{child.returncode}")
+    run = gateway.run_group(
+        ["/bin/sh", "-c", "kill -HUP $PPID; sleep 0.2; echo done"],
+        stdin=b"", env={"PATH": "/usr/bin:/bin"}, timeout=10, stdout_limit=100,
+        stderr_limit=100,
+    )
+    seen.append("hook-" + run.stdout.decode().strip())
+    # A hook does not: SIGHUP ends it.
+    run = gateway.run_group(
+        ["/bin/sh", "-c", "kill -HUP $$; echo alive"],
+        stdin=b"", env={"PATH": "/usr/bin:/bin"}, timeout=10, stdout_limit=100,
+        stderr_limit=100,
+    )
+    seen.append(f"hook-hup-{run.returncode}")
+    deliver(signal.SIGHUP)
+    seen.append("hup-still-ignored")
+restored = all(
+    signal.getsignal(signum) == default
+    for signum, default in (
+        (signal.SIGTERM, signal.SIG_DFL),
+        (signal.SIGHUP, signal.SIG_DFL),
+        (signal.SIGINT, signal.default_int_handler),
+    )
+)
+seen.append(f"restored-{restored}")
+print(" ".join(seen))
+"""
+
+
+def test_the_stop_signal_guard_ignores_sighup_and_raises_once() -> None:
+    result = subprocess.run(
+        [sys.executable, "-c", _GUARD_SCRIPT], capture_output=True, text=True, timeout=30
+    )
+    assert result.returncode == 0, result.stderr
+    assert result.stdout.split() == [
+        "hup-ignored",
+        f"term-raised-{int(signal.SIGTERM)}",
+        "later-ignored",
+        "int-raised",
+        "dropped",
+        f"child-{-int(signal.SIGHUP)}",
+        # A hook run under the guard: its SIGHUP to termctl (its parent) stops neither.
+        "hook-done",
+        f"hook-hup-{-int(signal.SIGHUP)}",
+        "hup-still-ignored",
+        "restored-True",
+    ]
+
+
+def test_the_stop_signal_guard_leaves_an_ignored_signal_ignored() -> None:
+    before = signal.signal(signal.SIGHUP, signal.SIG_IGN)
+    try:
+        with SystemGateway().stop_signal_guard():
+            assert signal.getsignal(signal.SIGHUP) == signal.SIG_IGN
+        assert signal.getsignal(signal.SIGHUP) == signal.SIG_IGN
+    finally:
+        signal.signal(signal.SIGHUP, before)
+
+
 # --- spawn_watched ------------------------------------------------------------------------------
 
 

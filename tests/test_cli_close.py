@@ -17,7 +17,7 @@ import yaml
 
 from termctl import tmux_backend as tb
 from termctl.cli import main
-from termctl.gateway import GroupRun
+from termctl.gateway import GroupRun, Terminated
 
 from .conftest import private_environ
 from .fakes import (
@@ -26,6 +26,7 @@ from .fakes import (
     FakeGateway,
     FakeProcess,
     GroupCall,
+    GroupResponse,
     completed,
     group_run,
     is_list_panes,
@@ -161,9 +162,7 @@ def sh(cmd: str) -> tuple[str, ...]:
     return ("/bin/sh", "-c", cmd)
 
 
-def hook(
-    gateway: FakeGateway, cmd: str, response: GroupRun | Callable[[GroupCall], GroupRun]
-) -> None:
+def hook(gateway: FakeGateway, cmd: str, response: GroupResponse) -> None:
     gateway.group_responses[sh(cmd)] = response
 
 
@@ -251,6 +250,13 @@ def test_a_dead_pane_is_closed_without_force_by_a_guarded_kill_pane(
     assert (record["result"], record["force"], record["actor"]) == ("ok", False, "auto:unknown")
     assert (record["escalation_override"], record["decision_ids"]) == (False, [])
     assert records(private_state_home, "audit.jsonl") == []
+
+
+def test_the_guarded_kill_runs_tmux_in_a_session_of_its_own() -> None:
+    # Killing termctl's own pane hangs up its terminal; the tmux client must still answer.
+    result = forced(process=FakeProcess(hup_on_kill=True))
+    result.output()
+    assert result.gateway.new_session_calls == [list(KILL_QUERY)]
 
 
 def test_the_guarded_kill_targets_only_the_managed_pane() -> None:
@@ -442,6 +448,24 @@ def test_a_namespace_check_that_cannot_be_made_warns_and_signals_nothing() -> No
     assert "cannot check the server: Permission denied" in result.stderr
 
 
+@pytest.mark.parametrize(
+    ("own", "problem"),
+    [
+        (False, "/proc belongs to another PID namespace than termctl"),
+        (PermissionError(13, "Permission denied"), "cannot read /proc/self: Permission denied"),
+    ],
+)
+def test_a_proc_of_another_pid_namespace_is_uncheckable_and_never_signaled(
+    own: bool | OSError, problem: str
+) -> None:
+    gateway, clock = gateway_for()
+    gateway.own_namespace = own
+    result = close([ID, "--force", *HUMAN], gateway, clock)
+    assert_unsignaled_mismatch(result)
+    assert problem in result.stderr
+    assert gateway.proc_reads == []
+
+
 def test_pane_pid_changing_between_the_list_and_the_query_is_a_mismatch() -> None:
     result = forced(responses={QUERY: completed(f"5555 0 {SERVER}\n")})
     assert_unsignaled_mismatch(result)
@@ -590,11 +614,31 @@ def test_a_dead_pane_respawned_during_the_hooks_is_state_changed(private_state_h
 
 
 def test_the_id_on_another_tmux_pane_at_the_re_check_is_state_changed() -> None:
+    # Step 1's tmux pane %3 is still a managed pane (now under another id).
     gateway, clock = gateway_for([pane_row(tc_id=ID, overrides=DEAD)])
-    hook(gateway, "gate", changing(gateway, [pane_row("%9", ID, overrides=DEAD)]))
+    rows = [pane_row("%3", "tc-zzzzzzzz", overrides=DEAD), pane_row("%9", ID, overrides=DEAD)]
+    hook(gateway, "gate", changing(gateway, rows))
     result = close([ID, "--hook", "pre-close=gate"], gateway, clock)
     result.error("state_changed", 12)
     assert "kill" not in result.tmux()
+
+
+def test_the_id_moved_off_a_gone_tmux_pane_counts_as_gone_and_the_other_is_untouched(
+    private_state_home: Path,
+) -> None:
+    # Step 1's tmux pane %3 is gone; a running pane %9 now carries the id (forged).
+    gateway, clock = gateway_for(process=FakeProcess(exits_on=frozenset({signal.SIGTERM})))
+    hook(gateway, "gate", changing(gateway, [pane_row("%9", ID)]))
+    result = close(
+        [ID, "--force", *HUMAN, "--hook", "pre-close=gate", "--grace", "0s"], gateway, clock
+    )
+    data = result.output()
+    assert (data["pane_closed"], data["was_running"]) == (True, True)
+    # Step 1's proof stands: the recorded process is signaled by its start time alone.
+    assert data["signals_sent"] == ["SIGTERM"]
+    assert result.tmux() == ["list-panes", "query", "list-panes"]  # %9 is never touched
+    assert "its id now appears on tmux pane %9, which was not touched" in result.stderr
+    assert [r["event"] for r in records(private_state_home)].count("warning") == 1
 
 
 def test_two_panes_with_the_id_at_the_re_check_are_ambiguous() -> None:
@@ -711,6 +755,126 @@ def test_gone_at_the_step_5_probe_uses_the_step_1_proof() -> None:
     assert "kill+query" not in result.tmux()
 
 
+def test_gone_at_the_step_1_probe_with_its_process_exited_is_exited_not_a_mismatch() -> None:
+    gateway, clock = gateway_for(responses={QUERY: NOMATCH})
+
+    def gate(_: GroupCall) -> GroupRun:
+        gateway.panes = []
+        return group_run(0)
+
+    hook(gateway, "gate", gate)
+    gateway.processes[4242].exited = True
+    result = close([ID, "--force", *HUMAN, "--hook", "pre-close=gate"], gateway, clock)
+    data = result.output()
+    assert (data["pid_mismatch"], data["exited"], data["signals_sent"]) == (False, True, [])
+    assert "warning" not in result.stderr
+    assert gateway.signals == []
+
+
+def test_gone_at_the_step_1_probe_with_its_process_alive_warns_and_never_signals() -> None:
+    gateway, clock = gateway_for(responses={QUERY: NOMATCH})
+    hook(gateway, "gate", changing(gateway, []))
+    result = close([ID, "--force", *HUMAN, "--hook", "pre-close=gate"], gateway, clock)
+    data = result.output()
+    assert (data["pid_mismatch"], data["exited"], data["signals_sent"]) == (True, None, [])
+    assert "the pane was gone before process 4242 could be checked" in result.stderr
+    assert gateway.signals == []
+    assert all(handle.closed for handle in gateway.handles)
+
+
+def test_gone_at_the_step_1_probe_but_listed_at_the_re_check_is_never_signaled() -> None:
+    result = forced(responses={QUERY: NOMATCH})
+    data = result.output()
+    assert (data["pid_mismatch"], data["signals_sent"]) == (True, [])
+    assert result.tmux() == ["list-panes", "query", "list-panes", "kill"]
+    assert result.gateway.signals == []
+
+
+# --- a run stopped by a signal ------------------------------------------------------------------
+
+
+def interrupting(clock: FakeClock, stop: BaseException, after: int) -> None:
+    """The fake clock's ``after``-th sleep raises ``stop``, as a signal handler would."""
+    sleep = clock.sleep
+    count = [0]
+
+    def stopping(seconds: float) -> None:
+        count[0] += 1
+        if count[0] == after:
+            raise stop
+        sleep(seconds)
+
+    clock.sleep = stopping  # type: ignore[method-assign]
+
+
+@pytest.mark.parametrize(
+    ("stop", "signum", "exit_code"),
+    [
+        (KeyboardInterrupt(), "SIGINT", 130),
+        (Terminated(signal.SIGTERM), "SIGTERM", 143),
+    ],
+)
+def test_a_forced_close_stopped_after_sigterm_is_logged_and_audited(
+    private_state_home: Path, stop: BaseException, signum: str, exit_code: int
+) -> None:
+    gateway, clock = gateway_for()
+    # The grace is 0 s: SIGTERM goes out at once, then the 5 s wait polls and sleeps.
+    interrupting(clock, stop, after=1)
+    result = close([ID, "--force", *HUMAN, "--grace", "0s"], gateway, clock)
+    assert result.code == exit_code
+    assert gateway.signals == [(4242, signal.SIGTERM)]
+    [record] = close_records(private_state_home)
+    assert (record["result"], record["exit_code"]) == ("error", exit_code)
+    [audit] = records(private_state_home, "audit.jsonl")  # validated against audit.json
+    assert (audit["action"], audit["force"], audit["target"]) == ("close", True, ID)
+    assert audit["result"]["stopped"]["signal"] == signum
+    assert audit["result"]["stopped"]["exit_code"] == exit_code
+    assert audit["result"]["stopped"]["signals_sent"] == ["SIGTERM"]
+    # The guard was entered at step 3, dropped before the records, and left afterwards.
+    assert gateway.guard_events == ["enter", "drop", "exit"]
+
+
+def test_a_forced_close_stopped_during_the_grace_wait_is_audited_with_no_signals(
+    private_state_home: Path,
+) -> None:
+    gateway, clock = gateway_for()
+    interrupting(clock, Terminated(signal.SIGTERM), after=1)
+    result = close([ID, "--force", *HUMAN], gateway, clock)
+    assert result.code == 143
+    assert gateway.signals == []
+    [audit] = records(private_state_home, "audit.jsonl")
+    assert audit["result"]["stopped"]["signals_sent"] == []
+    assert close_records(private_state_home)[0]["exit_code"] == 143
+
+
+def test_a_forced_close_stopped_in_a_pre_close_hook_is_audited(private_state_home: Path) -> None:
+    gateway, clock = gateway_for()
+    hook(gateway, "gate", Terminated(signal.SIGHUP))
+    result = close([ID, "--force", *HUMAN, "--hook", "pre-close=gate"], gateway, clock)
+    assert result.code == 129
+    [audit] = records(private_state_home, "audit.jsonl")
+    assert audit["result"]["stopped"]["signal"] == "SIGHUP"
+    # The guard starts at step 3, which was never reached.
+    assert gateway.guard_events == []
+
+
+def test_a_stopped_close_without_force_of_a_dead_pane_is_not_audited(
+    private_state_home: Path,
+) -> None:
+    gateway, clock = gateway_for([pane_row(tc_id=ID, overrides=DEAD)])
+    hook(gateway, "gate", KeyboardInterrupt())
+    result = close([ID, "--hook", "pre-close=gate"], gateway, clock)
+    assert result.code == 130
+    assert close_records(private_state_home)[0]["exit_code"] == 130
+    assert records(private_state_home, "audit.jsonl") == []
+
+
+def test_a_completed_close_drops_stop_signals_before_its_records() -> None:
+    gateway, clock = gateway_for(process=FakeProcess(hup_on_kill=True))
+    close([ID, "--force", *HUMAN], gateway, clock).output()
+    assert gateway.guard_events == ["enter", "drop", "exit"]
+
+
 # --- logging and errors before the pane is known ------------------------------------------------
 
 
@@ -780,6 +944,23 @@ def test_dry_run_reports_a_mismatch_and_no_signals(
 ) -> None:
     data = dry_output(dry(rows, **kwargs))
     assert (data["pid_mismatch"], data["signals_possible"]) == (True, [])
+
+
+def test_dry_run_of_a_pane_gone_at_the_probe_with_its_process_exited_is_no_mismatch() -> None:
+    gateway, clock = gateway_for(responses={QUERY: NOMATCH})
+    gateway.processes[4242].exited = True
+    result = close([ID, "--force", *HUMAN, "--dry-run"], gateway, clock)
+    data = dry_output(result)
+    assert (data["pid_mismatch"], data["signals_possible"]) == (False, [])
+    assert "warning" not in result.stderr
+
+
+def test_dry_run_of_a_pane_gone_at_the_probe_with_its_process_alive_warns() -> None:
+    gateway, clock = gateway_for(responses={QUERY: NOMATCH})
+    result = close([ID, "--force", *HUMAN, "--dry-run"], gateway, clock)
+    data = dry_output(result)
+    assert (data["pid_mismatch"], data["signals_possible"]) == (True, [])
+    assert "a real run would not signal the recorded process" in result.stderr
 
 
 def test_dry_run_of_a_running_pane_without_force_is_refused() -> None:

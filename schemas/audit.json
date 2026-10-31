@@ -2,7 +2,7 @@
   "$schema": "https://json-schema.org/draft/2020-12/schema",
   "$id": "termctl/audit.json",
   "title": "termctl audit.jsonl record",
-  "description": "Written, once an id is generated (open) or resolved (close), for close --force of a running pane (any outcome) and for open or close with --override-escalation.",
+  "description": "Written, once an id is generated (open) or resolved (close), for close --force of a running pane (any outcome, a run a signal stopped included) and for open or close with --override-escalation.",
   "type": "object",
   "properties": {
     "ts": {
@@ -92,7 +92,7 @@
       ]
     },
     "result": {
-      "description": "The command's --json output, or its error output."
+      "description": "The command's --json output, its error output, or (close only) {\"stopped\": ...} for a run a signal stopped."
     }
   },
   "additionalProperties": false,
@@ -205,6 +205,51 @@
               },
               {
                 "$ref": "cli/error.json"
+              },
+              {
+                "type": "object",
+                "description": "A close stopped by a signal (it has no output and no error object).",
+                "properties": {
+                  "stopped": {
+                    "type": "object",
+                    "properties": {
+                      "signal": {
+                        "enum": [
+                          "SIGINT",
+                          "SIGTERM",
+                          "SIGHUP"
+                        ],
+                        "description": "The signal that stopped termctl."
+                      },
+                      "exit_code": {
+                        "enum": [
+                          130,
+                          143,
+                          129
+                        ],
+                        "description": "128 plus the signal number."
+                      },
+                      "message": {
+                        "type": "string"
+                      },
+                      "signals_sent": {
+                        "$ref": "defs.json#/$defs/signals",
+                        "description": "The signals termctl had sent the recorded process when it stopped."
+                      }
+                    },
+                    "additionalProperties": false,
+                    "required": [
+                      "signal",
+                      "exit_code",
+                      "message",
+                      "signals_sent"
+                    ]
+                  }
+                },
+                "additionalProperties": false,
+                "required": [
+                  "stopped"
+                ]
               }
             ]
           }

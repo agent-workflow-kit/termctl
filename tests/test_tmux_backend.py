@@ -1080,9 +1080,9 @@ class RecordingGateway(FakeGateway):
         super().__init__(*args, **kwargs)  # type: ignore[arg-type]
         self.timeouts: list[float | None] = []
 
-    def run(self, argv, *, stdin=None, timeout=None, env=None):  # type: ignore[no-untyped-def,override]
+    def run(self, argv, *, stdin=None, timeout=None, env=None, new_session=False):  # type: ignore[no-untyped-def,override]
         self.timeouts.append(timeout)
-        return super().run(argv, stdin=stdin, timeout=timeout, env=env)
+        return super().run(argv, stdin=stdin, timeout=timeout, env=env, new_session=new_session)
 
 
 def test_runner_runs_argv_with_the_given_env_and_traces_redacted() -> None:
@@ -1136,7 +1136,7 @@ class RaisingGateway(FakeGateway):
         super().__init__()
         self.exc = exc
 
-    def run(self, argv, *, stdin=None, timeout=None, env=None):  # type: ignore[no-untyped-def,override]
+    def run(self, argv, *, stdin=None, timeout=None, env=None, new_session=False):  # type: ignore[no-untyped-def,override]
         raise self.exc
 
 

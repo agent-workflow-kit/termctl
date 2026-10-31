@@ -1262,17 +1262,19 @@ class Tmux:
         self.configured_bin = tmux_bin if configured_bin is None else configured_bin
 
     def run(
-        self, invocation: Invocation, *, utf8: bool = False
+        self, invocation: Invocation, *, utf8: bool = False, new_session: bool = False
     ) -> subprocess.CompletedProcess[str]:
         """Run ``invocation`` and return tmux's result; mapping tmux's failures to exit codes
         is the caller's, since it depends on the command (``tmux_failure``, ``is_no_server``).
-        ``utf8``: see ``Invocation.argv``."""
+        ``utf8``: see ``Invocation.argv``; ``new_session``: see ``Gateway.run``."""
         argv = invocation.argv(self.tmux_bin, self.socket_path, utf8=utf8)
         if self.trace is not None:
             shown = shlex.join(invocation.shown_argv(self.tmux_bin, self.socket_path, utf8=utf8))
             self.trace("tmux: " + _escape_controls(shown))
         try:
-            return self.gateway.run(argv, timeout=TMUX_TIMEOUT, env=self.env)
+            return self.gateway.run(
+                argv, timeout=TMUX_TIMEOUT, env=self.env, new_session=new_session
+            )
         except subprocess.TimeoutExpired:
             raise TermctlError(
                 "server_unavailable",

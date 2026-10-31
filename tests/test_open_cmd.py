@@ -595,6 +595,24 @@ def test_a_process_that_cannot_be_read_warns_and_records_nothing(stat: object) -
     assert len(warnings) == 1 and "%5" in warnings[0]
 
 
+@pytest.mark.parametrize(
+    ("own", "problem"),
+    [
+        (False, "/proc belongs to another PID namespace than termctl"),
+        (PermissionError(13, "Permission denied"), "cannot read /proc/self: Permission denied"),
+    ],
+)
+def test_a_proc_of_another_pid_namespace_warns_and_records_nothing(
+    own: bool | OSError, problem: str
+) -> None:
+    gateway = FakeGateway(proc_stats={4242: proc_stat()}, peer_pids=SERVER_PEER)
+    gateway.own_namespace = own
+    warnings: list[str] = []
+    assert record(gateway, RUNNING, warnings) is False
+    assert gateway.calls == [] and gateway.proc_reads == []
+    assert len(warnings) == 1 and problem in warnings[0] and "%5" in warnings[0]
+
+
 def test_a_recording_whose_guard_no_longer_matches_is_silent() -> None:
     # The pane died, closed or changed between the query and the recording.
     gateway = FakeGateway({RECORD: NOMATCH}, proc_stats={4242: proc_stat()}, peer_pids=SERVER_PEER)
@@ -715,6 +733,7 @@ class Script(FakeGateway):
         stdin: str | None = None,
         timeout: float | None = None,
         env: Mapping[str, str] | None = None,
+        new_session: bool = False,
     ) -> subprocess.CompletedProcess[str]:
         self.calls.append(list(argv))
         queue = self.script.get(tuple(argv))

@@ -127,11 +127,13 @@ def _gone(
 # --- step 3 -------------------------------------------------------------------------------------
 
 
-def recheck(read: PaneRead, first: ManagedPane) -> ManagedPane | None:
+def recheck(read: PaneRead, first: ManagedPane, warn: Warn) -> ManagedPane | None:
     """Step 3: the pane resolved again by its full id; None when it is gone (no server
     included). Raises ``state_changed`` (exit 12) when its state differs from step 1, or when
-    the id now names another tmux pane (it is not the pane the hooks approved), and
-    ``ambiguous`` (exit 21) when two panes carry the id."""
+    the id now names another tmux pane while step 1's tmux pane is still a managed pane (it
+    is not the pane the hooks approved), and ``ambiguous`` (exit 21) when two panes carry the
+    id. When step 1's tmux pane is no longer a managed pane, the approved pane is gone and the
+    other one is left alone, with a warning."""
     matches = [pane for pane in read.panes if pane.id == first.id] if read.server_running else []
     if not matches:
         return None
@@ -146,6 +148,12 @@ def recheck(read: PaneRead, first: ManagedPane) -> ManagedPane | None:
         )
     current = matches[0]
     if current.pane_id != first.pane_id:
+        if not any(pane.pane_id == first.pane_id for pane in read.panes):
+            warn(
+                f"managed pane {first.id} (tmux pane {first.pane_id}) is gone; its id now"
+                f" appears on tmux pane {current.pane_id}, which was not touched"
+            )
+            return None
         raise TermctlError(
             "state_changed",
             f"managed pane {first.id} is now tmux pane {current.pane_id}, not"
@@ -177,7 +185,7 @@ class Closing:
     """What steps 1 to 3 established. ``current`` is the pane as step 3 read it, None when it
     was gone; ``pid_mismatch`` holds for a recorded PID that failed a check of step 1 or 3;
     ``proof`` is step 1's ``probe`` of a forced running pane's recorded PID (None when none
-    was made)."""
+    was made). ``signals_sent`` receives each signal as it is sent."""
 
     first: ManagedPane
     current: ManagedPane | None
@@ -185,6 +193,7 @@ class Closing:
     grace_s: float
     pid_mismatch: bool
     proof: Probe | None
+    signals_sent: list[str] = field(default_factory=list[str])
 
 
 @dataclass
@@ -219,9 +228,49 @@ def close(
         if closing.current is not None:
             _kill(backend, socket_path, closing.current, query=False)
         return Closed.mismatch() if closing.pid_mismatch else Closed()
+    assert first.pid is not None
+    if closing.proof is not None and closing.proof.pane_gone:
+        # Gone at step 1's probe, so never proven: never signaled (``gone_at_probe``).
+        if closing.current is not None:
+            _kill(backend, socket_path, closing.current, query=False)
+        return Closed() if gone_at_probe(gateway, first.pid, warn) else Closed.mismatch()
     if closing.current is None:
         return _signal_gone_pane(gateway, clock, closing, warn)
     return _kill_and_signal(backend, gateway, clock, socket_path, closing, warn)
+
+
+def gone_at_probe(gateway: Gateway, pid: int, warn: Warn) -> bool:
+    """For a pane gone at step 1's probe, which therefore proved nothing: whether its recorded
+    process has exited (no such process, or a zombie, as its handle shows). Otherwise, or
+    when that cannot be told, a warning: the process cannot be checked and is not signaled
+    (``pid_mismatch``)."""
+    try:
+        handle = gateway.open_process(pid)
+    except OSError:
+        handle, exited = None, False
+    else:
+        exited = handle is None
+    if handle is not None:
+        try:
+            exited = handle.exited() or _exited(gateway, pid)
+        finally:
+            handle.close()
+    if not exited:
+        _warn_unproven(pid, warn, "the recorded process is not signaled")
+    return exited
+
+
+def _warn_unproven(pid: int, warn: Warn, consequence: str) -> None:
+    warn(f"the pane was gone before process {pid} could be checked; {consequence}")
+
+
+def _exited(gateway: Gateway, pid: int) -> bool:
+    """Whether reading ``pid`` shows it gone or a zombie (for a handle that cannot tell)."""
+    try:
+        process = procs.read(gateway, pid)
+    except procs.ProcessError:
+        return False
+    return process is None or process.zombie
 
 
 def _kill(
@@ -280,7 +329,7 @@ def _signal_gone_pane(gateway: Gateway, clock: Clock, closing: Closing, warn: Wa
             return Closed()
         if process.start != first.pid_start:
             return Closed.mismatch()
-        return _sequence(gateway, clock, handle, first, closing.grace_s, warn)
+        return _sequence(gateway, clock, handle, first, closing, warn)
     finally:
         handle.close()
 
@@ -324,7 +373,7 @@ def _kill_and_signal(
             or answer.server_pid != check.server_pid
         ):
             return Closed.mismatch()  # respawned, or another server: never signaled
-        return _sequence(gateway, clock, handle, current, closing.grace_s, warn)
+        return _sequence(gateway, clock, handle, current, closing, warn)
     finally:
         handle.close()
 
@@ -337,7 +386,7 @@ def _signal_gone_handle(
     proof = closing.proof
     if proof is None or proof.verification.identity is not Identity.VERIFIED:
         return Closed.mismatch()
-    return _sequence(gateway, clock, handle, closing.first, closing.grace_s, warn)
+    return _sequence(gateway, clock, handle, closing.first, closing, warn)
 
 
 def _sequence(
@@ -345,11 +394,12 @@ def _sequence(
     clock: Clock,
     handle: ProcessHandle,
     pane: ManagedPane,
-    grace_s: float,
+    closing: Closing,
     warn: Warn,
 ) -> Closed:
     assert pane.pid is not None and pane.pid_start is not None
-    outcome = procs.signal_sequence(gateway, clock, handle, pane.pid, pane.pid_start, grace_s)
+    grace_s, sent = closing.grace_s, closing.signals_sent
+    outcome = procs.signal_sequence(gateway, clock, handle, pane.pid, pane.pid_start, grace_s, sent)
     for warning in outcome.warnings:
         warn(warning)
     return Closed(outcome.signals_sent, outcome.exited, outcome.pid_mismatch)
@@ -370,11 +420,19 @@ def dry_run(
     """The check of step 1 for ``--dry-run`` (a running pane here is forced): ``pid_mismatch``
     when the recorded PID fails the ``#{pane_pid}`` check or the process no longer has the
     recorded start time (or cannot be proven, ``probe``); the signals a real run could send
-    otherwise. Read-only: a guarded ``display``, ``SO_PEERCRED`` and ``/proc``."""
+    otherwise. A pane gone at the probe is no mismatch when its recorded process has exited
+    too, as ``gone_at_probe`` (reading it only). Read-only: a guarded ``display``,
+    ``SO_PEERCRED`` and ``/proc``."""
     mismatch = row_mismatch(pane)
     if pane.dead or pane.pid is None or mismatch:
         return DryRun(mismatch, [])
-    identity = probe(backend, gateway, socket_path, pane).verification
+    found = probe(backend, gateway, socket_path, pane)
+    if found.pane_gone:
+        if _exited(gateway, pane.pid):
+            return DryRun(False, [])
+        _warn_unproven(pane.pid, warn, "a real run would not signal the recorded process")
+        return DryRun(True, [])
+    identity = found.verification
     if identity.identity is Identity.VERIFIED:
         return DryRun(False, list(SIGNALS))
     if identity.identity is Identity.GONE:

@@ -12,6 +12,7 @@ import errno
 import os
 import platform
 import pwd
+import re
 import select
 import selectors
 import signal
@@ -23,7 +24,7 @@ import tempfile
 import threading
 import time
 from collections.abc import Iterator, Mapping
-from contextlib import contextmanager
+from contextlib import AbstractContextManager, contextmanager
 from dataclasses import dataclass
 from datetime import UTC, datetime
 from types import FrameType
@@ -70,8 +71,8 @@ WATCHDOG_PATH = os.path.abspath(hookwatch.__file__)
 
 
 class Terminated(BaseException):
-    """termctl got SIGTERM or SIGHUP while a hook ran; the hook's group was killed first.
-    termctl exits ``128 + signum``."""
+    """termctl got SIGTERM or SIGHUP while a hook ran (the hook's group was killed first), or
+    SIGTERM inside a ``stop_signal_guard``. termctl exits ``128 + signum``."""
 
     def __init__(self, signum: int) -> None:
         super().__init__(f"terminated by signal {signum}")
@@ -129,6 +130,14 @@ class ProcessHandle(Protocol):
         ...
 
 
+class StopGuard(Protocol):
+    """What ``Gateway.stop_signal_guard`` yields."""
+
+    def drop(self) -> None:
+        """From now until the guard ends, no stop signal raises: one that comes is dropped."""
+        ...
+
+
 class Gateway(Protocol):
     """External effects termctl needs. Later stages add tty writes here."""
 
@@ -139,6 +148,7 @@ class Gateway(Protocol):
         stdin: str | None = None,
         timeout: float | None = None,
         env: Mapping[str, str] | None = None,
+        new_session: bool = False,
     ) -> subprocess.CompletedProcess[str]: ...
 
     def run_bounded(
@@ -259,6 +269,22 @@ class Gateway(Protocol):
         pidfd (the caller then sends no signal). macOS: a handle on the PID alone."""
         ...
 
+    def proc_is_own_namespace(self) -> bool:
+        """Linux: whether ``/proc`` shows termctl's own PID namespace (``/proc/self`` names
+        termctl's PID), so ``/proc/<pid>`` is the process a pidfd or ``SO_PEERCRED`` names.
+        Raises ``OSError`` if ``/proc/self`` cannot be read."""
+        ...
+
+    def stop_signal_guard(self) -> AbstractContextManager[StopGuard]:
+        """Until the context exits (``close`` from its re-check until its records are
+        written): SIGHUP is ignored, so a hangup (closing termctl's own pane included) cannot
+        end the run; the first SIGTERM or SIGINT raises ``Terminated`` or
+        ``KeyboardInterrupt``, after which every stop signal is ignored so the caller can
+        write its records. A signal the caller set to be ignored or handled stays so. A hook
+        run meanwhile (``run_group``) is stopped through the same guard. Signal handlers are
+        process state: only the main thread changes them."""
+        ...
+
 
 class Clock(Protocol):
     def now(self) -> datetime:
@@ -284,10 +310,14 @@ class SystemGateway:
         stdin: str | None = None,
         timeout: float | None = None,
         env: Mapping[str, str] | None = None,
+        new_session: bool = False,
     ) -> subprocess.CompletedProcess[str]:
         """Run ``argv`` without a shell and capture its output as text.
 
         ``env`` replaces the whole environment when given; ``None`` inherits termctl's own.
+        ``new_session`` runs it in a session of its own, without termctl's controlling
+        terminal, so a hangup of that terminal (the guarded kill of termctl's own pane) does
+        not reach it.
         Output is read as bytes and decoded with ``.decode("utf-8", "surrogateescape")``
         whatever the locale (tmux runs with ``-u`` and writes UTF-8; each undecodable byte is
         kept as a lone surrogate), with no newline translation, so a ``\r`` in tmux's output
@@ -301,6 +331,7 @@ class SystemGateway:
             timeout=timeout,
             env=None if env is None else dict(env),
             check=False,
+            start_new_session=new_session,
         )
         return subprocess.CompletedProcess(
             completed.args,
@@ -441,17 +472,41 @@ class SystemGateway:
             return None
         return _PidfdHandle(fd)
 
+    def proc_is_own_namespace(self) -> bool:
+        return os.readlink("/proc/self") == str(os.getpid())
 
-# The Linux system call numbers of pidfd_send_signal (5.1) and pidfd_open (5.3): the same on
-# every architecture, which share one numbering for calls added since 5.1 (alpha excepted).
+    def stop_signal_guard(self) -> AbstractContextManager[StopGuard]:
+        return _stop_signal_guard()
+
+
+# The Linux system call numbers of pidfd_send_signal (5.1) and pidfd_open (5.3) on the
+# architectures that use the unified numbering for calls added since 5.1. Others differ: alpha
+# (534, 544), ia64 (1448, 1458) and MIPS (4424/4434 o32, 5424/5434 n64, 6424/6434 n32), and
+# x32 needs __X32_SYSCALL_BIT; there the raw calls are refused (ENOSYS).
 _SYS_PIDFD_SEND_SIGNAL = 424
 _SYS_PIDFD_OPEN = 434
+# platform.machine() of the architectures known to use those numbers.
+_UNIFIED_SYSCALL_MACHINE = re.compile(r"x86_64|i[3-6]86|aarch64|arm.*|riscv64|ppc64(le)?|s390x")
+# The largest PID (and pidfd_open's pid_t argument): a C int.
+_PID_T_MAX = 2**31 - 1
+
+
+def _syscall_numbers_known() -> bool:
+    """Whether ``_SYS_PIDFD_*`` are this machine's numbers: Linux on an allowlisted
+    architecture, and on x86_64 the 64-bit ABI (not x32, whose pointers are 4 bytes)."""
+    if sys.platform != "linux":
+        return False
+    machine = platform.machine()
+    if _UNIFIED_SYSCALL_MACHINE.fullmatch(machine) is None:
+        return False
+    return machine != "x86_64" or ctypes.sizeof(ctypes.c_void_p) == 8
 
 
 def _syscall(number: int, *args: ctypes.c_int | ctypes.c_uint | None) -> int:
     """A raw Linux system call through libc's ``syscall``, for Python builds whose ``os`` lacks
-    the pidfd functions (some standalone builds); raises ``OSError`` with its errno."""
-    if platform.machine().startswith("alpha"):  # pragma: no cover - other numbering
+    the pidfd functions (some standalone builds); raises ``OSError`` with its errno, and
+    ``ENOSYS`` where the system call numbers are not known (``_syscall_numbers_known``)."""
+    if not _syscall_numbers_known():
         raise OSError(errno.ENOSYS, "pidfd system calls are not known on this architecture")
     libc = ctypes.CDLL(None, use_errno=True)
     result = libc.syscall(ctypes.c_long(number), *args)
@@ -462,8 +517,11 @@ def _syscall(number: int, *args: ctypes.c_int | ctypes.c_uint | None) -> int:
 
 
 def _pidfd_open(pid: int) -> int:
-    """``pidfd_open(pid, 0)``; ``ProcessLookupError`` when no such process exists, another
-    ``OSError`` (``ENOSYS`` before Linux 5.3) when no handle can be opened."""
+    """``pidfd_open(pid, 0)``; ``ProcessLookupError`` when no such process exists (a PID
+    outside 1 to 2**31-1 never does, and is never passed on), another ``OSError`` (``ENOSYS``
+    before Linux 5.3) when no handle can be opened."""
+    if not 1 <= pid <= _PID_T_MAX:
+        raise ProcessLookupError(errno.ESRCH, f"no process can have PID {pid}")
     if hasattr(os, "pidfd_open"):
         return os.pidfd_open(pid)
     try:
@@ -521,6 +579,10 @@ class _PidfdHandle:
             os.close(fd)
 
 
+# TODO(#26): macOS signals a bare PID. The start time is checked through ps (one-second
+# resolution) just before os.kill, so a PID reused between that check and the kill could be
+# signaled (docs/design.md "Implementation notes", interface.md "Residual risks"); #26 owns the
+# macOS signaling path and its verification.
 class _PidHandle:  # pragma: no cover - macOS only
     """macOS: the PID alone. The caller checks the start time just before each signal."""
 
@@ -603,45 +665,65 @@ def _default_sigchld() -> None:
 
 
 class _StopSignals:
-    """The handler ``_hook_signals`` installs for SIGTERM and SIGHUP: the first signal raises
-    ``Terminated``, unless it is held, in which case ``release`` raises it.
+    """The handler ``_hook_signals`` and ``_stop_signal_guard`` install: the first stop signal
+    raises (``Terminated``, or ``KeyboardInterrupt`` for SIGINT), unless it is held, in which
+    case ``release`` raises it; later ones, and those in ``ignored``, do nothing.
 
     Held while the hook starts, so the signal cannot come between the fork and the moment the
     caller has the process to kill. Not blocked with ``pthread_sigmask``: the hook would inherit
-    the blocked mask.
+    the blocked mask (and a handled signal, unlike an ignored one, is reset by ``exec``).
     """
 
-    def __init__(self) -> None:
+    def __init__(self, ignored: frozenset[int] = frozenset()) -> None:
+        self._ignored = ignored
         self._raised = False
         self._held = False
         self._pending: int | None = None
 
     def handle(self, signum: int, frame: FrameType | None) -> None:
         # Only the first signal raises, so a second one cannot interrupt the cleanup.
-        if self._raised:
+        if signum in self._ignored or self._raised:
             return
         self._raised = True
         if self._held:
             self._pending = signum
             return
-        raise Terminated(signum)
+        raise _stop_exception(signum)
 
     def hold(self) -> None:
         self._held = True
 
     def release(self) -> None:
-        """Stop holding; raise ``Terminated`` for a signal that came while held."""
+        """Stop holding; raise for a signal that came while held."""
         self._held = False
         if self._pending is not None:
             signum, self._pending = self._pending, None
-            raise Terminated(signum)
+            raise _stop_exception(signum)
+
+    def drop(self) -> None:
+        """From now on no signal raises, a held one included."""
+        self._raised = True
+        self._pending = None
+
+
+def _stop_exception(signum: int) -> BaseException:
+    return KeyboardInterrupt() if signum == signal.SIGINT else Terminated(signum)
+
+
+# The guard of ``_stop_signal_guard`` while it is active; ``_hook_signals`` defers to it.
+_active_guard: _StopSignals | None = None
 
 
 @contextmanager
 def _hook_signals() -> Iterator[_StopSignals]:
     """While a hook runs: ``SIGCHLD`` at its default, and ``SIGTERM`` and ``SIGHUP`` (unless
     ignored or handled already) raise ``Terminated`` (see ``_StopSignals``), so the hook's group
-    is killed before termctl exits. The previous handlers are restored afterwards."""
+    is killed before termctl exits. The previous handlers are restored afterwards. Inside a
+    ``_stop_signal_guard`` the guard's handler stays and is used instead."""
+    if _active_guard is not None:
+        _default_sigchld()
+        yield _active_guard
+        return
     stops = _StopSignals()
     if threading.current_thread() is not threading.main_thread():
         yield stops
@@ -654,6 +736,34 @@ def _hook_signals() -> Iterator[_StopSignals]:
     try:
         yield stops
     finally:
+        for signum, handler in previous.items():
+            signal.signal(signum, handler)
+
+
+@contextmanager
+def _stop_signal_guard() -> Iterator[StopGuard]:
+    """``Gateway.stop_signal_guard``: SIGHUP ignored, the first SIGTERM or SIGINT raises, any
+    later one is ignored. Only signals at their default handling are taken over, by a handler
+    (not SIG_IGN), so the programs termctl runs meanwhile get them at their default."""
+    global _active_guard
+    stops = _StopSignals(ignored=frozenset({signal.SIGHUP}))
+    if threading.current_thread() is not threading.main_thread() or _active_guard is not None:
+        yield stops
+        return
+    defaults: dict[int, Any] = {
+        signal.SIGTERM: signal.SIG_DFL,
+        signal.SIGHUP: signal.SIG_DFL,
+        signal.SIGINT: signal.default_int_handler,
+    }
+    previous: dict[int, Any] = {}
+    for signum, default in defaults.items():
+        if signal.getsignal(signum) == default:
+            previous[signum] = signal.signal(signum, stops.handle)
+    _active_guard = stops
+    try:
+        yield stops
+    finally:
+        _active_guard = None
         for signum, handler in previous.items():
             signal.signal(signum, handler)
 

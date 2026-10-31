@@ -66,6 +66,19 @@ def read(gateway: Gateway, pid: int) -> Process | None:
     return _read_proc(gateway, pid)
 
 
+def namespace_problem(gateway: Gateway) -> str | None:
+    """Linux: why ``/proc`` cannot be trusted to show the processes termctl's PID namespace
+    sees (a pidfd and ``SO_PEERCRED`` use that namespace; ``/proc`` shows the one it was
+    mounted for, e.g. after ``unshare -p`` without a new ``/proc``, or a host ``/proc`` bound
+    into a container), or None when it can: ``/proc/self`` must name termctl's own PID."""
+    try:
+        if gateway.proc_is_own_namespace():
+            return None
+    except OSError as err:
+        return f"cannot read /proc/self: {err.strerror or err}"
+    return "/proc belongs to another PID namespace than termctl"
+
+
 def _read_proc(gateway: Gateway, pid: int) -> Process | None:
     try:
         text = gateway.read_proc_stat(pid)
@@ -147,8 +160,9 @@ def verify(
 
     On Linux the server socket's ``SO_PEERCRED`` PID must be ``server_pid`` (tmux's
     ``#{pid}``): tmux reports PIDs in the server's PID namespace and ``/proc`` is read in
-    termctl's. Then the process must exist, not be a zombie, have the recorded ``start`` time
-    and have the server as its parent. A check that cannot be made is ``UNCHECKABLE``.
+    termctl's, which ``/proc`` must show (``namespace_problem``). Then the process must exist,
+    not be a zombie, have the recorded ``start`` time and have the server as its parent. A
+    check that cannot be made is ``UNCHECKABLE``.
     """
     if gateway.platform() != "darwin":
         try:
@@ -159,6 +173,9 @@ def verify(
             )
         if peer != server_pid:
             return Verification(Identity.MISMATCH)
+        problem = namespace_problem(gateway)
+        if problem is not None:
+            return Verification(Identity.UNCHECKABLE, problem)
     try:
         process = read(gateway, pid)
     except ProcessError as err:
@@ -205,6 +222,7 @@ def signal_sequence(
     pid: int,
     start: str,
     grace_s: float,
+    sent: list[str] | None = None,
 ) -> SignalOutcome:
     """interface.md `close` step 5, after the kernel's SIGHUP (the pane was killed, or was
     found gone): wait up to ``grace_s`` for the process to exit, send SIGTERM, wait 5 seconds,
@@ -216,9 +234,10 @@ def signal_sequence(
     is sent), and after a signal means the recorded process has exited and its PID was
     reused. A process that cannot be read stops the sequence with a warning; it is reported
     as exited only if the handle says so. A process that survives SIGKILL is ``exited:
-    False``.
+    False``. ``sent``, when given, is the outcome's ``signals_sent`` list, so the caller sees
+    each signal as soon as it is sent (a run stopped meanwhile audits them).
     """
-    outcome = SignalOutcome()
+    outcome = SignalOutcome() if sent is None else SignalOutcome(signals_sent=sent)
 
     def state() -> _State:
         if handle.exited():

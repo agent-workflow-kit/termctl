@@ -585,7 +585,7 @@ def test_read_generates_a_fresh_sentinel_each_time(monkeypatch: pytest.MonkeyPat
     seen: list[str] = []
 
     class Capture(FakeGateway):
-        def run(self, argv, *, stdin=None, timeout=None, env=None):  # type: ignore[no-untyped-def,override]
+        def run(self, argv, *, stdin=None, timeout=None, env=None, new_session=False):  # type: ignore[no-untyped-def,override]
             seen.append(argv[-1].rsplit("\t", 1)[-1])
             return subprocess.CompletedProcess(argv, 0, "", "")
 

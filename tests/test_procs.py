@@ -12,6 +12,7 @@ from pathlib import Path
 
 import pytest
 
+from termctl import gateway as gateway_module
 from termctl import procs
 from termctl.gateway import SystemGateway
 
@@ -23,6 +24,9 @@ TAIL = "0 -1 4194304 131 0 0 0 0 0 0 0 20 0 1 0 823520334 3436544 70 18446744073
 
 def stat_line(pid: int = 4242, comm: str = "sleep", state: str = "S", ppid: int = 77) -> str:
     return f"{pid} ({comm}) {state} {ppid} {pid} {pid} {TAIL}\n"
+
+
+needs_proc = pytest.mark.skipif(not Path("/proc/self/stat").exists(), reason="Linux /proc")
 
 
 def linux(pid: int, answer: str | None | BaseException) -> FakeGateway:
@@ -243,6 +247,30 @@ def test_verify_that_cannot_check_is_uncheckable_with_a_reason(gateway: FakeGate
     assert found.identity is procs.Identity.UNCHECKABLE and found.problem
 
 
+@pytest.mark.parametrize(
+    ("own", "problem"),
+    [
+        (False, "/proc belongs to another PID namespace than termctl"),
+        (OSError(errno.ENOENT, "No such file or directory"), "cannot read /proc/self"),
+    ],
+)
+def test_verify_with_a_proc_of_another_pid_namespace_is_uncheckable(
+    own: bool | OSError, problem: str
+) -> None:
+    gateway = proving()
+    gateway.own_namespace = own
+    found = procs.verify(gateway, SOCK, 4242, START, SERVER)
+    assert found.identity is procs.Identity.UNCHECKABLE
+    assert found.problem is not None and problem in found.problem
+    assert gateway.proc_reads == []
+
+
+@needs_proc
+def test_this_process_sees_its_own_pid_namespace_in_proc() -> None:
+    assert SystemGateway().proc_is_own_namespace() is True
+    assert procs.namespace_problem(SystemGateway()) is None
+
+
 def test_verify_on_macos_skips_the_namespace_check() -> None:
     lstart = "Thu Jan  1 00:00:10 2026"
     gateway = FakeGateway(
@@ -381,6 +409,66 @@ def test_a_signal_refused_by_the_kernel_stops_with_a_warning() -> None:
 # --- the real pidfd handle (Linux) --------------------------------------------------------------
 
 needs_pidfd = pytest.mark.skipif(not Path("/proc/self/stat").exists(), reason="Linux pidfd")
+
+
+@needs_pidfd
+@pytest.mark.parametrize("pid", [0, -1, 2**31, 2**32 + 1])
+def test_pidfd_open_refuses_a_pid_no_process_can_have(
+    pid: int, monkeypatch: pytest.MonkeyPatch
+) -> None:
+    # Before any system call: the raw fallback would truncate it to a C int.
+    def no_syscall(*args: object) -> int:
+        raise AssertionError("a system call was made")
+
+    monkeypatch.delattr(os, "pidfd_open", raising=False)
+    monkeypatch.setattr(gateway_module, "_syscall", no_syscall)
+    with pytest.raises(ProcessLookupError):
+        gateway_module._pidfd_open(pid)
+    assert SystemGateway().open_process(pid) is None
+
+
+@pytest.mark.parametrize(
+    ("system", "machine", "pointer"),
+    [
+        ("linux", "mips64", 8),
+        ("linux", "mips", 4),
+        ("linux", "ia64", 8),
+        ("linux", "alpha", 8),
+        ("linux", "x86_64", 4),  # x32
+        ("freebsd14", "x86_64", 8),
+    ],
+)
+def test_raw_pidfd_calls_are_refused_where_their_numbers_are_unknown(
+    system: str, machine: str, pointer: int, monkeypatch: pytest.MonkeyPatch
+) -> None:
+    monkeypatch.setattr(gateway_module.sys, "platform", system)
+    monkeypatch.setattr(gateway_module.platform, "machine", lambda: machine)
+    monkeypatch.setattr(gateway_module.ctypes, "sizeof", lambda _: pointer)
+    with pytest.raises(OSError) as info:
+        gateway_module._syscall(gateway_module._SYS_PIDFD_OPEN, None)
+    assert info.value.errno == errno.ENOSYS
+
+
+@pytest.mark.parametrize(
+    "machine", ["x86_64", "i686", "aarch64", "armv7l", "riscv64", "ppc64le", "ppc64", "s390x"]
+)
+def test_raw_pidfd_call_numbers_are_known_on_the_unified_architectures(
+    machine: str, monkeypatch: pytest.MonkeyPatch
+) -> None:
+    monkeypatch.setattr(gateway_module.sys, "platform", "linux")
+    monkeypatch.setattr(gateway_module.platform, "machine", lambda: machine)
+    monkeypatch.setattr(gateway_module.ctypes, "sizeof", lambda _: 8)
+    assert gateway_module._syscall_numbers_known()
+
+
+@needs_pidfd
+def test_without_known_pidfd_calls_no_handle_is_opened(monkeypatch: pytest.MonkeyPatch) -> None:
+    # ENOSYS from the raw fallback is a handle that cannot be opened: uncheckable.
+    monkeypatch.delattr(os, "pidfd_open", raising=False)
+    monkeypatch.setattr(gateway_module.platform, "machine", lambda: "mips64")
+    with pytest.raises(OSError) as info:
+        SystemGateway().open_process(os.getpid())
+    assert info.value.errno == errno.ENOSYS
 
 
 @needs_pidfd

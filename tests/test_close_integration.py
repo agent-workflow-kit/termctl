@@ -9,9 +9,11 @@ private server, or with ``subprocess``. A process left running is stopped by its
 
 from __future__ import annotations
 
+import json
 import os
 import signal
 import subprocess
+import sys
 from collections.abc import Iterator
 from contextlib import contextmanager
 from pathlib import Path
@@ -24,7 +26,7 @@ from termctl.gateway import SystemGateway
 from .conftest import TmuxServer, wait_for
 from .procs import is_gone, wait_gone
 from .schemas import validate
-from .test_cli_open_integration import fmt, opened, pane_exists, termctl
+from .test_cli_open_integration import NO_CONFIG, fmt, opened, pane_exists, termctl
 
 pytestmark = [
     pytest.mark.tmux,
@@ -198,3 +200,41 @@ def test_closing_the_last_pane_of_the_server_ends_it_and_still_closes(
         assert (data["pane_closed"], data["exited"], data["pid_mismatch"]) == (True, True, False)
         assert wait_for(lambda: not tmux_server.alive())
         assert wait_gone(pid)
+
+
+# The pane's own command: wait for its id, then close its own pane with --force. stdout goes to
+# a file; stderr stays on the pane's terminal, which dies under it.
+_CLOSE_OWN_PANE = """
+while [ ! -s "$1" ]; do sleep 0.05; done
+env HOME="$5" XDG_CONFIG_HOME="$6" XDG_STATE_HOME="$5" "$2" -m termctl --socket "$3" --json \\
+    close "$(cat "$1")" --force --actor human:tester --grace 0s > "$4"
+"""
+
+
+def test_closing_its_own_pane_with_force_completes_and_writes_its_records(
+    tmux_server: TmuxServer, tmp_path: Path
+) -> None:
+    tmux_server.start()
+    id_file, out_file, state = tmp_path / "id", tmp_path / "out", tmp_path / "state"
+    state.mkdir(mode=0o700)
+    args = (str(id_file), sys.executable, tmux_server.socket_path, str(out_file), str(state))
+    out = opened(tmux_server, "--", "/bin/sh", "-c", _CLOSE_OWN_PANE, "sh", *args, NO_CONFIG)
+    pid = recorded_pid(tmux_server, out["pane_id"])
+    with stop_if_left(pid, start_of(pid)):
+        (tmp_path / "id.tmp").write_text(str(out["id"]))
+        (tmp_path / "id.tmp").rename(id_file)
+        audit = state / "termctl" / "audit.jsonl"
+        # The kernel's SIGHUP (the pane's terminal closes under termctl) must not stop it.
+        assert wait_for(lambda: audit.exists() and audit.read_text().endswith("\n"), 20)
+        [record] = [json.loads(line) for line in audit.read_text().splitlines()]
+        validate(record, "termctl/audit.json")
+        assert (record["target"], record["force"]) == (out["id"], True)
+        result = record["result"]
+        # The tmux client of the kill, in a session of its own, still read the pane's process.
+        assert (result["pane_closed"], result["was_running"]) == (True, True)
+        assert (result["exited"], result["pid_mismatch"]) == (True, False)
+        assert not pane_exists(tmux_server, out["pane_id"])
+        log_file = state / "termctl" / "log.jsonl"
+        log = [json.loads(line) for line in log_file.read_text().splitlines()]
+        assert [(r["result"], r["exit_code"]) for r in log if r["event"] == "close"] == [("ok", 0)]
+        assert json.loads(out_file.read_text()) == result
