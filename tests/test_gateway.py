@@ -286,83 +286,6 @@ def test_system_gateway_encodes_stdin_as_utf8() -> None:
     assert result.stdout == "é\n"
 
 
-def test_system_gateway_real_uid(monkeypatch: pytest.MonkeyPatch) -> None:
-    monkeypatch.setattr(os, "getuid", lambda: 4242)
-    assert SystemGateway().real_uid() == 4242
-
-
-def test_system_gateway_lstat_does_not_follow_symlinks(tmp_path: Path) -> None:
-    (tmp_path / "dir").mkdir(mode=0o750)
-    (tmp_path / "dir").chmod(0o750)
-    (tmp_path / "link").symlink_to(tmp_path / "dir")
-    gateway = SystemGateway()
-    info = gateway.lstat(str(tmp_path / "dir"))
-    assert (stat.S_ISDIR(info.mode), stat.S_IMODE(info.mode)) == (True, 0o750)
-    assert info.uid == os.getuid()
-    assert stat.S_ISLNK(gateway.lstat(str(tmp_path / "link")).mode)
-    with pytest.raises(FileNotFoundError):
-        gateway.lstat(str(tmp_path / "missing"))
-
-
-def test_system_gateway_real_path_is_strict(tmp_path: Path) -> None:
-    (tmp_path / "dir").mkdir()
-    (tmp_path / "link").symlink_to(tmp_path / "dir")
-    (tmp_path / "dangling").symlink_to(tmp_path / "nowhere")
-    gateway = SystemGateway()
-    assert gateway.real_path(str(tmp_path / "link")) == os.path.realpath(tmp_path / "dir")
-    with pytest.raises(OSError):
-        gateway.real_path(str(tmp_path / "dangling"))
-    with pytest.raises(OSError):
-        gateway.real_path(str(tmp_path / "missing" / ".."))
-
-
-def test_system_gateway_read_link(tmp_path: Path) -> None:
-    (tmp_path / "link").symlink_to("relative/target")
-    (tmp_path / "file").write_text("")
-    gateway = SystemGateway()
-    assert gateway.read_link(str(tmp_path / "link")) == "relative/target"
-    with pytest.raises(OSError):
-        gateway.read_link(str(tmp_path / "file"))
-    with pytest.raises(FileNotFoundError):
-        gateway.read_link(str(tmp_path / "missing"))
-
-
-def test_system_gateway_make_dir_uses_the_mode(tmp_path: Path) -> None:
-    path = tmp_path / "d"
-    old = os.umask(0o022)
-    try:
-        SystemGateway().make_dir(str(path), 0o700)
-    finally:
-        os.umask(old)
-    assert stat.S_IMODE(path.stat().st_mode) == 0o700
-
-
-def test_system_gateway_make_dir_refuses_an_existing_path(tmp_path: Path) -> None:
-    (tmp_path / "link").symlink_to(tmp_path / "missing")
-    with pytest.raises(FileExistsError):
-        SystemGateway().make_dir(str(tmp_path / "link"), 0o700)
-    assert not (tmp_path / "missing").exists()
-
-
-def test_system_gateway_make_dir_never_creates_parents(tmp_path: Path) -> None:
-    with pytest.raises(FileNotFoundError):
-        SystemGateway().make_dir(str(tmp_path / "a" / "b"), 0o700)
-
-
-@pytest.mark.skipif(sys.platform != "linux", reason="SO_PEERCRED is Linux-only")
-def test_system_gateway_socket_peer_pid(tmp_path: Path) -> None:
-    path = str(tmp_path / "sock")
-    with socket.socket(socket.AF_UNIX, socket.SOCK_STREAM) as server:
-        server.bind(path)
-        server.listen(1)
-        assert SystemGateway().socket_peer_pid(path) == os.getpid()
-
-
-def test_system_gateway_socket_peer_pid_without_a_listener(tmp_path: Path) -> None:
-    with pytest.raises(OSError):
-        SystemGateway().socket_peer_pid(str(tmp_path / "missing"))
-
-
 # --- run_group ----------------------------------------------------------------------------------
 
 SH = "/bin/sh"
@@ -1067,3 +990,80 @@ def test_watchdog_kills_the_hook_on_a_stop_signal_while_it_starts(tmp_path: Path
     )
     assert proc.returncode == 1, proc.stderr
     assert wait_gone(int(read_when_ready(marker)))
+
+
+def test_system_gateway_real_uid(monkeypatch: pytest.MonkeyPatch) -> None:
+    monkeypatch.setattr(os, "getuid", lambda: 4242)
+    assert SystemGateway().real_uid() == 4242
+
+
+def test_system_gateway_lstat_does_not_follow_symlinks(tmp_path: Path) -> None:
+    (tmp_path / "dir").mkdir(mode=0o750)
+    (tmp_path / "dir").chmod(0o750)
+    (tmp_path / "link").symlink_to(tmp_path / "dir")
+    gateway = SystemGateway()
+    info = gateway.lstat(str(tmp_path / "dir"))
+    assert (stat.S_ISDIR(info.mode), stat.S_IMODE(info.mode)) == (True, 0o750)
+    assert info.uid == os.getuid()
+    assert stat.S_ISLNK(gateway.lstat(str(tmp_path / "link")).mode)
+    with pytest.raises(FileNotFoundError):
+        gateway.lstat(str(tmp_path / "missing"))
+
+
+def test_system_gateway_real_path_is_strict(tmp_path: Path) -> None:
+    (tmp_path / "dir").mkdir()
+    (tmp_path / "link").symlink_to(tmp_path / "dir")
+    (tmp_path / "dangling").symlink_to(tmp_path / "nowhere")
+    gateway = SystemGateway()
+    assert gateway.real_path(str(tmp_path / "link")) == os.path.realpath(tmp_path / "dir")
+    with pytest.raises(OSError):
+        gateway.real_path(str(tmp_path / "dangling"))
+    with pytest.raises(OSError):
+        gateway.real_path(str(tmp_path / "missing" / ".."))
+
+
+def test_system_gateway_read_link(tmp_path: Path) -> None:
+    (tmp_path / "link").symlink_to("relative/target")
+    (tmp_path / "file").write_text("")
+    gateway = SystemGateway()
+    assert gateway.read_link(str(tmp_path / "link")) == "relative/target"
+    with pytest.raises(OSError):
+        gateway.read_link(str(tmp_path / "file"))
+    with pytest.raises(FileNotFoundError):
+        gateway.read_link(str(tmp_path / "missing"))
+
+
+def test_system_gateway_make_dir_uses_the_mode(tmp_path: Path) -> None:
+    path = tmp_path / "d"
+    old = os.umask(0o022)
+    try:
+        SystemGateway().make_dir(str(path), 0o700)
+    finally:
+        os.umask(old)
+    assert stat.S_IMODE(path.stat().st_mode) == 0o700
+
+
+def test_system_gateway_make_dir_refuses_an_existing_path(tmp_path: Path) -> None:
+    (tmp_path / "link").symlink_to(tmp_path / "missing")
+    with pytest.raises(FileExistsError):
+        SystemGateway().make_dir(str(tmp_path / "link"), 0o700)
+    assert not (tmp_path / "missing").exists()
+
+
+def test_system_gateway_make_dir_never_creates_parents(tmp_path: Path) -> None:
+    with pytest.raises(FileNotFoundError):
+        SystemGateway().make_dir(str(tmp_path / "a" / "b"), 0o700)
+
+
+@pytest.mark.skipif(sys.platform != "linux", reason="SO_PEERCRED is Linux-only")
+def test_system_gateway_socket_peer_pid(tmp_path: Path) -> None:
+    path = str(tmp_path / "sock")
+    with socket.socket(socket.AF_UNIX, socket.SOCK_STREAM) as server:
+        server.bind(path)
+        server.listen(1)
+        assert SystemGateway().socket_peer_pid(path) == os.getpid()
+
+
+def test_system_gateway_socket_peer_pid_without_a_listener(tmp_path: Path) -> None:
+    with pytest.raises(OSError):
+        SystemGateway().socket_peer_pid(str(tmp_path / "missing"))

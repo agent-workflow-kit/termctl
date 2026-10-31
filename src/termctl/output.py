@@ -122,6 +122,7 @@ class Output:
             _write(self.stdout, to_json(err.envelope()))
             # Flushed now so that it precedes the message when both go to one pipe or file.
             _flush(self.stdout)
+        # TODO(#6): hook_stderr is not printed in human mode yet (PR #41 adds its lines).
         self._stderr(err.message)
         if err.hook_stderr and not self.json:
             self.hook_stderr(err.hook_stderr)
