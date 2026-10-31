@@ -2,6 +2,7 @@ from __future__ import annotations
 
 import io
 import json
+import signal
 import subprocess
 import sys
 import tomllib
@@ -13,6 +14,7 @@ import pytest
 from termctl import __version__, cli
 from termctl.cli import Context, Result, main, parse_args
 from termctl.errors import TermctlError, UsageError
+from termctl.gateway import Terminated
 
 from .fakes import TMUX, FakeClock, FakeGateway
 from .schemas import validate
@@ -757,6 +759,25 @@ def test_unexpected_exception_is_internal(monkeypatch: pytest.MonkeyPatch) -> No
         "code": "internal",
         "message": "internal error: RuntimeError: boom",
     }
+
+
+@pytest.mark.parametrize(
+    ("stop", "code", "message"),
+    [
+        (KeyboardInterrupt(), 130, "termctl: interrupted\n"),
+        (Terminated(signal.SIGTERM), 143, "termctl: terminated by signal 15\n"),
+        (Terminated(signal.SIGHUP), 129, "termctl: terminated by signal 1\n"),
+    ],
+)
+def test_a_stop_signal_exits_128_plus_its_number_without_a_traceback(
+    monkeypatch: pytest.MonkeyPatch, stop: BaseException, code: int, message: str
+) -> None:
+    def stopped(args: Any, ctx: Context) -> Result:
+        raise stop
+
+    monkeypatch.setattr(cli, "run_command", stopped)
+    run = Run(["--json", "--quiet", "placements"])
+    assert (run.code, run.stdout, run.stderr) == (code, "", message)
 
 
 def test_quiet_suppresses_warnings_but_not_errors(monkeypatch: pytest.MonkeyPatch) -> None:

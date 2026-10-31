@@ -68,6 +68,9 @@ ENV_KEYS = ("socket", "tmux_bin", "backend", "keep_on_exit", "close_grace", "mar
 
 PRE_HOOKS = ("pre-open", "pre-close")
 
+DEFAULT_HOOK_TIMEOUT_S = 30
+MAX_HOOK_TIMEOUT_S = 600
+
 
 class ConfigError(TermctlError):
     """Invalid config (exit 2, ``config_invalid``); ``details`` names the key, variable or file."""
@@ -121,7 +124,21 @@ def _integral(value: Any) -> Any:
 
 
 NonEmpty = Annotated[str, Field(min_length=1)]
+
+
+def _no_nul(value: str) -> str:
+    # A command line cannot hold a NUL, so such a hook could never be started.
+    if "\x00" in value:
+        raise ValueError("must not contain a NUL character")
+    return value
+
+
+HookCmd = Annotated[str, Field(min_length=1), AfterValidator(_no_nul)]
 PositiveInt = Annotated[int, BeforeValidator(_integral), Field(ge=1)]
+# A hook timeout in whole seconds (interface.md "Hooks"): at most 10 minutes, like every other
+# duration termctl accepts, which leaves room for a gate with agent checks (design guide
+# section 8 gives such a gate 600 s).
+HookTimeout = Annotated[int, BeforeValidator(_integral), Field(ge=1, le=MAX_HOOK_TIMEOUT_S)]
 Socket = Annotated[str, _problem(_config_socket_problem, "socket")]
 Duration = Annotated[str, _grammar(_is_duration, "duration (e.g. 10s, 500ms, 2m; at most 10m)")]
 MarkerName = Annotated[str, _grammar(validate.is_marker_name, "marker name")]
@@ -173,10 +190,8 @@ class Rule(_Model):
 
 
 class PreHook(_Model):
-    cmd: NonEmpty
-    # TODO(#6): bound hook timeout (schema allows arbitrarily large ints; clamp or add a schema
-    # maximum).
-    timeout: PositiveInt = 30
+    cmd: HookCmd
+    timeout: HookTimeout = DEFAULT_HOOK_TIMEOUT_S
 
 
 class PostHook(PreHook):
