@@ -1073,13 +1073,13 @@ def _done(
 
 
 class RecordingGateway(FakeGateway):
+    """Also records each call's timeout (``FakeGateway`` records the env)."""
+
     def __init__(self, *args: object, **kwargs: object) -> None:
         super().__init__(*args, **kwargs)  # type: ignore[arg-type]
-        self.envs: list[dict[str, str] | None] = []
         self.timeouts: list[float | None] = []
 
     def run(self, argv, *, stdin=None, timeout=None, env=None):  # type: ignore[no-untyped-def,override]
-        self.envs.append(None if env is None else dict(env))
         self.timeouts.append(timeout)
         return super().run(argv, stdin=stdin, timeout=timeout, env=env)
 

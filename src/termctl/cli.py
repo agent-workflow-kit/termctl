@@ -14,13 +14,14 @@ from collections.abc import Mapping, Sequence
 from dataclasses import dataclass, field
 from typing import Any, NoReturn, TextIO
 
-from . import __version__, ids, tmux_socket, validate
+from . import __version__, ids, tmux_bin, tmux_socket, validate
 from . import config as config_module
 from .argv import Scan, scan
 from .config import Config
 from .errors import TermctlError, UsageError
 from .gateway import Clock, Gateway, SystemClock, SystemGateway
 from .output import PROG, Output, Result, flush_standard_streams
+from .tmux_bin import TmuxBinary
 
 __all__ = ["Context", "Output", "Result", "main", "parse_args"]
 
@@ -37,6 +38,10 @@ class Context:
     # Set by step 2 (the resolved server) and step 3 (False when there is no server).
     server: tmux_socket.Server | None = None
     socket_present: bool | None = None
+    # `tmux_bin` resolved to an absolute path, once: by `open`'s resolve step or the tmux checks.
+    tmux_path: str | None = None
+    # The resolved tmux binary and version, set by the tmux checks (step 3) after `tmux -V`.
+    tmux: TmuxBinary | None = None
 
 
 # --- argument parsing ---------------------------------------------------------------------------
@@ -410,7 +415,18 @@ def resolve_server(args: argparse.Namespace, ctx: Context) -> None:
 
 def check_tmux(args: argparse.Namespace, ctx: Context) -> None:
     """Step 3: tmux binary, version and socket safety checks (exit 12)."""
-    # TODO(#10): the tmux binary and version checks, before the socket checks.
+    if ctx.tmux is None:
+        if ctx.tmux_path is None:
+            ctx.tmux_path = tmux_bin.resolve(ctx.config.tmux_bin, ctx.environ, ctx.gateway)
+        # TODO(#5): a version warning also gets a `warning` log record in logged commands.
+        ctx.tmux = tmux_bin.probe(
+            ctx.config.tmux_bin,
+            ctx.environ,
+            ctx.gateway,
+            ctx.out.warn,
+            ctx.out.trace,
+            path=ctx.tmux_path,
+        )
     assert ctx.server is not None
     ctx.socket_present = tmux_socket.check(ctx.server, ctx.gateway)
     # TODO(#14): open re-checks the socket right before connecting, creates the default
