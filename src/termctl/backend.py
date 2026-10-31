@@ -15,7 +15,8 @@ implements it:
   options and window name (``pane_change.py``); ``rename``, ``mark``, ``unmark`` and the label
   commands use them.
 - ``pane_tty``: the terminal a ``bell`` marker writes BEL to (``display.ring_bell``).
-- TODO(#23): ``close``; TODO(#24): ``focus``.
+- ``query_process`` and ``kill_pane``: ``close`` (``close_cmd``).
+- TODO(#24): ``focus``.
 """
 
 from __future__ import annotations
@@ -151,6 +152,22 @@ class Backend(Protocol):
         reported; ``display.ring_bell`` writes only to a pseudo-terminal."""
         ...
 
+    def query_process(
+        self, pane_id: str, termctl_id: str
+    ) -> tuple[tb.GuardOutcome, subprocess.CompletedProcess[str], tb.ProcessQuery | None]:
+        """Read the pane's ``#{pane_pid} #{pane_dead} #{pid}``, guarded by its being managed
+        as ``termctl_id``; the guard's outcome, tmux's result and the parsed answer (None when
+        it did not match or printed anything else). Raises only when tmux cannot be run."""
+        ...
+
+    def kill_pane(
+        self, pane_id: str, termctl_id: str, *, query: bool
+    ) -> tuple[tb.GuardOutcome, subprocess.CompletedProcess[str], tb.ProcessQuery | None]:
+        """``kill-pane`` of the pane, guarded by its being managed as ``termctl_id``; with
+        ``query``, the same invocation first reads the pane's process as ``query_process``
+        does. Raises only when tmux cannot be run."""
+        ...
+
 
 class TmuxBackend:
     """The tmux backend. ``tmux`` carries the resolved ``tmux_bin`` (#10), the checked socket
@@ -240,6 +257,32 @@ class TmuxBackend:
         except TermctlError:
             return tb.GuardOutcome.FAILED
         return tb.guard_outcome(result)
+
+    def query_process(
+        self, pane_id: str, termctl_id: str
+    ) -> tuple[tb.GuardOutcome, subprocess.CompletedProcess[str], tb.ProcessQuery | None]:
+        result = self.tmux.run(tb.query_process(pane_id, termctl_id))
+        return self._queried(result)
+
+    def kill_pane(
+        self, pane_id: str, termctl_id: str, *, query: bool
+    ) -> tuple[tb.GuardOutcome, subprocess.CompletedProcess[str], tb.ProcessQuery | None]:
+        # The tmux client runs in a process group of its own (``Gateway.run``), so the hangup of
+        # termctl's terminal, when this is termctl's own pane, does not reach it and it still
+        # delivers the answer of its query.
+        result = self.tmux.run(tb.kill_pane(pane_id, termctl_id, query=query))
+        outcome, result, answer = self._queried(result)
+        return outcome, result, answer if query else None
+
+    @staticmethod
+    def _queried(
+        result: subprocess.CompletedProcess[str],
+    ) -> tuple[tb.GuardOutcome, subprocess.CompletedProcess[str], tb.ProcessQuery | None]:
+        outcome = tb.guard_outcome(result)
+        answer = (
+            tb.parse_process_query(result.stdout) if outcome is tb.GuardOutcome.MATCHED else None
+        )
+        return outcome, result, answer
 
     def _created(self, result: subprocess.CompletedProcess[str]) -> Created:
         """The ids a successful creation printed. A failed chain is never taken as created,

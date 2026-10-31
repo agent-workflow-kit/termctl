@@ -863,6 +863,7 @@ IMPLEMENTED = {
     "unmark",
     "label add",
     "label remove",
+    "close",
 }
 UNIMPLEMENTED = sorted(set(MINIMAL) - IMPLEMENTED)
 
@@ -891,7 +892,7 @@ def test_unimplemented_command_is_internal_error(command: str) -> None:
 def test_unimplemented_command_golden() -> None:
     expected = json.loads((GOLDEN / "error-not-implemented.json").read_text(encoding="utf-8"))
     validate(expected, "termctl/cli/error.json")
-    assert Run(["--json", "close", ID], FakeGateway(panes=[pane_row(tc_id=ID)])).json() == expected
+    assert Run(["--json", "focus", ID], FakeGateway(panes=[pane_row(tc_id=ID)])).json() == expected
 
 
 # --- broken output streams ----------------------------------------------------------------------
