@@ -1,17 +1,19 @@
 """The macOS-only code paths, run on Linux by injection (#26; design.md "macOS checklist").
 
-CI has no macOS runner, so each macOS path is exercised here with what it reads replaced:
+Each macOS path is exercised here with what it reads replaced where the system lacks it:
 
-- the kqueue ``NOTE_EXIT`` watch (``gateway._KqueueExit``) by ``KqueueEmulation``, the
-  ``select`` kqueue API backed by a Linux pidfd, which, like a kqueue registration, stays tied
-  to the process that had the PID when it was made. It runs the hook leader's exit detection
-  (``_LeaderExit``, macOS before Python 3.13) and the ``close --force`` handle (``_PidHandle``)
-  against real child processes;
+- the kqueue ``NOTE_EXIT`` watch (``gateway._KqueueExit``): on a system with a kernel kqueue
+  (macOS, the BSDs) the real ``select`` module; elsewhere ``KqueueEmulation``, the ``select``
+  kqueue API backed by a Linux pidfd, which, like a kqueue registration, stays tied to the
+  process that had the PID when it was made and, like Darwin's, refuses to watch a zombie. It
+  runs the hook leader's exit detection (``_LeaderExit``, macOS before Python 3.13) and the
+  ``close --force`` handle (``_PidHandle``) against real child processes;
 - ``ps`` output (``procs._read_ps``) by scripted text;
 - the platform (``Gateway.platform``) by ``FakeGateway(system="darwin")`` or a
   ``SystemGateway`` subclass.
 
-What the emulation cannot show (the real kernel's answers) is on the manual checklist.
+On a Mac these kqueue tests are the record of the real kernel's answers (checklist item 6);
+what no test can show is on the manual checklist.
 """
 
 from __future__ import annotations
@@ -19,9 +21,11 @@ from __future__ import annotations
 import errno
 import os
 import select
+import shutil
 import signal
 import socket
 import subprocess
+import tempfile
 import time
 from collections.abc import Iterator
 from pathlib import Path
@@ -47,9 +51,17 @@ from .test_cli_close import (
 )
 from .test_gateway import group, group_is_gone, is_gone, wait_gone
 
-# Through gateway._pidfd_open, which makes the system call itself where os lacks it.
-needs_pidfd = pytest.mark.skipif(
-    not Path("/proc/self/stat").exists(), reason="the kqueue emulation needs Linux pidfd"
+# A kernel kqueue (macOS, the BSDs): the tests run against it, not the emulation.
+REAL_KQUEUE = hasattr(select, "kqueue")
+
+# The emulation goes through gateway._pidfd_open, which makes the system call itself where os
+# lacks it.
+needs_kqueue = pytest.mark.skipif(
+    not REAL_KQUEUE and not Path("/proc/self/stat").exists(),
+    reason="needs a kernel kqueue, or a Linux pidfd for the kqueue emulation",
+)
+emulated_only = pytest.mark.skipif(
+    REAL_KQUEUE, reason="a refused registration is injected only through the kqueue emulation"
 )
 
 # select's constants on macOS (sys/event.h).
@@ -57,6 +69,13 @@ KQ_FILTER_PROC = -5
 KQ_EV_ADD = 0x0001
 KQ_EV_ONESHOT = 0x0010
 KQ_NOTE_EXIT = 0x80000000
+
+
+def _has_exited(pidfd: int) -> bool:
+    """A pidfd polls readable once its process has exited (a zombie included)."""
+    poller = select.poll()
+    poller.register(pidfd, select.POLLIN)
+    return bool(poller.poll(0))
 
 
 class _EmulatedKqueue:
@@ -76,14 +95,17 @@ class _EmulatedKqueue:
                 assert fflags == KQ_NOTE_EXIT
                 if self.api.refuse is not None:
                     raise self.api.refuse
+                fd = gateway_module._pidfd_open(ident)  # ProcessLookupError if none
+                if _has_exited(fd):
+                    # Darwin refuses to watch a process that has already exited (a zombie).
+                    os.close(fd)
+                    raise ProcessLookupError(errno.ESRCH, "No such process")
                 self.api.registered.append(ident)
-                self.fds[ident] = gateway_module._pidfd_open(ident)  # ProcessLookupError if none
+                self.fds[ident] = fd
             return []
         assert changes is None and max_events == 1
         for ident, fd in list(self.fds.items()):
-            poller = select.poll()
-            poller.register(fd, select.POLLIN)
-            if poller.poll(0):  # the process has exited (a zombie included)
+            if _has_exited(fd):
                 del self.fds[ident]  # EV_ONESHOT: delivered once
                 os.close(fd)
                 return [(ident, KQ_FILTER_PROC, 0, KQ_NOTE_EXIT)]
@@ -121,14 +143,24 @@ class KqueueEmulation:
 
 
 @pytest.fixture
-def kqueue(monkeypatch: pytest.MonkeyPatch) -> Iterator[KqueueEmulation]:
-    """The kqueue emulation in place of ``select``'s, and no ``os.waitid`` (as on macOS
-    before Python 3.13)."""
+def kqueue(monkeypatch: pytest.MonkeyPatch) -> Iterator[Any]:
+    """The kqueue API termctl uses, and no ``os.waitid`` (as on macOS before Python 3.13):
+    the real ``select`` module where the kernel has kqueue, else a ``KqueueEmulation`` in
+    its place."""
+    monkeypatch.setattr(gateway_module, "_HAS_WAITID", False)
+    if REAL_KQUEUE:
+        yield select
+        return
     api = KqueueEmulation()
     monkeypatch.setattr(gateway_module, "_kqueue_api", lambda: api)
-    monkeypatch.setattr(gateway_module, "_HAS_WAITID", False)
     yield api
     assert all(queue.closed for queue in api.queues), "a kqueue was left open"
+
+
+def assert_registered(kqueue: Any, pids: list[int]) -> None:
+    """The emulation records each PID watched; the real kernel's kqueue does not tell."""
+    if isinstance(kqueue, KqueueEmulation):
+        assert kqueue.registered == pids
 
 
 class DarwinGateway(SystemGateway):
@@ -150,15 +182,15 @@ def stop(proc: subprocess.Popen[bytes]) -> None:
 # --- close --force on macOS: the kqueue process handle ------------------------------------------
 
 
-@needs_pidfd
+@needs_kqueue
 def test_macos_handle_watches_the_pid_and_signals_its_live_process(
-    kqueue: KqueueEmulation,
+    kqueue: Any,
 ) -> None:
     proc = child()
     try:
         handle = DarwinGateway().open_process(proc.pid)
         assert isinstance(handle, gateway_module._PidHandle)
-        assert kqueue.registered == [proc.pid]
+        assert_registered(kqueue, [proc.pid])
         assert not handle.exited()
         assert handle.send_signal(signal.SIGTERM)
         assert proc.wait(timeout=5) == -signal.SIGTERM
@@ -169,16 +201,16 @@ def test_macos_handle_watches_the_pid_and_signals_its_live_process(
         stop(proc)
 
 
-@needs_pidfd
+@needs_kqueue
 def test_macos_handle_never_kills_once_its_process_has_exited(
-    kqueue: KqueueEmulation, monkeypatch: pytest.MonkeyPatch
+    kqueue: Any, monkeypatch: pytest.MonkeyPatch
 ) -> None:
     # The race of #23: the recorded process exits and its PID could be reused before the
     # kill. Once the watch has fired, no kill is made at all, whoever holds the PID now.
-    proc = child("/bin/true")
+    proc = child()
     handle = DarwinGateway().open_process(proc.pid)
     assert handle is not None
-    proc.wait()
+    stop(proc)  # exited and reaped: its PID is free for reuse
     kills: list[tuple[int, int]] = []
     monkeypatch.setattr(gateway_module.os, "kill", lambda pid, sig: kills.append((pid, sig)))
     try:
@@ -190,12 +222,13 @@ def test_macos_handle_never_kills_once_its_process_has_exited(
         handle.close()
 
 
-@needs_pidfd
-def test_macos_handle_sees_a_zombie_as_exited(kqueue: KqueueEmulation) -> None:
-    proc = child("/bin/true")
+@needs_kqueue
+def test_macos_handle_sees_a_zombie_as_exited(kqueue: Any) -> None:
+    proc = child()
     try:
         handle = DarwinGateway().open_process(proc.pid)
         assert handle is not None
+        proc.kill()  # not reaped: a zombie
         deadline = time.monotonic() + 5
         while not handle.exited() and time.monotonic() < deadline:
             time.sleep(0.01)
@@ -206,9 +239,9 @@ def test_macos_handle_sees_a_zombie_as_exited(kqueue: KqueueEmulation) -> None:
         proc.wait()
 
 
-@needs_pidfd
+@needs_kqueue
 @pytest.mark.parametrize("pid", ["reaped", 0, -1, 2**31])
-def test_macos_handle_of_no_process_is_none(kqueue: KqueueEmulation, pid: int | str) -> None:
+def test_macos_handle_of_no_process_is_none(kqueue: Any, pid: int | str) -> None:
     if pid == "reaped":
         proc = child("/bin/true")
         proc.wait()
@@ -217,7 +250,21 @@ def test_macos_handle_of_no_process_is_none(kqueue: KqueueEmulation, pid: int | 
     assert DarwinGateway().open_process(pid) is None
 
 
-@needs_pidfd
+@needs_kqueue
+def test_macos_handle_of_a_zombie_is_none(kqueue: Any) -> None:
+    # The kernel refuses to watch a process that has exited but is not yet reaped: nothing to
+    # signal, so no handle (close_cmd then reads it as exited).
+    proc = child()
+    try:
+        proc.kill()
+        assert wait_gone(proc.pid)  # a zombie: exited, not reaped by this test yet
+        assert DarwinGateway().open_process(proc.pid) is None
+    finally:
+        proc.wait()
+
+
+@needs_kqueue
+@emulated_only
 def test_macos_handle_that_cannot_be_registered_raises(kqueue: KqueueEmulation) -> None:
     # close_cmd._open turns this into a warning and pid_mismatch: nothing is signaled.
     kqueue.refuse = PermissionError(errno.EPERM, "Operation not permitted")
@@ -236,8 +283,8 @@ def test_macos_handle_without_kqueue_raises_enosys(monkeypatch: pytest.MonkeyPat
     assert info.value.errno == errno.ENOSYS
 
 
-@needs_pidfd
-def test_a_closed_macos_handle_is_refused(kqueue: KqueueEmulation) -> None:
+@needs_kqueue
+def test_a_closed_macos_handle_is_refused(kqueue: Any) -> None:
     proc = child()
     try:
         handle = DarwinGateway().open_process(proc.pid)
@@ -251,8 +298,8 @@ def test_a_closed_macos_handle_is_refused(kqueue: KqueueEmulation) -> None:
         stop(proc)
 
 
-@needs_pidfd
-def test_signal_sequence_with_the_macos_handle_and_ps(kqueue: KqueueEmulation) -> None:
+@needs_kqueue
+def test_signal_sequence_with_the_macos_handle_and_ps(kqueue: Any) -> None:
     # procs.signal_sequence as close --force runs it on macOS: ps (scripted) gives the start
     # time, the real handle signals a real child, which exits on SIGTERM.
     proc = child()
@@ -276,16 +323,17 @@ def test_signal_sequence_with_the_macos_handle_and_ps(kqueue: KqueueEmulation) -
 # --- hooks on macOS before Python 3.13: the kqueue leader-exit watch ----------------------------
 
 
-@needs_pidfd
-def test_hook_exit_status_through_the_kqueue_watch(kqueue: KqueueEmulation) -> None:
+@needs_kqueue
+def test_hook_exit_status_through_the_kqueue_watch(kqueue: Any) -> None:
     run = group("exit 3")
     assert run.returncode == 3
-    assert len(kqueue.registered) == 1
+    if isinstance(kqueue, KqueueEmulation):
+        assert len(kqueue.registered) == 1
 
 
-@needs_pidfd
+@needs_kqueue
 def test_hook_whose_grandchild_holds_stdout_ends_one_second_after_the_shell(
-    kqueue: KqueueEmulation,
+    kqueue: Any,
 ) -> None:
     start = time.monotonic()
     run = group("sleep 6 & echo $!; exit 4", timeout=5)
@@ -298,10 +346,8 @@ def test_hook_whose_grandchild_holds_stdout_ends_one_second_after_the_shell(
     assert wait_gone(grandchild)
 
 
-@needs_pidfd
-def test_hook_timeout_kills_the_group_through_the_kqueue_watch(
-    kqueue: KqueueEmulation, tmp_path: Path
-) -> None:
+@needs_kqueue
+def test_hook_timeout_kills_the_group_through_the_kqueue_watch(kqueue: Any, tmp_path: Path) -> None:
     marker = tmp_path / "survived"
     start = time.monotonic()
     run = group(f"(sleep 5; touch '{marker}') & echo $!; sleep 10", timeout=0.5)
@@ -323,7 +369,33 @@ def test_hook_leader_watch_without_waitid_or_kqueue_is_unavailable(
     assert group("exit 5").returncode == 5  # the exit is seen when the streams close
 
 
-@needs_pidfd
+@needs_kqueue
+def test_hook_leader_watch_of_a_zombie_is_available_and_exited(
+    kqueue: Any, monkeypatch: pytest.MonkeyPatch
+) -> None:
+    # The leader exited before the watch was set up: the kernel refuses to watch a zombie,
+    # which _LeaderExit reads as exited, without falling back to os.waitid.
+    def no_waitid(*args: object) -> None:
+        pytest.fail("_LeaderExit used os.waitid with the kqueue watch selected")
+
+    monkeypatch.setattr(gateway_module.os, "waitid", no_waitid, raising=False)
+    proc = child()
+    try:
+        proc.kill()
+        assert wait_gone(proc.pid)  # a zombie: exited, not reaped by this test yet
+        leader = gateway_module._LeaderExit(proc.pid)
+        try:
+            assert leader.available
+            assert leader.exited()
+            assert leader._kqueue is None  # no watch was registered
+        finally:
+            leader.close()
+    finally:
+        proc.wait()
+
+
+@needs_kqueue
+@emulated_only
 def test_hook_leader_watch_that_cannot_register_is_unavailable(kqueue: KqueueEmulation) -> None:
     kqueue.refuse = OSError(errno.EMFILE, "Too many open files")
     leader = gateway_module._LeaderExit(os.getpid())
@@ -335,12 +407,19 @@ def test_hook_leader_watch_that_cannot_register_is_unavailable(kqueue: KqueueEmu
 
 
 @pytest.fixture
-def listener(tmp_path: Path) -> Iterator[str]:
-    path = str(tmp_path / "sock")
-    with socket.socket(socket.AF_UNIX, socket.SOCK_STREAM) as server:
-        server.bind(path)
-        server.listen(1)
-        yield path
+def listener() -> Iterator[str]:
+    # A short path: macOS limits a Unix socket path to 104 bytes (sun_path), and pytest's
+    # tmp_path there, under $TMPDIR (/var/folders/...), is longer.
+    root = tempfile.mkdtemp(prefix="tc-")
+    path = os.path.join(root, "sock")
+    assert len(os.fsencode(path)) < 104
+    try:
+        with socket.socket(socket.AF_UNIX, socket.SOCK_STREAM) as server:
+            server.bind(path)
+            server.listen(1)
+            yield path
+    finally:
+        shutil.rmtree(root, ignore_errors=True)
 
 
 @pytest.mark.parametrize("system", ["darwin", "freebsd14", "openbsd7"])

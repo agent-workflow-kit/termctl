@@ -13,6 +13,7 @@ import os
 import shutil
 import stat
 import subprocess
+import sys
 import tempfile
 import threading
 from collections.abc import Callable, Iterator
@@ -354,6 +355,9 @@ def test_a_socket_directory_made_unsafe_after_the_probe_is_never_connected(
     assert len(windows(tmux_server, "work")) == 1
 
 
+@pytest.mark.skipif(
+    sys.platform != "linux", reason="SO_PEERCRED is read only on Linux (socket_peer_pid raises)"
+)
 def test_the_socket_peer_is_the_server_that_reports_its_pid(tmux_server: TmuxServer) -> None:
     # Open order step 7 (review round 1 of #16, R1-8): the server termctl reaches through the
     # socket (SO_PEERCRED) is the one whose #{pid} the query reports, in the same namespace.

@@ -117,7 +117,8 @@ class ProcessHandle(Protocol):
     ``NOTE_EXIT`` watch registered on the PID, which sees that process's exit, and the PID,
     which ``send_signal`` signals only while the watch has not seen it exit (a reuse can then
     be signaled only if the process exits and its PID is reused between that look and the
-    ``kill``). The caller also checks the start time before each signal
+    ``kill``, or the PID was reused, before the watch was registered, by a process started in
+    the same second as the recorded one). The caller also checks the start time before each signal
     (``procs.signal_sequence``)."""
 
     def exited(self) -> bool:
@@ -741,7 +742,9 @@ class _PidHandle:
     """macOS: a kqueue exit watch registered on the PID, then the PID. ``send_signal`` looks
     at the watch immediately before each ``kill`` and never signals once it has fired, so a
     reused PID can be signaled only if the process exits and its PID is reused between that
-    look and the ``kill`` (interface.md "Residual risks"). The caller opens the handle before
+    look and the ``kill``, or the PID was reused, before the watch was registered, by a
+    process started in the same second as the recorded one (the ``ps`` start-time check has
+    one-second resolution; interface.md "Residual risks"). The caller opens the handle before
     it verifies the start time, so the watch names the process verified."""
 
     def __init__(self, pid: int, watch: _KqueueExit) -> None:

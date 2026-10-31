@@ -110,16 +110,17 @@ def _read_proc(gateway: Gateway, pid: int) -> Process | None:
 
 
 def _read_ps(gateway: Gateway, pid: int) -> Process | None:
-    """macOS. CI runs it only against scripted ``ps`` output; design.md "macOS checklist"
-    checks it against the real ``ps``."""
+    """macOS. Only ``ps`` exiting 1 with no output means no such process; any other failure
+    is a ``ProcessError``. Linux CI runs it against scripted ``ps`` output; the ``macos`` CI
+    job and design.md "macOS checklist" run it against the real ``ps``."""
     argv = [PS, "-o", "ppid=", "-o", "stat=", "-o", "lstart=", "-p", str(pid)]
     try:
         result = gateway.run(argv, timeout=PS_TIMEOUT, env=PS_ENV)
     except (OSError, subprocess.TimeoutExpired) as exc:
         raise ProcessError(f"cannot run {PS} for process {pid}: {exc}") from None
     text = result.stdout.strip()
-    if result.returncode != 0 and not text and not result.stderr.strip():
-        return None  # ps found no such process (it says nothing then)
+    if result.returncode == 1 and not text and not result.stderr.strip():
+        return None  # ps found no such process (it says nothing then and exits 1)
     lines = text.splitlines()
     tokens = text.split()
     if result.returncode != 0 or len(lines) != 1 or len(tokens) != 7:

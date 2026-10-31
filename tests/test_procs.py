@@ -176,6 +176,10 @@ def test_macos_missing_process_is_none(result: subprocess.CompletedProcess[str])
         completed(""),
         # ps failed rather than finding no such process (review round 1, R1-2).
         completed("", stderr="ps: cannot read the process table\n", returncode=1),
+        # Only exit 1 with no output means no such process: ps killed by a signal, or failing
+        # with another status, fails closed (review round 1 of #26, N).
+        completed("", returncode=-9),
+        completed("", returncode=2),
         # A start time before the epoch is outside the @termctl_pid_start grammar (R1-3).
         completed("77 S Wed Dec 31 23:59:59 1969\n"),
         subprocess.TimeoutExpired(list(PS), 10),
