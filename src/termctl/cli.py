@@ -79,9 +79,13 @@ class Context:
     plan: open_cmd.Plan | None = None
     window: WindowSpec | None = None
     open_id: str | None = None
-    # A command that writes log records (``open`` other than a dry run, once past step 1):
-    # each of its warnings also becomes a ``warning`` log record (``warn``).
+    # A command that writes log records (``open`` or a pane change of ``CHANGE_EVENTS``, not a
+    # dry run, once past step 1): each of its warnings also becomes a ``warning`` log record
+    # (``warn``).
     logged: bool = False
+    # A logged pane change: its ``warning`` records, held until its outcome is known, then
+    # written before its own record, or dropped if it changed nothing (``_logged_change``).
+    held_warnings: list[dict[str, Any]] | None = None
     # The actor, resolved once per run (``resolve_actor``).
     actor: str | None = None
     # ``open``: the --decision-id values, then the ids its pre-open hooks returned (step 4),
@@ -112,16 +116,24 @@ class Context:
         ``warning`` log record (interface.md "Audit and log")."""
         self.out.warn(message)
         if self.logged:
-            self.log(
-                jsonlog.log_record(
-                    self.clock.now(),
-                    event="warning",
-                    result="warning",
-                    id=self.record_id(),
-                    socket_path=self.socket_path(),
-                    message=message,
-                )
+            record = jsonlog.log_record(
+                self.clock.now(),
+                event="warning",
+                result="warning",
+                id=self.record_id(),
+                socket_path=self.socket_path(),
+                message=message,
             )
+            if self.held_warnings is not None:
+                self.held_warnings.append(record)
+            else:
+                self.log(record)
+
+    def write_held_warnings(self) -> None:
+        """Write the held ``warning`` records, in order, and stop holding them."""
+        held, self.held_warnings = self.held_warnings or [], None
+        for record in held:
+            self.log(record)
 
     def log(self, record: dict[str, Any]) -> None:
         """Append a ``log.jsonl`` record. One that cannot be written only warns: the action
@@ -897,11 +909,15 @@ def _open_stopped(args: argparse.Namespace, ctx: Context, stop: BaseException) -
     """Log an ``open`` stopped by a signal (exit 128 plus its number). Its audit record, if
     any, was written once the output existed (``open_pane``); a run stopped before then has
     neither output nor error object, and gets none."""
+    exit_code, message = _stopped(stop)
+    ctx.log(_open_record(args, ctx, result="error", exit_code=exit_code, message=message))
+
+
+def _stopped(stop: BaseException) -> tuple[int, str]:
+    """The exit code (128 plus the signal number) and message of a run a signal stopped."""
     if isinstance(stop, Terminated):
-        signum, message = stop.signum, f"terminated by signal {stop.signum}"
-    else:
-        signum, message = int(signal.SIGINT), "interrupted"
-    ctx.log(_open_record(args, ctx, result="error", exit_code=128 + signum, message=message))
+        return 128 + stop.signum, f"terminated by signal {stop.signum}"
+    return 128 + int(signal.SIGINT), "interrupted"
 
 
 def _opened(ctx: Context, backend: Backend, created: Created, created_at: str) -> Result:
@@ -980,6 +996,8 @@ def _apply_change(
         version=ctx.tmux.version,
         environ=ctx.environ,
         clock=ctx.clock,
+        warn=ctx.warn,
+        seen=() if ctx.pane_read is None else ctx.pane_read.warnings,
     )
     ctx.no_op = not outcome.changed
     data = {
@@ -1075,7 +1093,8 @@ def run_command(args: argparse.Namespace, ctx: Context) -> Result:
     if args.command == "placements":
         labels = validate.parse_labels(args.labels) if args.labels else None
         return placement.report(ctx.config, labels)
-    # TODO: each remaining command lands in its own issue (#19-#24).
+    # TODO(#21): label add, label remove. TODO(#23): close.
+    # TODO(#24): focus.
     raise TermctlError("internal", f"{PROG} {args.command} is not implemented yet")
 
 
@@ -1142,29 +1161,52 @@ CHANGE_EVENTS = {"rename": "rename", "mark": "mark", "unmark": "unmark"}
 
 def _logged_change(args: argparse.Namespace, ctx: Context) -> Result:
     """A pane change past step 1, not a dry run: one ``log.jsonl`` record for its outcome,
-    failures included, except a no-op and an error of step 2 (the server could not be
-    resolved: exit 2, which interface.md "Audit and log" logs for ``open`` only); its
-    warnings become ``warning`` records. Unlike ``open``, it does not catch stop signals:
-    the spec logs a signal-stopped ``open`` only."""
+    failures from step 2 on and a stop by a signal (exit 128 plus its number) included, except
+    a no-op, which writes no record at all (interface.md "Audit and log"). Its warnings are
+    printed at once; their ``warning`` records are held and written before that record, or
+    dropped with a no-op. Stop signals raise as for ``open`` (``stop_signals``) but are never
+    deferred: a change stopped after its write was applied is logged as stopped."""
     ctx.logged = True
+    ctx.held_warnings = []
     event = CHANGE_EVENTS[args.command]
-    try:
-        result = _resolve_and_run(args, ctx)
-    except TermctlError as err:
-        if ctx.server is not None:
-            ctx.log(_change_record(ctx, event, "error", err.exit_code, err))
-        raise
-    except Exception as exc:
-        err = internal_error(exc)
-        ctx.log(_change_record(ctx, event, "error", err.exit_code, err))
-        raise err from exc
-    if not ctx.no_op:
-        ctx.log(_change_record(ctx, event, "ok", result.exit_code))
+
+    def write(record: dict[str, Any]) -> None:
+        ctx.write_held_warnings()
+        ctx.log(record)
+
+    with stop_signals() as signals:
+        try:
+            result = _resolve_and_run(args, ctx)
+        except TermctlError as err:
+            signals.finish()
+            write(_change_record(ctx, event, "error", err.exit_code, err))
+            raise
+        except (KeyboardInterrupt, Terminated) as stop:
+            signals.finish()
+            exit_code, message = _stopped(stop)
+            write(_change_record(ctx, event, "error", exit_code, message=message))
+            raise
+        except Exception as exc:
+            signals.finish()
+            err = internal_error(exc)
+            write(_change_record(ctx, event, "error", err.exit_code, err))
+            raise err from exc
+        signals.finish()
+        if ctx.no_op:
+            ctx.held_warnings = None
+        else:
+            write(_change_record(ctx, event, "ok", result.exit_code))
     return result
 
 
 def _change_record(
-    ctx: Context, event: str, result: str, exit_code: int, err: TermctlError | None = None
+    ctx: Context,
+    event: str,
+    result: str,
+    exit_code: int,
+    err: TermctlError | None = None,
+    *,
+    message: str | None = None,
 ) -> dict[str, Any]:
     return jsonlog.log_record(
         ctx.clock.now(),
@@ -1173,7 +1215,7 @@ def _change_record(
         id=ctx.record_id(),
         socket_path=ctx.socket_path(),
         exit_code=exit_code,
-        message=None if err is None else err.message,
+        message=message if err is None else err.message,
         details=None if err is None else err.details,
     )
 

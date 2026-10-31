@@ -335,6 +335,22 @@ def test_a_forged_control_byte_in_the_window_name_is_replaced(tmux_server: TmuxS
     assert termctl(tmux_server, "--json", "rename", ID, "n\\033x").json()["changed"] is False
 
 
+@pytest.mark.parametrize("separator", ["\t", "\n"], ids=["tab", "newline"])
+def test_a_tab_or_newline_in_the_window_name_is_not_taken_for_a_space(
+    tmux_server: TmuxServer, separator: str
+) -> None:
+    # The reader shows a tab or newline in a window name as a space; new-window -n keeps it.
+    tmux_server.start()
+    pane_id = new_window(tmux_server, "-n", f"a{separator}b")
+    tag(tmux_server, pane_id, **{"@termctl_name": "a b"})
+    tmux_server.raw("new-session", "-d", "-s", "keep", "--", "/usr/bin/env", "--", "sleep", "600")
+    assert termctl(tmux_server, "--json", "show", ID).json()["display_name"] == "a b"
+    result = termctl(tmux_server, "--json", "rename", ID, "a b")
+    assert (result.code, result.json()["changed"]) == (0, True), result.stderr
+    assert window_name(tmux_server, pane_id) == "a b"
+    assert termctl(tmux_server, "--json", "rename", ID, "a b").json()["changed"] is False
+
+
 def test_raw_bytes_never_reach_human_output(tmux_server: TmuxServer) -> None:
     pane_id = managed(tmux_server)
     tmux_server.raw("set", "-p", "-t", pane_id, "@termctl_name", "n\x1bx")

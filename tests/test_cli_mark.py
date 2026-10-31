@@ -11,13 +11,24 @@ from pathlib import Path
 
 import pytest
 
-from termctl import cli, lock
+from termctl import cli, display, lock
 from termctl import tmux_backend as tb
 from termctl.tmux_backend import command
 
 from .fakes import TMUX, FakeGateway, completed, is_list_panes, pane_row
 from .schemas import validate
-from .test_cli_rename import ID, NOMATCH, PANE, SOCK, Server, _argv, run, writes
+from .test_cli_rename import (
+    ID,
+    NOMATCH,
+    PANE,
+    SOCK,
+    Server,
+    _argv,
+    lengths,
+    measured,
+    run,
+    writes,
+)
 
 GOLDEN = Path(__file__).parent / "golden"
 BELL = "\U0001f514 "
@@ -50,11 +61,6 @@ def combined(marker: str, text: str, display_name: str) -> tuple[str, ...]:
 
 def options_only(marker: str, text: str) -> tuple[str, ...]:
     return _argv(tb.guarded(tb.pane(PANE), tb.owned(ID), *_sets(marker, text)))
-
-
-def lengths(*names: str) -> tuple[str, ...]:
-    probe = command("display").flag("-p").target(tb.pane(PANE))
-    return _argv(probe.format_arg(tb.byte_lengths(*names)).build())
 
 
 def tty_answer(tty: str = TTY, dead: str = "0") -> subprocess.CompletedProcess[str]:
@@ -100,6 +106,8 @@ def config(tmp_path: Path, text: str) -> list[str]:
     return ["--config", str(path)]
 
 
+# The length probe's answer for a marked window name: it holds a space, so it is measured.
+MARKED_PROBE = {lengths("window_name"): measured(len((BELL + "KEY-12").encode()))}
 BELL_CONFIG = "markers:\n  attention:\n    bell: true\n"
 
 
@@ -282,7 +290,7 @@ def test_marker_texts_reach_tmux_through_the_argument_builder(
 
 def test_marking_with_the_set_marker_is_a_no_op(state: Path, tmp_path: Path) -> None:
     # bell: true, but a no-op rings nothing (no tty query or write is scripted).
-    gateway = Server([pane_row(overrides=MARKED)])
+    gateway = Server([pane_row(overrides=MARKED)], responses=MARKED_PROBE)
     argv = [*config(tmp_path, BELL_CONFIG), "--json", "mark", ID, "attention"]
     result = run(argv, gateway, state)
     assert (result.code, result.stderr) == (0, "")
@@ -342,7 +350,7 @@ def test_a_no_op_with_a_backslash_in_the_name(state: Path) -> None:
     row = {**MARKED, "@termctl_name": "a\\b", "window_name": BELL + "a\\\\b"}
     gateway = Server(
         [pane_row(overrides=row)],
-        responses={lengths("window_name"): completed(f"{len((BELL + 'a\\\\b').encode())}\n")},
+        responses={lengths("window_name"): measured(len((BELL + "a\\\\b").encode()))},
     )
     result = run(["--json", "mark", ID, "attention"], gateway, state)
     assert (result.code, result.json()["changed"]) == (0, False)
@@ -360,7 +368,7 @@ def test_a_forged_control_byte_in_the_marker_text_is_rewritten(
     gateway = Server(
         [pane_row(overrides=row)],
         writes={combined("esc", printed, "KEY-12"): (completed(), {})},
-        responses={lengths("@termctl_marker_text"): completed(stored + "\n")},
+        responses={lengths("@termctl_marker_text"): completed(f"{PANE} @2 {PANE} {ID} {stored}\n")},
     )
     yaml = "marker_display: option\nmarkers:\n  esc:\n    text: '\\033 '\n"
     result = run([*config(tmp_path, yaml), "--json", "mark", ID, "esc"], gateway, state)
@@ -648,3 +656,40 @@ def test_an_unusable_state_directory_exits_12_locked_before_any_write(state: Pat
 
 def test_mark_and_unmark_are_logged_change_events() -> None:
     assert (cli.CHANGE_EVENTS["mark"], cli.CHANGE_EVENTS["unmark"]) == ("mark", "unmark")
+
+
+# --- #19's logging rules, as they apply to mark and unmark ----------------------------------------
+
+
+def test_a_no_op_mark_writes_no_warning_record(state: Path) -> None:
+    bad = pane_row(pane_id="%9", tc_id="tc-zzzzzzzz", overrides={"@termctl_keep": "sometimes"})
+    gateway = Server([pane_row(overrides=MARKED), bad], responses=MARKED_PROBE)
+    result = run(["--json", "mark", ID, "attention"], gateway, state)
+    assert (result.code, result.json()["changed"]) == (0, False)
+    assert "ignoring managed pane %9" in result.stderr
+    assert not (state / "termctl" / "log.jsonl").exists()
+
+
+def test_a_server_resolution_error_is_logged(state: Path) -> None:
+    result = run(["unmark", ID], unmarking(), state, environ={"TMUX": "rel/sock,1,0"})
+    assert result.code == 2
+    [record] = result.log()
+    validate(record, "termctl/log.json")
+    assert (record["event"], record["exit_code"], record["id"]) == ("unmark", 2, None)
+
+
+@pytest.mark.parametrize(("stop", "code"), [(KeyboardInterrupt(), 130), (cli.Terminated(15), 143)])
+def test_a_signal_during_the_bell_is_logged_as_stopped(
+    state: Path, tmp_path: Path, monkeypatch: pytest.MonkeyPatch, stop: BaseException, code: int
+) -> None:
+    def stopped(*args: object) -> None:
+        raise stop
+
+    monkeypatch.setattr(display, "ring_bell", stopped)
+    gateway = marking()
+    result = run([*config(tmp_path, BELL_CONFIG), "mark", ID, "attention"], gateway, state)
+    assert result.code == code
+    [record] = result.log()
+    validate(record, "termctl/log.json")
+    assert (record["event"], record["result"], record["exit_code"]) == ("mark", "error", code)
+    assert gateway.panes is not None and gateway.panes[0]["@termctl_marker"] == "attention"
