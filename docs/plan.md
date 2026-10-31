@@ -6,7 +6,7 @@ Status: planned, 2026-10-30. Implements [interface.md](interface.md) (normative)
 
 - Test-first. Every behavior in a task starts as a failing test.
 - All subprocesses, `/proc` reads, `ps` calls and tty writes go through `src/termctl/gateway.py`; unit tests replace it with a fake. Time comes from an injectable clock.
-- Integration tests run real tmux: each test pre-starts its own server with `tmux -f /dev/null -S <tmp path>` and passes `--socket <path>`; they never touch a user's server. They run in CI (tmux from apt) and are not `live`. `make verify-floor` runs them with tmux 3.2 when it is installed locally.
+- Integration tests run real tmux: each test pre-starts its own server with `tmux -f /dev/null -S <tmp path>` and passes `--socket <path>`; they never touch a user's server. They run in CI (tmux from apt, in termctl's own `tmux` job, which sets `TERMCTL_REQUIRE_TMUX` so a missing tmux fails them; the shared `verify` job cannot install packages, so it runs them only when the runner image ships tmux and skips them otherwise) and are not `live`. `make verify-floor` runs them with tmux 3.2 when it is installed locally.
 - Every `--json` output gets a golden-file test validated against its schema in `schemas/` (with a `referencing` registry keyed by `$id`); every hook payload, log and audit record written in a test is validated too.
 - Every spike finding listed in design.md "Live verification" that the implementation relies on becomes an integration regression test in the stage that relies on it.
 - `make verify` passes before every commit. PR titles are Conventional Commit headers; no `!` before 1.0.
@@ -27,7 +27,8 @@ Status: planned, 2026-10-30. Implements [interface.md](interface.md) (normative)
 | `lock.py` | 0 | per-server `flock` with 10 s wait, canonical-path hashing |
 | `statedir.py` | 0 | state directory path and safe opening of its files (no symlinks, owner and mode checks) |
 | `hooks.py` | 0 | hook execution (process group, timeout, stdin payload, env vars, decision id parsing and validation), `--hook` and `--override-escalation` handling |
-| `tmux_backend.py` | 1 | tmux argument builder (all tmux argument rules), guarded-write wrapper, version check, socket resolution and safety checks, command chains |
+| `tmux_bin.py` | 1 | `tmux_bin` resolution, the `tmux -V` version check |
+| `tmux_backend.py` | 1 | tmux argument builder (all tmux argument rules), guarded-write wrapper, socket resolution and safety checks, command chains |
 | `panes.py` | 1 | the single `list-panes -a` read, field sanitizing, ownership check, option validation, deduplication, in-process filters |
 | `backend.py` | 1 | the `Backend` protocol the commands use |
 | `placement.py` | 2 | placement and rule resolution, inheritance from `default`, `not_supported` |
