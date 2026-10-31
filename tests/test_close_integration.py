@@ -230,7 +230,7 @@ def test_closing_its_own_pane_with_force_completes_and_writes_its_records(
         validate(record, "termctl/audit.json")
         assert (record["target"], record["force"]) == (out["id"], True)
         result = record["result"]
-        # The tmux client of the kill, in a session of its own, still read the pane's process.
+        # The tmux client of the kill, in a process group of its own, still read the process.
         assert (result["pane_closed"], result["was_running"]) == (True, True)
         assert (result["exited"], result["pid_mismatch"]) == (True, False)
         assert not pane_exists(tmux_server, out["pane_id"])

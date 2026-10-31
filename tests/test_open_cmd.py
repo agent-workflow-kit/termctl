@@ -753,7 +753,6 @@ class Script(FakeGateway):
         stdin: str | None = None,
         timeout: float | None = None,
         env: Mapping[str, str] | None = None,
-        new_session: bool = False,
     ) -> subprocess.CompletedProcess[str]:
         self.calls.append(list(argv))
         queue = self.script.get(tuple(argv))

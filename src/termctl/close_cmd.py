@@ -185,7 +185,7 @@ class Closing:
     """What steps 1 to 3 established. ``current`` is the pane as step 3 read it, None when it
     was gone; ``pid_mismatch`` holds for a recorded PID that failed a check of step 1 or 3;
     ``proof`` is step 1's ``probe`` of a forced running pane's recorded PID (None when none
-    was made). ``signals_sent`` receives each signal as it is sent."""
+    was made)."""
 
     first: ManagedPane
     current: ManagedPane | None
@@ -193,7 +193,6 @@ class Closing:
     grace_s: float
     pid_mismatch: bool
     proof: Probe | None
-    signals_sent: list[str] = field(default_factory=list[str])
 
 
 @dataclass
@@ -398,8 +397,9 @@ def _sequence(
     warn: Warn,
 ) -> Closed:
     assert pane.pid is not None and pane.pid_start is not None
-    grace_s, sent = closing.grace_s, closing.signals_sent
-    outcome = procs.signal_sequence(gateway, clock, handle, pane.pid, pane.pid_start, grace_s, sent)
+    outcome = procs.signal_sequence(
+        gateway, clock, handle, pane.pid, pane.pid_start, closing.grace_s
+    )
     for warning in outcome.warnings:
         warn(warning)
     return Closed(outcome.signals_sent, outcome.exited, outcome.pid_mismatch)

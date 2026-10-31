@@ -230,9 +230,10 @@ class TmuxBackend:
     def kill_pane(
         self, pane_id: str, termctl_id: str, *, query: bool
     ) -> tuple[tb.GuardOutcome, subprocess.CompletedProcess[str], tb.ProcessQuery | None]:
-        # A session of its own: killing termctl's own pane hangs up termctl's terminal, and
-        # the tmux client must still deliver the answer of its query.
-        result = self.tmux.run(tb.kill_pane(pane_id, termctl_id, query=query), new_session=True)
+        # The tmux client runs in a process group of its own (``Gateway.run``), so the hangup of
+        # termctl's terminal, when this is termctl's own pane, does not reach it and it still
+        # delivers the answer of its query.
+        result = self.tmux.run(tb.kill_pane(pane_id, termctl_id, query=query))
         outcome, result, answer = self._queried(result)
         return outcome, result, answer if query else None
 

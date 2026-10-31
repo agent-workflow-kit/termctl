@@ -6,6 +6,7 @@ from __future__ import annotations
 
 import io
 import json
+import os
 import signal
 from collections.abc import Callable, Mapping
 from dataclasses import dataclass
@@ -17,7 +18,7 @@ import yaml
 
 from termctl import tmux_backend as tb
 from termctl.cli import main
-from termctl.gateway import GroupRun, Terminated
+from termctl.gateway import GroupRun, Terminated, with_pgid
 
 from .conftest import private_environ
 from .fakes import (
@@ -250,13 +251,6 @@ def test_a_dead_pane_is_closed_without_force_by_a_guarded_kill_pane(
     assert (record["result"], record["force"], record["actor"]) == ("ok", False, "auto:unknown")
     assert (record["escalation_override"], record["decision_ids"]) == (False, [])
     assert records(private_state_home, "audit.jsonl") == []
-
-
-def test_the_guarded_kill_runs_tmux_in_a_session_of_its_own() -> None:
-    # Killing termctl's own pane hangs up its terminal; the tmux client must still answer.
-    result = forced(process=FakeProcess(hup_on_kill=True))
-    result.output()
-    assert result.gateway.new_session_calls == [list(KILL_QUERY)]
 
 
 def test_the_guarded_kill_targets_only_the_managed_pane() -> None:
@@ -793,69 +787,170 @@ def test_gone_at_the_step_1_probe_but_listed_at_the_re_check_is_never_signaled()
 # --- a run stopped by a signal ------------------------------------------------------------------
 
 
-def interrupting(clock: FakeClock, stop: BaseException, after: int) -> None:
-    """The fake clock's ``after``-th sleep raises ``stop``, as a signal handler would."""
+def send(signum: int) -> None:
+    """Deliver ``signum`` to this process, only with termctl's handler installed (it must
+    never reach the test runner)."""
+    assert signal.getsignal(signum) not in (signal.SIG_DFL, signal.SIG_IGN)
+    assert signal.getsignal(signum) is not signal.default_int_handler
+    os.kill(os.getpid(), signum)  # this process: exact, and handled
+
+
+def signaling_on_sleep(clock: FakeClock, signum: int, after: int) -> None:
+    """The fake clock's ``after``-th sleep delivers ``signum`` (during the signal sequence)."""
     sleep = clock.sleep
     count = [0]
 
-    def stopping(seconds: float) -> None:
+    def sleeping(seconds: float) -> None:
         count[0] += 1
         if count[0] == after:
-            raise stop
+            send(signum)
         sleep(seconds)
 
-    clock.sleep = stopping  # type: ignore[method-assign]
+    clock.sleep = sleeping  # type: ignore[method-assign]
 
 
-@pytest.mark.parametrize(
-    ("stop", "signum", "exit_code"),
-    [
-        (KeyboardInterrupt(), "SIGINT", 130),
-        (Terminated(signal.SIGTERM), "SIGTERM", 143),
-    ],
-)
-def test_a_forced_close_stopped_after_sigterm_is_logged_and_audited(
-    private_state_home: Path, stop: BaseException, signum: str, exit_code: int
+def signaling_on_call(gateway: FakeGateway, call: tuple[str, ...], signum: int) -> None:
+    """The tmux ``call`` delivers ``signum`` once it has run, as a signal during it would."""
+    run = gateway.run
+
+    def running(argv: list[str], **kwargs: Any) -> Any:
+        result = run(argv, **kwargs)
+        if tuple(argv) == call:
+            send(signum)
+        return result
+
+    gateway.run = running  # type: ignore[method-assign]
+
+
+STOPS = [(signal.SIGINT, "interrupted"), (signal.SIGTERM, "terminated by signal 15")]
+HANDLED = (signal.SIGINT, signal.SIGTERM, signal.SIGHUP)
+
+
+def assert_audited_output(state: Path) -> Any:
+    [audit] = records(state, "audit.jsonl")
+    validate(audit["result"], "termctl/cli/close.json")
+    assert (audit["action"], audit["force"], audit["target"]) == ("close", True, ID)
+    return audit["result"]
+
+
+@pytest.mark.parametrize(("signum", "message"), STOPS, ids=["int", "term"])
+def test_a_stop_signal_during_the_signal_sequence_is_deferred_until_the_audit(
+    signum: int, message: str, private_state_home: Path
 ) -> None:
     gateway, clock = gateway_for()
-    # The grace is 0 s: SIGTERM goes out at once, then the 5 s wait polls and sleeps.
-    interrupting(clock, stop, after=1)
-    result = close([ID, "--force", *HUMAN, "--grace", "0s"], gateway, clock)
-    assert result.code == exit_code
-    assert gateway.signals == [(4242, signal.SIGTERM)]
+    hook(gateway, "notify", group_run(0))
+    # The grace is 0 s: SIGTERM goes out at once; the signal comes in the 5 s wait after it.
+    signaling_on_sleep(clock, signum, after=1)
+    before = {s: signal.getsignal(s) for s in HANDLED}
+    argv = [ID, "--force", *HUMAN, "--grace", "0s", "--hook", "post-close=notify"]
+    result = close(argv, gateway, clock)
+    assert result.code == 128 + signum, result.stderr
+    # The sequence ran to its end, the output was audited; no post-close hook ran.
+    assert gateway.signals == [(4242, signal.SIGTERM), (4242, signal.SIGKILL)]
+    assert assert_audited_output(private_state_home)["signals_sent"] == ["SIGTERM", "SIGKILL"]
+    assert gateway.group_calls == []
     [record] = close_records(private_state_home)
-    assert (record["result"], record["exit_code"]) == ("error", exit_code)
-    [audit] = records(private_state_home, "audit.jsonl")  # validated against audit.json
-    assert (audit["action"], audit["force"], audit["target"]) == ("close", True, ID)
-    assert audit["result"]["stopped"]["signal"] == signum
-    assert audit["result"]["stopped"]["exit_code"] == exit_code
-    assert audit["result"]["stopped"]["signals_sent"] == ["SIGTERM"]
-    # The guard was entered at step 3, dropped before the records, and left afterwards.
-    assert gateway.guard_events == ["enter", "drop", "exit"]
+    assert (record["result"], record["exit_code"], record["message"]) == (
+        "error",
+        128 + signum,
+        message,
+    )
+    assert {s: signal.getsignal(s) for s in HANDLED} == before
 
 
-def test_a_forced_close_stopped_during_the_grace_wait_is_audited_with_no_signals(
+@pytest.mark.parametrize(("signum", "message"), STOPS, ids=["int", "term"])
+def test_a_stop_signal_during_the_guarded_kill_leaves_no_run_unrecorded(
+    signum: int, message: str, private_state_home: Path
+) -> None:
+    # R1-11: the tmux client runs in its own process group (``SystemGateway.run``), so the
+    # signal reaches termctl only; it is raised once the close and its audit record are done.
+    gateway, clock = gateway_for(process=FakeProcess(hup_on_kill=True))
+    signaling_on_call(gateway, KILL_QUERY, signum)
+    result = close([ID, "--force", *HUMAN], gateway, clock)
+    assert result.code == 128 + signum, result.stderr
+    assert result.tmux()[-1] == "kill+query"
+    output = assert_audited_output(private_state_home)
+    assert (output["pane_closed"], output["exited"], output["pid_mismatch"]) == (True, True, False)
+    [record] = close_records(private_state_home)
+    assert (record["exit_code"], record["message"]) == (128 + signum, message)
+
+
+@pytest.mark.parametrize("where", ["kill", "sequence", "post-close"])
+def test_sighup_from_the_re_check_on_does_not_stop_close(
+    where: str, private_state_home: Path
+) -> None:
+    # Closing the pane termctl runs in hangs up its terminal: the run completes.
+    gateway, clock = gateway_for()
+    hook(gateway, "notify", group_run(0))
+    if where == "kill":
+        signaling_on_call(gateway, KILL_QUERY, signal.SIGHUP)
+    elif where == "sequence":
+        signaling_on_sleep(clock, signal.SIGHUP, after=1)
+    else:
+
+        def hanging_up(_: GroupCall) -> GroupRun:
+            send(signal.SIGHUP)
+            return group_run(0)
+
+        hook(gateway, "notify", hanging_up)
+    argv = [ID, "--force", *HUMAN, "--grace", "0s", "--hook", "post-close=notify"]
+    data = close(argv, gateway, clock).output()
+    assert assert_audited_output(private_state_home) == data
+    assert [r["exit_code"] for r in close_records(private_state_home)] == [0]
+
+
+def test_sighup_in_a_pre_close_hook_still_stops_close_before_any_change(
     private_state_home: Path,
 ) -> None:
     gateway, clock = gateway_for()
-    interrupting(clock, Terminated(signal.SIGTERM), after=1)
-    result = close([ID, "--force", *HUMAN], gateway, clock)
-    assert result.code == 143
-    assert gateway.signals == []
-    [audit] = records(private_state_home, "audit.jsonl")
-    assert audit["result"]["stopped"]["signals_sent"] == []
-    assert close_records(private_state_home)[0]["exit_code"] == 143
-
-
-def test_a_forced_close_stopped_in_a_pre_close_hook_is_audited(private_state_home: Path) -> None:
-    gateway, clock = gateway_for()
-    hook(gateway, "gate", Terminated(signal.SIGHUP))
+    hook(gateway, "gate", with_pgid(Terminated(signal.SIGHUP), 9))
     result = close([ID, "--force", *HUMAN, "--hook", "pre-close=gate"], gateway, clock)
     assert result.code == 129
-    [audit] = records(private_state_home, "audit.jsonl")
-    assert audit["result"]["stopped"]["signal"] == "SIGHUP"
-    # The guard starts at step 3, which was never reached.
-    assert gateway.guard_events == []
+    assert result.tmux() == ["list-panes", "query"]
+    assert gateway.signals == []
+    [record] = close_records(private_state_home)
+    assert (record["exit_code"], record["hooks"]) == (
+        129,
+        [{"hook": "pre-close", "cmd": "gate", "pgid": 9, "async": False}],
+    )
+    # Nothing was changed, so there is nothing to audit (as for open before its window).
+    assert records(private_state_home, "audit.jsonl") == []
+
+
+def test_a_stop_in_a_later_pre_close_hook_keeps_the_earlier_hooks_and_ids(
+    private_state_home: Path,
+) -> None:
+    # R1-10.
+    gateway, clock = gateway_for()
+    hook(gateway, "a", group_run(0, stdout=b'{"decision_id": "a-1"}', pgid=11))
+    hook(gateway, "b", with_pgid(KeyboardInterrupt(), 12))
+    argv = [ID, "--force", *HUMAN, "--decision-id", "d-1", "--hook", "pre-close=a",
+            "--hook", "pre-close=b"]  # fmt: skip
+    assert close(argv, gateway, clock).code == 130
+    [record] = close_records(private_state_home)
+    assert record["decision_ids"] == ["d-1", "a-1"]
+    assert record["hooks"] == [
+        {"hook": "pre-close", "cmd": "a", "pgid": 11, "async": False},
+        {"hook": "pre-close", "cmd": "b", "pgid": 12, "async": False},
+    ]
+
+
+def test_a_stop_in_a_later_post_close_hook_keeps_the_earlier_hooks_and_the_audit(
+    private_state_home: Path,
+) -> None:
+    # R1-10: the audit record was written with the output before the post-close hooks.
+    gateway, clock = gateway_for(process=FakeProcess(hup_on_kill=True))
+    hook(gateway, "a", group_run(0, pgid=21))
+    hook(gateway, "b", with_pgid(Terminated(signal.SIGTERM), 22))
+    argv = [ID, "--force", *HUMAN, "--hook", "post-close=a", "--hook", "post-close=b"]
+    assert close(argv, gateway, clock).code == 143
+    [record] = close_records(private_state_home)
+    assert (record["exit_code"], record["message"]) == (143, "terminated by signal 15")
+    assert record["hooks"] == [
+        {"hook": "post-close", "cmd": "a", "pgid": 21, "async": False},
+        {"hook": "post-close", "cmd": "b", "pgid": 22, "async": False},
+    ]
+    assert assert_audited_output(private_state_home)["pane_closed"] is True
 
 
 def test_a_stopped_close_without_force_of_a_dead_pane_is_not_audited(
@@ -867,12 +962,6 @@ def test_a_stopped_close_without_force_of_a_dead_pane_is_not_audited(
     assert result.code == 130
     assert close_records(private_state_home)[0]["exit_code"] == 130
     assert records(private_state_home, "audit.jsonl") == []
-
-
-def test_a_completed_close_drops_stop_signals_before_its_records() -> None:
-    gateway, clock = gateway_for(process=FakeProcess(hup_on_kill=True))
-    close([ID, "--force", *HUMAN], gateway, clock).output()
-    assert gateway.guard_events == ["enter", "drop", "exit"]
 
 
 # --- logging and errors before the pane is known ------------------------------------------------

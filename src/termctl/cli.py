@@ -12,7 +12,6 @@ import os
 import signal
 import sys
 from collections.abc import Mapping, Sequence
-from contextlib import ExitStack
 from dataclasses import dataclass, field
 from typing import Any, NoReturn, TextIO
 
@@ -38,7 +37,6 @@ from .gateway import (
     Clock,
     Gateway,
     RunSignals,
-    StopGuard,
     SystemClock,
     SystemGateway,
     Terminated,
@@ -91,15 +89,9 @@ class Context:
     hook_processes: list[hooks.HookProcess] = field(default_factory=list[hooks.HookProcess])
     # ``close``: whether step 1 or step 3 saw the pane running (a forced run is then audited).
     close_saw_running: bool = False
-    # ``close``: the signals sent so far (a stopped run audits them), and the stop-signal
-    # guard held from step 3 until the records are written: ``guards`` (set by
-    # ``_logged_close``) holds it, ``stop_guard`` is the guard once entered.
-    signals_sent: list[str] = field(default_factory=list[str])
-    guards: ExitStack | None = None
-    stop_guard: StopGuard | None = None
-    # ``open``: whether its audit record was written (it is written once).
+    # ``open`` and ``close``: whether the audit record was written (it is written once).
     audited: bool = False
-    # A logged ``open``: its stop-signal handling (``gateway.stop_signals``).
+    # A logged ``open`` or ``close``: its stop-signal handling (``gateway.stop_signals``).
     signals: RunSignals | None = None
 
     def log_id(self) -> str | None:
@@ -986,11 +978,34 @@ def close_pane(args: argparse.Namespace, ctx: Context) -> Result:
                 ctx.warn(f"{proof.verification.problem}; the recorded process is not signaled")
     # Step 2: the pre-close hooks; a veto exits 11, an escalation 13.
     run_pre_close_hooks(args, ctx, first, grace)
-    # Step 3: the re-check, with a fresh read (the hooks may have run long). From here until
-    # the records are written, SIGHUP (closing termctl's own pane) cannot end the run, and
-    # SIGTERM or SIGINT stops it through ``_close_stopped`` ("Audit and log").
-    if ctx.guards is not None:
-        ctx.stop_guard = ctx.guards.enter_context(ctx.gateway.stop_signal_guard())
+    assert ctx.signals is not None
+    # From step 3 on SIGHUP does nothing (closing the pane termctl runs in hangs up its
+    # terminal), and steps 3 to 5 run with SIGINT and SIGTERM deferred: one there is raised
+    # only once the output exists and its audit record is written, so it never leaves a
+    # killed pane or a signaled process without an audit record (interface.md "Audit and log").
+    ctx.signals.ignore_hangups()
+    with ctx.signals.deferred():
+        data = _close_steps_3_to_5(args, ctx, first, grace, pid_mismatch, proof, started)
+        _audit_close(args, ctx, data)
+    # The post-close hooks, the log record and the output.
+    run_post_close_hooks(args, ctx, data, first.labels)
+    ctx.signals.finish()
+    ctx.log(_close_record(args, ctx, result="ok", exit_code=0))
+    return Result(data, f"closed {first.id}")
+
+
+def _close_steps_3_to_5(
+    args: argparse.Namespace,
+    ctx: Context,
+    first: ManagedPane,
+    grace: int,
+    pid_mismatch: bool,
+    proof: close_cmd.Probe | None,
+    started: float,
+) -> dict[str, Any]:
+    """Steps 3 to 5 of ``close``: the re-check (a fresh read; the hooks may have run long),
+    the guarded kill and the signal sequence; returns the ``--json`` output."""
+    socket_path = _socket_path(ctx)
     backend = connect(ctx)
     reread = _reread(ctx, backend)
     # Before the re-check can fail: a forced run that sees the pane running here is audited.
@@ -1006,7 +1021,6 @@ def close_pane(args: argparse.Namespace, ctx: Context) -> Result:
         grace_s=grace / 1000,
         pid_mismatch=pid_mismatch,
         proof=proof,
-        signals_sent=ctx.signals_sent,
     )
     # Steps 4 and 5.
     closed = close_cmd.close(backend, ctx.gateway, ctx.clock, socket_path, closing, ctx.warn)
@@ -1022,11 +1036,7 @@ def close_pane(args: argparse.Namespace, ctx: Context) -> Result:
         "duration_ms": max(0, round((ctx.clock.monotonic() - started) * 1000)),
         "socket_path": socket_path,
     }
-    run_post_close_hooks(args, ctx, data, first.labels)
-    _drop_stop_signals(ctx)
-    ctx.log(_close_record(args, ctx, result="ok", exit_code=0))
-    _audit_close(args, ctx, data)
-    return Result(data, f"closed {first.id}")
+    return data
 
 
 def _reread(ctx: Context, backend: Backend | None) -> PaneRead:
@@ -1084,6 +1094,7 @@ def run_pre_close_hooks(
         decision_ids=args.decision_ids,
         override_escalation=override,
     )
+    # The ids and processes go straight into ctx, so a stop signal loses neither.
     outcome = hooks.run_pre_hooks(
         hooks.hooks_for(ctx.config, "pre-close", args.flag_hooks),
         payload,
@@ -1091,9 +1102,9 @@ def run_pre_close_hooks(
         override_escalation=override,
         gateway=ctx.gateway,
         environ=ctx.environ,
+        ids=ctx.decision_ids,
+        processes=ctx.hook_processes,
     )
-    ctx.hook_processes.extend(outcome.processes)
-    ctx.decision_ids = list(outcome.decision_ids)
     _hook_warnings(ctx, outcome.warnings)
     outcome.check()
 
@@ -1108,8 +1119,8 @@ def run_post_close_hooks(
         hooks.post_close_payload(result=output, labels=labels),
         gateway=ctx.gateway,
         environ=ctx.environ,
+        processes=ctx.hook_processes,
     )
-    ctx.hook_processes.extend(outcome.processes)
     _hook_warnings(ctx, outcome.warnings)
 
 
@@ -1143,13 +1154,14 @@ def _close_record(
 
 def _audit_close(args: argparse.Namespace, ctx: Context, result: Mapping[str, Any]) -> None:
     """The audit record of a ``close --force`` in which step 1 or 3 saw a running pane, and of
-    an ``--override-escalation`` run, once the id is resolved; ``result`` is the ``--json``
-    output, the error envelope or, for a run a signal stopped, ``{"stopped": ...}``."""
-    if ctx.pane is None:
+    an ``--override-escalation`` run, once the id is resolved, and only once; ``result`` is
+    the ``--json`` output or the error envelope."""
+    if ctx.pane is None or ctx.audited:
         return
     forced = bool(args.force) and ctx.close_saw_running
     if not (forced or args.override_escalation):
         return
+    ctx.audited = True
     assert ctx.server is not None
     ctx.audit(
         jsonlog.audit_close_record(
@@ -1167,16 +1179,8 @@ def _audit_close(args: argparse.Namespace, ctx: Context, result: Mapping[str, An
     )
 
 
-def _drop_stop_signals(ctx: Context) -> None:
-    """Only the records are left to write: from now on a stop signal is dropped, so it cannot
-    cut them short."""
-    if ctx.stop_guard is not None:
-        ctx.stop_guard.drop()
-
-
 def _close_failed(args: argparse.Namespace, ctx: Context, err: TermctlError) -> None:
     """Log (and audit, where ``_audit_close`` says) a ``close`` that failed after step 1."""
-    _drop_stop_signals(ctx)
     if err.decision_ids is None and ctx.decision_ids:
         err.decision_ids = list(ctx.decision_ids)
     if err.code in ("vetoed", "escalated"):
@@ -1194,42 +1198,38 @@ def _close_failed(args: argparse.Namespace, ctx: Context, err: TermctlError) -> 
 
 
 def _close_stopped(args: argparse.Namespace, ctx: Context, stop: BaseException) -> None:
-    """Log a ``close`` stopped by a signal (exit 128 plus its number), and audit it where
-    ``_audit_close`` says, with a ``stopped`` result: the signal, the exit code and the
-    signals sent so far (interface.md "Audit and log")."""
+    """Log a ``close`` stopped by a signal (exit 128 plus its number). Its audit record, if
+    any, was written once the output existed (``close_pane``); a run stopped before step 3
+    has changed nothing and has neither output nor error object, and gets none."""
     if isinstance(stop, Terminated):
         signum, message = stop.signum, f"terminated by signal {stop.signum}"
     else:
         signum, message = int(signal.SIGINT), "interrupted"
-    _drop_stop_signals(ctx)
     ctx.log(_close_record(args, ctx, result="error", exit_code=128 + signum, message=message))
-    stopped = {
-        "signal": signal.Signals(signum).name,
-        "exit_code": 128 + signum,
-        "message": message,
-        "signals_sent": list(ctx.signals_sent),
-    }
-    _audit_close(args, ctx, {"stopped": stopped})
 
 
 def _logged_close(args: argparse.Namespace, ctx: Context) -> Result:
     """``close`` past step 1, not a dry run: every outcome gets a ``log.jsonl`` record, and a
     forced run that saw a running pane or an ``--override-escalation`` run an audit record
-    once its id is resolved, a run a signal stopped included (interface.md "Audit and log").
-    The stop-signal guard ``close_pane`` enters at step 3 ends only after the records."""
+    once its id is resolved (interface.md "Audit and log"). Stop signals are handled as for
+    ``open`` (``_logged_open``)."""
     ctx.logged = True
     ctx.decision_ids = list(args.decision_ids)
-    with ExitStack() as guards:
-        ctx.guards = guards
+    # SIGINT, SIGTERM and SIGHUP raise for the whole run, so it is logged whenever one stops it.
+    with stop_signals() as signals:
+        ctx.signals = signals
         try:
             return _resolve_and_run(args, ctx)
         except TermctlError as err:
+            signals.finish()
             _close_failed(args, ctx, err)
             raise
         except (KeyboardInterrupt, Terminated) as stop:
+            signals.finish()
             _close_stopped(args, ctx, stop)
             raise
         except Exception as exc:
+            signals.finish()
             err = internal_error(exc)
             _close_failed(args, ctx, err)
             raise err from exc

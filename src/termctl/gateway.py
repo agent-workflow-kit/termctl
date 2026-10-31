@@ -24,7 +24,7 @@ import tempfile
 import threading
 import time
 from collections.abc import Callable, Iterator, Mapping
-from contextlib import AbstractContextManager, contextmanager
+from contextlib import contextmanager
 from dataclasses import dataclass
 from datetime import UTC, datetime
 from types import FrameType
@@ -130,14 +130,6 @@ class ProcessHandle(Protocol):
         ...
 
 
-class StopGuard(Protocol):
-    """What ``Gateway.stop_signal_guard`` yields."""
-
-    def drop(self) -> None:
-        """From now until the guard ends, no stop signal raises: one that comes is dropped."""
-        ...
-
-
 class Gateway(Protocol):
     """External effects termctl needs. Later stages add tty writes here."""
 
@@ -148,7 +140,6 @@ class Gateway(Protocol):
         stdin: str | None = None,
         timeout: float | None = None,
         env: Mapping[str, str] | None = None,
-        new_session: bool = False,
     ) -> subprocess.CompletedProcess[str]: ...
 
     def run_bounded(
@@ -290,16 +281,6 @@ class Gateway(Protocol):
         Raises ``OSError`` if ``/proc/self`` cannot be read."""
         ...
 
-    def stop_signal_guard(self) -> AbstractContextManager[StopGuard]:
-        """Until the context exits (``close`` from its re-check until its records are
-        written): SIGHUP is ignored, so a hangup (closing termctl's own pane included) cannot
-        end the run; the first SIGTERM or SIGINT raises ``Terminated`` or
-        ``KeyboardInterrupt``, after which every stop signal is ignored so the caller can
-        write its records. A signal the caller set to be ignored or handled stays so. A hook
-        run meanwhile (``run_group``) is stopped through the same guard. Signal handlers are
-        process state: only the main thread changes them."""
-        ...
-
 
 class Clock(Protocol):
     def now(self) -> datetime:
@@ -325,14 +306,10 @@ class SystemGateway:
         stdin: str | None = None,
         timeout: float | None = None,
         env: Mapping[str, str] | None = None,
-        new_session: bool = False,
     ) -> subprocess.CompletedProcess[str]:
         """Run ``argv`` without a shell and capture its output as text.
 
         ``env`` replaces the whole environment when given; ``None`` inherits termctl's own.
-        ``new_session`` runs it in a session of its own, without termctl's controlling
-        terminal, so a hangup of that terminal (the guarded kill of termctl's own pane) does
-        not reach it.
         Output is read as bytes and decoded with ``.decode("utf-8", "surrogateescape")``
         whatever the locale (tmux runs with ``-u`` and writes UTF-8; each undecodable byte is
         kept as a lone surrogate), with no newline translation, so a ``\r`` in tmux's output
@@ -347,8 +324,6 @@ class SystemGateway:
         ``stdin`` pipe) and its output is captured: the tmux commands and ``ps`` run here
         never attach a client or otherwise need a terminal.
         """
-        # A new session is also a process group of its own.
-        group: dict[str, Any] = {"start_new_session": True} if new_session else {"process_group": 0}
         if stdin is None:
             completed = subprocess.run(
                 argv,
@@ -357,7 +332,7 @@ class SystemGateway:
                 timeout=timeout,
                 env=None if env is None else dict(env),
                 check=False,
-                **group,
+                process_group=0,
             )
         else:
             completed = subprocess.run(
@@ -367,7 +342,7 @@ class SystemGateway:
                 timeout=timeout,
                 env=None if env is None else dict(env),
                 check=False,
-                **group,
+                process_group=0,
             )
         return subprocess.CompletedProcess(
             completed.args,
@@ -543,9 +518,6 @@ class SystemGateway:
 
     def proc_is_own_namespace(self) -> bool:
         return os.readlink("/proc/self") == str(os.getpid())
-
-    def stop_signal_guard(self) -> AbstractContextManager[StopGuard]:
-        return _stop_signal_guard()
 
 
 # The Linux system call numbers of pidfd_send_signal (5.1) and pidfd_open (5.3) on the
@@ -766,15 +738,14 @@ class _StopSignals:
     the fork and the moment the caller has the process to kill, nor lose a hook that ended.
     ``stop_signals`` installs one for a whole run; a hook's handler has the run's as its
     ``parent``: holding it holds the parent too (SIGINT stays with the run's handler), and
-    only the first signal of either raises. Not blocked with ``pthread_sigmask``: the hook
-    (or tmux and the pane) would inherit the blocked mask.
+    only the first signal of either raises. A signal in ``ignored`` (the run's, for a hook's
+    handler) does nothing at all (``RunSignals.ignore_hangups``). Not blocked with
+    ``pthread_sigmask``: the hook (or tmux and the pane) would inherit the blocked mask.
     """
 
-    def __init__(
-        self, parent: _StopSignals | None = None, ignored: frozenset[int] = frozenset()
-    ) -> None:
+    def __init__(self, parent: _StopSignals | None = None) -> None:
         self._parent = parent
-        self._ignored = ignored
+        self.ignored: set[int] = set()
         self._raised = False
         self._held = False
         self._holding_parent = False
@@ -783,10 +754,15 @@ class _StopSignals:
     def _done(self) -> bool:
         return self._raised or (self._parent is not None and self._parent._raised)
 
+    def _ignores(self, signum: int) -> bool:
+        return signum in self.ignored or (
+            self._parent is not None and signum in self._parent.ignored
+        )
+
     def handle(self, signum: int, frame: FrameType | None) -> None:
         # Only the first signal raises, so a second one cannot interrupt the cleanup; the run's
         # handler, restored after a hook, must not raise again either (review round 2, R2-3).
-        if signum in self._ignored or self._done():
+        if self._done() or self._ignores(signum):
             return
         self._raised = True
         if self._parent is not None:
@@ -818,15 +794,6 @@ class _StopSignals:
         """Stop holding, drop a signal that came while held and ignore any later one."""
         self._raised = True
         self._held, self._pending = False, None
-
-    def drop(self) -> None:
-        """From now on no signal raises, a held one included."""
-        self._raised = True
-        self._pending = None
-
-
-# The guard of ``_stop_signal_guard`` while it is active; ``_hook_signals`` defers to it.
-_active_guard: _StopSignals | None = None
 
 
 def _is_stop_handler(handler: Any) -> bool:
@@ -868,6 +835,13 @@ class RunSignals:
         """The run is ending (its last record is being written): ignore later stop signals."""
         self._stops.ignore_later()
 
+    def ignore_hangups(self) -> None:
+        """From now on SIGHUP does nothing, a hook's handler included (``close`` from its
+        re-check on: closing the pane termctl runs in hangs up its terminal, and the run must
+        still complete and write its records). It stays handled, not ``SIG_IGN``, so the
+        programs termctl runs get it at its default."""
+        self._stops.ignored.add(signal.SIGHUP)
+
 
 @contextmanager
 def stop_signals() -> Iterator[RunSignals]:
@@ -902,12 +876,7 @@ def _hook_signals() -> Iterator[_StopSignals]:
     ignored or handled already, other than by ``stop_signals``) raise ``Terminated`` (see
     ``_StopSignals``), so the hook's group is killed before termctl exits. The run's handler
     (``stop_signals``), if any, is its parent: holding holds both, and once either has raised
-    neither raises again. The previous handlers are restored afterwards. Inside a
-    ``_stop_signal_guard`` the guard's handler stays and is used instead."""
-    if _active_guard is not None:
-        _default_sigchld()
-        yield _active_guard
-        return
+    neither raises again. The previous handlers are restored afterwards."""
     stops = _StopSignals()
     if threading.current_thread() is not threading.main_thread():
         yield stops
@@ -922,34 +891,6 @@ def _hook_signals() -> Iterator[_StopSignals]:
     try:
         yield stops
     finally:
-        for signum, handler in previous.items():
-            signal.signal(signum, handler)
-
-
-@contextmanager
-def _stop_signal_guard() -> Iterator[StopGuard]:
-    """``Gateway.stop_signal_guard``: SIGHUP ignored, the first SIGTERM or SIGINT raises, any
-    later one is ignored. Only signals at their default handling are taken over, by a handler
-    (not SIG_IGN), so the programs termctl runs meanwhile get them at their default."""
-    global _active_guard
-    stops = _StopSignals(ignored=frozenset({signal.SIGHUP}))
-    if threading.current_thread() is not threading.main_thread() or _active_guard is not None:
-        yield stops
-        return
-    defaults: dict[int, Any] = {
-        signal.SIGTERM: signal.SIG_DFL,
-        signal.SIGHUP: signal.SIG_DFL,
-        signal.SIGINT: signal.default_int_handler,
-    }
-    previous: dict[int, Any] = {}
-    for signum, default in defaults.items():
-        if signal.getsignal(signum) == default:
-            previous[signum] = signal.signal(signum, stops.handle)
-    _active_guard = stops
-    try:
-        yield stops
-    finally:
-        _active_guard = None
         for signum, handler in previous.items():
             signal.signal(signum, handler)
 

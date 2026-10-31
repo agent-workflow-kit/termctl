@@ -222,7 +222,6 @@ def signal_sequence(
     pid: int,
     start: str,
     grace_s: float,
-    sent: list[str] | None = None,
 ) -> SignalOutcome:
     """interface.md `close` step 5, after the kernel's SIGHUP (the pane was killed, or was
     found gone): wait up to ``grace_s`` for the process to exit, send SIGTERM, wait 5 seconds,
@@ -234,10 +233,9 @@ def signal_sequence(
     is sent), and after a signal means the recorded process has exited and its PID was
     reused. A process that cannot be read stops the sequence with a warning; it is reported
     as exited only if the handle says so. A process that survives SIGKILL is ``exited:
-    False``. ``sent``, when given, is the outcome's ``signals_sent`` list, so the caller sees
-    each signal as soon as it is sent (a run stopped meanwhile audits them).
+    False``.
     """
-    outcome = SignalOutcome() if sent is None else SignalOutcome(signals_sent=sent)
+    outcome = SignalOutcome()
 
     def state() -> _State:
         if handle.exited():

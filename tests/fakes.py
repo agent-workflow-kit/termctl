@@ -6,8 +6,7 @@ import errno
 import os
 import stat
 import subprocess
-from collections.abc import Callable, Iterator, Mapping, Sequence
-from contextlib import contextmanager
+from collections.abc import Callable, Mapping, Sequence
 from dataclasses import dataclass, field
 from datetime import UTC, datetime, timedelta
 from typing import Any
@@ -184,16 +183,6 @@ class FakeHandle:
         self.closed = True
 
 
-class FakeGuard:
-    """What the fake ``stop_signal_guard`` yields; it records ``drop``."""
-
-    def __init__(self, events: list[str]) -> None:
-        self.events = events
-
-    def drop(self) -> None:
-        self.events.append("drop")
-
-
 @dataclass
 class GroupCall:
     """One ``run_group`` or ``spawn_watched`` call as the fake saw it."""
@@ -276,8 +265,6 @@ class FakeGateway:
         self.peer_checks: list[str] = []
         # ``proc_is_own_namespace`` answers ``own_namespace`` (or raises it).
         self.own_namespace: bool | OSError = True
-        # ``stop_signal_guard`` events: "enter", "drop", "exit".
-        self.guard_events: list[str] = []
         self.panes = None if panes is None else [dict(row) for row in panes]
         self.list_panes = list_panes
         self.responses: dict[tuple[str, ...], Response] = {
@@ -287,8 +274,6 @@ class FakeGateway:
         self.executables = {TMUX} if executables is None else set(executables)
         self.executable_checks: list[str] = []
         self.calls: list[list[str]] = []
-        # The calls run with ``new_session``.
-        self.new_session_calls: list[list[str]] = []
         # The ``env`` argument of each call, in the order of ``calls``.
         self.envs: list[Mapping[str, str] | None] = []
         self.cwd = cwd
@@ -326,10 +311,7 @@ class FakeGateway:
         stdin: str | None = None,
         timeout: float | None = None,
         env: Mapping[str, str] | None = None,
-        new_session: bool = False,
     ) -> subprocess.CompletedProcess[str]:
-        if new_session:
-            self.new_session_calls.append(list(argv))
         return self._respond(argv, env)
 
     def run_bounded(
@@ -520,14 +502,6 @@ class FakeGateway:
         if isinstance(self.own_namespace, OSError):
             raise self.own_namespace
         return self.own_namespace
-
-    @contextmanager
-    def stop_signal_guard(self) -> Iterator[FakeGuard]:
-        self.guard_events.append("enter")
-        try:
-            yield FakeGuard(self.guard_events)
-        finally:
-            self.guard_events.append("exit")
 
     def _resolve(self, path: str, *, depth: int) -> str:
         if depth > 40:
