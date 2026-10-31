@@ -18,7 +18,7 @@ import pytest
 from termctl import tmux_backend as tb
 from termctl.tmux_backend import Command, GuardOutcome, Invocation, command
 
-from .conftest import TMUX_VERSION, TmuxServer, wait_for
+from .conftest import TmuxServer, tmux_stored_name, wait_for
 
 pytestmark = pytest.mark.tmux
 
@@ -47,6 +47,10 @@ LITERALS = [
     "a'b",
     '"',
     "$HOME",
+    # tmux 3.2 stores a "$" escaped only before an ASCII letter, "_" or "{" (tmux_stored_name).
+    "a$b c$",
+    "${x}",
+    "$1",
     "~",
     "{}",
     "}",
@@ -77,19 +81,10 @@ LITERALS = [
     "#(echo pwned)\n#(echo pwned)",
 ]
 
-# Option values as tmux prints them back: it escapes ESC, CR and other C0 characters on output
-# (tab and newline are kept), so those are left to the argv and -e tests, which read them raw.
+# Option values as tmux prints them back: tmux 3.3+ escapes ESC, CR and other C0 characters on
+# output (tab and newline are kept) and 3.2 prints them raw, so those are left to the argv and -e
+# tests, which read them raw.
 OPTION_VALUES = [v for v in LITERALS if "\x1b" not in v and "\r" not in v]
-
-# TODO(#25): tmux 3.2 differs from 3.3+ where these tests expect 3.5a's behaviour: rename-window
-# stores "$" as "\\$" in window_name (design.md spikes A and E). #25 covers tmux 3.2; the "$"
-# divergence also affects the displayed-name comparisons of #19 (rename) and #20 (mark).
-TMUX_3_2 = TMUX_VERSION is not None and TMUX_VERSION < (3, 3)
-XFAIL_3_2_DOLLAR = pytest.mark.xfail(
-    TMUX_3_2,
-    reason="#25: tmux 3.2 rename-window reports '$' as '\\$' in window_name",
-    strict=True,
-)
 
 # Values for format-expanded positions: valid names (no control characters, no "#[").
 NAMES = [
@@ -110,16 +105,16 @@ NAMES = [
     "a'b",
     '"',
     "$HOME",
+    # tmux 3.2 stores a "$" escaped only before an ASCII letter, "_" or "{" (tmux_stored_name).
+    "a$b c$",
+    "${x}",
+    "$1",
     "~",
     "{",
     "}",
     "a,b",
     "é中\U0001f514",
     "🔔 KEY-12",
-]
-# NAMES as test parameters, with the tmux 3.2 "$" divergence marked (TODO(#25) above).
-NAME_PARAMS = [
-    pytest.param(n, marks=XFAIL_3_2_DOLLAR) if "$" in n else pytest.param(n) for n in NAMES
 ]
 
 
@@ -177,12 +172,6 @@ def _new_window(server: TmuxServer, builder_tail: Command | None = None) -> tupl
     assert rc == 0, err
     pane_id, window_id = out.split()
     return pane_id, window_id
-
-
-def _as_window_name(name: str) -> str:
-    """How tmux reports a name set by ``rename-window``: it stores that name vis-escaped, so
-    a backslash reads back doubled (``new-window -n`` keeps it as given)."""
-    return name.replace("\\", "\\\\")
 
 
 # How long _run_holding_client keeps the client open for a "#(" job: the control test proves
@@ -315,7 +304,7 @@ def test_e3_leading_dash_positionals_are_not_flags(tmux_server: TmuxServer) -> N
 # --- E4: "#" doubling; "#(" never executes ------------------------------------------------------
 
 
-@pytest.mark.parametrize("name", NAME_PARAMS)
+@pytest.mark.parametrize("name", NAMES)
 def test_e4_names_round_trip_in_new_window_and_rename_window(
     tmux_server: TmuxServer, name: str
 ) -> None:
@@ -340,7 +329,7 @@ def test_e4_names_round_trip_in_new_window_and_rename_window(
         tmux_server, command("rename-window").target(tb.window(window_id)).name(name + "2").build()
     )
     assert rc == 0, err
-    assert _display(tmux_server, pane_id, "#{window_name}") == _as_window_name(name + "2")
+    assert _display(tmux_server, pane_id, "#{window_name}") == tmux_stored_name(name + "2")
 
 
 @pytest.mark.parametrize("dirname", ["#", "a#b", "#{pane_id}", "a;", ";", "-x", "'", "$HOME", "é"])
@@ -493,7 +482,7 @@ def test_f5_guarded_option_values_round_trip(tmux_server: TmuxServer, value: str
     assert tmux_server.raw("show-options", "-g", "-q", "-v", "@termctl_name").stdout == ""
 
 
-@pytest.mark.parametrize("name", NAME_PARAMS)
+@pytest.mark.parametrize("name", NAMES)
 def test_f5_guarded_rename_round_trips(tmux_server: TmuxServer, name: str) -> None:
     pane_id = tmux_server.start()
     window_id = _display(tmux_server, pane_id, "#{window_id}")
@@ -501,7 +490,7 @@ def test_f5_guarded_rename_round_trips(tmux_server: TmuxServer, name: str) -> No
     rename = command("rename-window").target(tb.window(window_id)).name(name).build()
     guarded = tb.guarded(tb.pane(pane_id), tb.owned_single_pane_window(ID), rename)
     assert _guard(tmux_server, guarded) is GuardOutcome.MATCHED
-    assert _display(tmux_server, pane_id, "#{window_name}") == _as_window_name(name)
+    assert _display(tmux_server, pane_id, "#{window_name}") == tmux_stored_name(name)
 
 
 @pytest.mark.parametrize("value", LITERALS)

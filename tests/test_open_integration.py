@@ -119,6 +119,10 @@ def test_c2_a_new_session_on_a_running_server_survives_destroy_unattached(
     tmux_server: TmuxServer,
 ) -> None:
     tmux_server.start()
+    # Exempt the fixture's own detached session first: tmux 3.2 applies a changed global
+    # destroy-unattached to existing sessions at once (3.5a waits for the next detach), which
+    # would end base and, with it, the server.
+    tmux_server.raw("set", "-t", "=base:", "destroy-unattached", "off")
     tmux_server.raw("set", "-g", "destroy-unattached", "on")
     created = create(tmux_server)
     assert not wait_for(lambda: tmux_server.raw("has-session", "-t", "=work:").returncode != 0, 0.5)
