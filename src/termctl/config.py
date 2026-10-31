@@ -25,6 +25,7 @@ from pydantic import (
     BeforeValidator,
     ConfigDict,
     Field,
+    PrivateAttr,
     TypeAdapter,
     ValidationError,
     field_validator,
@@ -205,6 +206,15 @@ class Config(_Model):
     rules: list[Rule]
     hooks: Hooks
 
+    # The fields of placements.default that the config files set (empty for the built-in
+    # config). Merging over DEFAULTS hides where a field came from; `placements` reports it.
+    _configured_default_fields: frozenset[str] = PrivateAttr(default=frozenset())
+
+    @property
+    def configured_default_fields(self) -> frozenset[str]:
+        """The fields of the ``default`` placement that config files set."""
+        return self._configured_default_fields
+
 
 def defaults() -> Config:
     """The built-in config."""
@@ -222,20 +232,33 @@ def config_path(environ: Mapping[str, str], explicit: str | None) -> Path:
     entry's home, which must be absolute)."""
     if explicit is not None:
         return Path(explicit)
-    xdg = environ.get("XDG_CONFIG_HOME", "")
-    if xdg and os.path.isabs(xdg):
-        base = Path(xdg)
-    else:
-        home = environ.get("HOME", "")
-        if not os.path.isabs(home):
-            try:
-                home = pwd.getpwuid(os.getuid()).pw_dir
-            except KeyError:
-                raise ConfigError(_HOME_UNKNOWN) from None
-            if not os.path.isabs(home):
-                raise ConfigError(_HOME_UNKNOWN)
-        base = Path(home) / ".config"
+    base = xdg_base(environ, "XDG_CONFIG_HOME", ".config")
+    if base is None:
+        raise ConfigError(_HOME_UNKNOWN)
     return base / "termctl" / "config.yaml"
+
+
+def home_dir(environ: Mapping[str, str]) -> Path | None:
+    """An absolute ``HOME``, else the passwd entry's home if it is absolute, else None."""
+    home = environ.get("HOME", "")
+    if not os.path.isabs(home):
+        try:
+            home = pwd.getpwuid(os.getuid()).pw_dir
+        except KeyError:
+            return None
+        if not os.path.isabs(home):
+            return None
+    return Path(home)
+
+
+def xdg_base(environ: Mapping[str, str], variable: str, fallback: str) -> Path | None:
+    """``$variable`` when it is set and absolute (XDG base directory spec), else
+    ``<home>/<fallback>``; None when the home directory cannot be determined."""
+    value = environ.get(variable, "")
+    if value and os.path.isabs(value):
+        return Path(value)
+    home = home_dir(environ)
+    return None if home is None else home / fallback
 
 
 def merge(base: Mapping[Any, Any], over: Mapping[Any, Any], path: tuple[Any, ...] = ()) -> Any:
@@ -624,14 +647,28 @@ def _check_rules(cfg: Config) -> None:
             raise _key_error(f"rules[{index}].placement", f"undefined placement {rule.placement!r}")
 
 
+def _configured_default_fields(files: Mapping[str, Any]) -> frozenset[str]:
+    """The keys of ``placements.default`` in the merged files (before ``DEFAULTS``)."""
+    placements = files.get("placements")
+    default = placements.get("default") if isinstance(placements, dict) else None
+    return frozenset(default) if isinstance(default, dict) else frozenset()  # pyright: ignore[reportUnknownArgumentType]
+
+
 def load(environ: Mapping[str, str], explicit: str | None = None) -> Config:
     """Load the effective config: built-in defaults, the main file, the drop-ins in code point
     order, then ``TERMCTL_<KEY>`` scalars. Raises ``ConfigError`` naming the key, variable or
     file. A missing main file is an error only when given with ``--config``."""
     main = config_path(environ, explicit)
-    data = merge(copy.deepcopy(DEFAULTS), _read(main, optional=explicit is None))
+    files = _read(main, optional=explicit is None)
+    data = merge(copy.deepcopy(DEFAULTS), files)
     for path in _dropins(main):
-        data = merge(data, _read(path))
+        dropin = _read(path)
+        data = merge(data, dropin)
+        files = merge(files, dropin)
+    if isinstance(data.get("placements"), dict):
+        # A scalar replaced by a later map (in a file, or for placements.default) dropped the
+        # built-in placements, or the built-in default's fields: merge them back beneath.
+        data["placements"] = merge(copy.deepcopy(DEFAULTS["placements"]), data["placements"])
 
     _check_unicode(data)
     _check_pre_hooks(data)
@@ -641,4 +678,5 @@ def load(environ: Mapping[str, str], explicit: str | None = None) -> Config:
         raise _key_error(*_first_error(exc)) from None
     cfg = cfg.model_copy(update=_from_environment(environ))
     _check_rules(cfg)
+    cfg._configured_default_fields = _configured_default_fields(files)  # pyright: ignore[reportPrivateUsage]
     return cfg

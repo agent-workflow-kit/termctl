@@ -14,13 +14,14 @@ from collections.abc import Mapping, Sequence
 from dataclasses import dataclass, field
 from typing import Any, NoReturn, TextIO
 
-from . import __version__, ids, tmux_socket, validate
+from . import __version__, ids, placement, tmux_bin, tmux_socket, validate
 from . import config as config_module
 from .argv import Scan, scan
 from .config import Config
 from .errors import TermctlError, UsageError
 from .gateway import Clock, Gateway, SystemClock, SystemGateway
 from .output import PROG, Output, Result, flush_standard_streams
+from .tmux_bin import TmuxBinary
 
 __all__ = ["Context", "Output", "Result", "main", "parse_args"]
 
@@ -37,6 +38,12 @@ class Context:
     # Set by step 2 (the resolved server) and step 3 (False when there is no server).
     server: tmux_socket.Server | None = None
     socket_present: bool | None = None
+    # `open`'s resolved placement (Open order step 2); None for other commands.
+    selection: placement.Selection | None = None
+    # `tmux_bin` resolved to an absolute path, once: by `open`'s resolve step or the tmux checks.
+    tmux_path: str | None = None
+    # The resolved tmux binary and version, set by the tmux checks (step 3) after `tmux -V`.
+    tmux: TmuxBinary | None = None
 
 
 # --- argument parsing ---------------------------------------------------------------------------
@@ -370,7 +377,7 @@ def check_args(args: argparse.Namespace, ctx: Context) -> None:
         validate.check_decision_ids(args.decision_ids)
     if hasattr(args, "labels"):
         labels = validate.parse_labels(args.labels)
-        if command == "open":
+        if command in ("open", "placements"):
             validate.check_label_count(labels)
 
     if command == "open":
@@ -408,9 +415,32 @@ def resolve_server(args: argparse.Namespace, ctx: Context) -> None:
     ctx.server = tmux_socket.resolve(args.socket, ctx.config.socket, ctx.environ, ctx.gateway)
 
 
+def resolve_placement(args: argparse.Namespace, ctx: Context) -> None:
+    """Step 2 of ``open``: resolve the placement, without side effects (exit 2, ``usage`` for
+    an undefined ``--placement``, ``not_supported``)."""
+    ctx.selection = placement.select(
+        ctx.config,
+        validate.parse_labels(args.labels),
+        placement=args.placement,
+        session=args.session,
+        target=args.target,
+    )
+
+
 def check_tmux(args: argparse.Namespace, ctx: Context) -> None:
     """Step 3: tmux binary, version and socket safety checks (exit 12)."""
-    # TODO(#10): the tmux binary and version checks, before the socket checks.
+    if ctx.tmux is None:
+        if ctx.tmux_path is None:
+            ctx.tmux_path = tmux_bin.resolve(ctx.config.tmux_bin, ctx.environ, ctx.gateway)
+        # TODO(#5): a version warning also gets a `warning` log record in logged commands.
+        ctx.tmux = tmux_bin.probe(
+            ctx.config.tmux_bin,
+            ctx.environ,
+            ctx.gateway,
+            ctx.out.warn,
+            ctx.out.trace,
+            path=ctx.tmux_path,
+        )
     assert ctx.server is not None
     ctx.socket_present = tmux_socket.check(ctx.server, ctx.gateway)
     # TODO(#14): open re-checks the socket right before connecting, creates the default
@@ -437,7 +467,12 @@ def resolve_id(args: argparse.Namespace, ctx: Context) -> None:
 
 def run_command(args: argparse.Namespace, ctx: Context) -> Result:
     """Step 5: the command's own steps."""
-    # TODO: each command lands in its own issue (#7, #12-#24).
+    if args.command == "placements":
+        labels = validate.parse_labels(args.labels) if args.labels else None
+        return placement.report(ctx.config, labels)
+    # TODO: each command lands in its own issue (#12-#24). `open` gets its resolved placement
+    # in ctx.selection: TODO(#14) the session, TODO(#15) the window, TODO(#18) --dry-run's
+    # placement, matched_rule, session and target.
     raise TermctlError("internal", f"{PROG} {args.command} is not implemented yet")
 
 
@@ -447,7 +482,11 @@ def dispatch(args: argparse.Namespace, ctx: Context) -> Result:
     check_args(args, ctx)
     load_config(args, ctx)
     if spec.uses_tmux:
+        # Open order step 2: the server, then tmux_bin (#10), then the placement.
         resolve_server(args, ctx)
+        # TODO(#10): resolve tmux_bin here (Open order step 2), before resolve_placement
+        if args.command == "open":
+            resolve_placement(args, ctx)
         check_tmux(args, ctx)
         if spec.takes_id:
             resolve_id(args, ctx)
@@ -517,6 +556,9 @@ def _run(
     try:
         result = dispatch(args, ctx)
     except TermctlError as err:
+        if isinstance(err, UsageError) and err.usage is None:
+            # A usage error found after parsing concerns the subcommand that was parsed.
+            err.usage = scanned.parser.format_usage()
         out.error(err)
         return err.exit_code
     except Exception as exc:

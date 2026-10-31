@@ -1,6 +1,6 @@
 [project]
 name = "termctl"
-version = "0.0.1"
+version = "0.8.0"
 description = "Terminal placement with a tmux backend"
 readme = "README.md"
 requires-python = ">=3.12"
@@ -43,7 +43,10 @@ pythonVersion = "3.12"
 
 [tool.pytest.ini_options]
 testpaths = ["tests"]
-markers = ["live: needs real models/hosts/credentials; never run in CI"]
+markers = [
+    "live: needs real models/hosts/credentials; never run in CI",
+    "tmux: runs real tmux on a private socket; skipped without tmux, failed if TERMCTL_REQUIRE_TMUX",
+]
 addopts = "-m 'not live'"
 
 [tool.semantic_release]

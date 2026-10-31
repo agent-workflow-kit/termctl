@@ -1,0 +1,1 @@
+{"error": {"code": "not_supported", "message": "placement 'panes' uses target: pane, max_panes, which this version does not support (only target: window)", "details": {"placement": "panes", "fields": ["target", "max_panes"]}}}

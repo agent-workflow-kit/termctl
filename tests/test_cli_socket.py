@@ -13,7 +13,7 @@ import pytest
 from termctl import cli
 from termctl.cli import Context, Result, main
 
-from .fakes import UID, FakeClock, FakeGateway, directory, safe_default_server, socket_file
+from .fakes import TMUX, UID, FakeClock, FakeGateway, directory, safe_default_server, socket_file
 from .schemas import validate
 
 GOLDEN = Path(__file__).parent / "golden"
@@ -42,7 +42,7 @@ def run(
         ["--json", *argv],
         gateway=gateway,
         clock=FakeClock(),
-        environ={**NO_CONFIG, **(environ or {})},
+        environ={**NO_CONFIG, "PATH": "/usr/bin", **(environ or {})},  # PATH: where tmux is
         stdout=stdout,
         stderr=stderr,
     )
@@ -62,7 +62,8 @@ def test_unsafe_ancestor_exits_12_and_never_runs_tmux(argv: list[str]) -> None:
     validate(envelope, "termctl/cli/error.json")
     assert code == 12
     assert envelope["error"]["code"] == "server_unavailable"
-    assert gateway.calls == []
+    # Only the version probe ran; the socket checks come after it and stop before any connection.
+    assert gateway.calls == [[TMUX, "-V"]]
 
 
 def test_server_unavailable_golden() -> None:
@@ -96,7 +97,7 @@ def test_missing_default_directory_is_no_server_and_creates_nothing() -> None:
     gateway = FakeGateway(files={"/": directory(), "/tmp": directory(0o1777)})
     code, envelope, _ = run(["show", ID], gateway)
     assert (code, envelope["error"]["code"]) == (10, "no_server")
-    assert gateway.calls == []
+    assert gateway.calls == [[TMUX, "-V"]]
 
 
 @pytest.fixture
