@@ -11,6 +11,7 @@ image ships tmux (ubuntu-26.04 ships 3.6a) and skip otherwise.
 
 from __future__ import annotations
 
+import atexit
 import os
 import pwd
 import re
@@ -41,6 +42,13 @@ def tmux_version(tmux_bin: str | None = TMUX_BIN) -> tuple[int, int] | None:
 
 
 TMUX_VERSION = tmux_version()
+# tmux 3.3 to 3.5 escape control characters and bad UTF-8 in printed output; 3.6 prints them raw.
+TMUX_PRINTS_RAW = TMUX_VERSION is not None and TMUX_VERSION >= (3, 6)
+
+# An empty config home for the CLI tests that start tmux. It is outside the checkout: the tmux
+# home guard refuses a config home under a real home, as the checkout is on CI runners.
+NO_CONFIG = tempfile.mkdtemp(prefix="tc-no-config-")
+atexit.register(shutil.rmtree, NO_CONFIG, ignore_errors=True)
 
 
 # --- the guard against tmux reading the real user's config (review round 1, R1-11) -------------

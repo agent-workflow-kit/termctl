@@ -21,12 +21,11 @@ import pytest
 
 from termctl.cli import main
 
-from .conftest import TmuxServer, wait_for
+from .conftest import NO_CONFIG, TmuxServer, wait_for
 from .schemas import validate
 
 pytestmark = pytest.mark.tmux
 
-NO_CONFIG = str(Path(__file__).parent / "no-config")
 PROC = Path("/proc/self/environ").exists()
 needs_proc = pytest.mark.skipif(not PROC, reason="reads /proc/<pid>/environ")
 SESSION = "termctl"

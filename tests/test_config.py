@@ -1080,6 +1080,15 @@ def test_hook_keys_index_the_merged_list(home: Path, main_file: Path, dropins: P
     assert err.details == {"key": "hooks.pre-open[1].async"}
 
 
+@pytest.mark.parametrize("hook", ["pre-open", "post-close"])
+def test_a_nul_in_a_hook_cmd_is_rejected(home: Path, main_file: Path, hook: str) -> None:
+    # YAML's "\0" escape: a command line cannot hold a NUL, so the hook could never start.
+    write(main_file, f'hooks:\n  {hook}: [{{cmd: ok}}, {{cmd: "a\\0b"}}]\n')
+    err = load_error({"HOME": str(home)})
+    assert err.details == {"key": f"hooks.{hook}[1].cmd"}
+    assert "NUL" in err.message
+
+
 @pytest.mark.parametrize("hook", ["post-open", "post-close"])
 def test_async_on_a_post_hook_is_allowed(home: Path, main_file: Path, hook: str) -> None:
     write(main_file, {"hooks": {hook: [{"cmd": "x", "async": True}]}})
@@ -1193,6 +1202,8 @@ VALID: list[dict[str, Any]] = [
     {"rules": [{"match": {"kind.sub-x": "A-z0.9:/#@+=,-", "e": ""}, "placement": "default"}]},
     {"hooks": {"pre-open": [{"cmd": "x", "timeout": 1}]}},
     {"hooks": {"post-open": [{"cmd": "x", "timeout": 1.0}]}},
+    {"hooks": {"pre-open": [{"cmd": "x", "timeout": 600}]}},
+    {"hooks": {"post-close": [{"cmd": "x", "timeout": 600.0}]}},
     {"placements": {"a": {"max_panes": 2.0}}},
 ]
 
@@ -1243,6 +1254,8 @@ INVALID: list[tuple[dict[str, Any], str]] = [
     ({"hooks": {"pre-open": [{"cmd": ""}]}}, "hooks.pre-open[0].cmd"),
     ({"hooks": {"post-open": [{"cmd": "x", "timeout": 0}]}}, "hooks.post-open[0].timeout"),
     ({"hooks": {"pre-open": [{"cmd": "x", "timeout": 1.5}]}}, "hooks.pre-open[0].timeout"),
+    ({"hooks": {"pre-open": [{"cmd": "x", "timeout": 601}]}}, "hooks.pre-open[0].timeout"),
+    ({"hooks": {"post-open": [{"cmd": "x", "timeout": 10**30}]}}, "hooks.post-open[0].timeout"),
     ({"hooks": {"post-open": [{"cmd": "x", "async": "true"}]}}, "hooks.post-open[0].async"),
     ({"hooks": {"post-close": [{"cmd": "x", "env": {}}]}}, "hooks.post-close[0].env"),
     ({"hooks": {"post-open": [{"cmd": "x", "async_": True}]}}, "hooks.post-open[0].async_"),

@@ -245,6 +245,63 @@
           }
         }
       }
+    },
+    {
+      "if": {
+        "properties": {
+          "event": {
+            "const": "hook_failed"
+          }
+        },
+        "required": [
+          "event"
+        ]
+      },
+      "then": {
+        "required": [
+          "details"
+        ],
+        "properties": {
+          "details": {
+            "type": "object",
+            "properties": {
+              "hook": {
+                "enum": [
+                  "pre-open",
+                  "post-open",
+                  "pre-close",
+                  "post-close"
+                ]
+              },
+              "cmd": {
+                "type": "string",
+                "minLength": 1
+              },
+              "problem": {
+                "type": "string",
+                "description": "termctl's own text; never holds hook output."
+              },
+              "pgid": {
+                "type": "integer",
+                "minimum": 1,
+                "description": "The process group termctl created for the hook (for an async hook, its watchdog's); absent if it could not be started."
+              },
+              "hook_stderr": {
+                "type": "string",
+                "maxLength": 4096,
+                "x-untrusted": true,
+                "description": "Untrusted: the hook's stderr, cut to 4096 bytes at a UTF-8 boundary; absent when empty."
+              }
+            },
+            "additionalProperties": false,
+            "required": [
+              "hook",
+              "cmd",
+              "problem"
+            ]
+          }
+        }
+      }
     }
   ]
 }
