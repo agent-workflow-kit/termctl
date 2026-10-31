@@ -277,10 +277,12 @@ def test_the_limit_is_checked_against_the_labels_read_under_the_lock(state: Path
 
 
 def test_label_remove_never_hits_the_limit(state: Path) -> None:
+    # Any number of pairs: 41 distinct pairs, one of them present, leave 31 labels.
     gateway = labelled(" ".join(labels_of(32)), " ".join(labels_of(32)[1:]))
-    result = run(["--json", "label", "remove", ID, "k00=v", *labels_of(40)[32:]], gateway, state)
+    pairs = ["k00=v", *(f"x{index:02d}=v" for index in range(40))]
+    result = run(["--json", "label", "remove", ID, *pairs], gateway, state)
     assert result.code == 0, result.stderr
-    assert len(result.json()["labels"]) == 31
+    assert result.json()["labels"] == labels_of(32)[1:]
 
 
 def test_human_mode_limit_error_names_the_pane(state: Path) -> None:
@@ -288,6 +290,7 @@ def test_human_mode_limit_error_names_the_pane(state: Path) -> None:
     result = run(["label", "add", ID, "new=1"], gateway, state)
     assert (result.code, result.stdout) == (2, "")
     assert ID in result.stderr and "33" in result.stderr
+    assert "usage: termctl label add" in result.stderr
 
 
 # --- arguments ----------------------------------------------------------------------------------
