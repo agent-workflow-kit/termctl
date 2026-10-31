@@ -10,18 +10,24 @@ per-host token, compared only for equality.
 Every read goes through the gateway. ``read`` returns None when the process does not exist,
 and raises ``ProcessError`` when it cannot tell (an unreadable or malformed answer).
 
-TODO(#23): the ``close --force`` signal sequence (``pidfd_open`` on Linux, design.md
-"Implementation notes").
+``close --force`` (interface.md ``close`` steps 3 and 5) proves a recorded PID is the pane's
+process with ``verify`` before it signals, and signals it with ``signal_sequence``: through a
+pidfd on Linux, so a PID reused after the handle was opened is never signaled, and with the
+start time checked before every signal (design.md "Implementation notes"). Only that one
+process is ever signaled, never a process group.
 """
 
 from __future__ import annotations
 
+import enum
 import re
+import signal
 import subprocess
-from dataclasses import dataclass
+from collections.abc import Callable
+from dataclasses import dataclass, field
 from datetime import UTC, datetime
 
-from .gateway import Gateway
+from .gateway import Clock, Gateway, ProcessHandle
 
 PS = "/bin/ps"
 PS_TIMEOUT = 10.0
@@ -108,3 +114,177 @@ def _read_ps(gateway: Gateway, pid: int) -> Process | None:
     if not _START.fullmatch(start):  # before the epoch: outside the @termctl_pid_start grammar
         raise ProcessError(f"unexpected start time from {PS} for process {pid}")
     return Process(ppid=int(ppid), start=start, zombie=stat.startswith("Z"))
+
+
+# --- close --force: proving the process and signaling it ---------------------------------------
+
+
+class Identity(enum.Enum):
+    """What ``verify`` found for a recorded PID."""
+
+    # The live process with the recorded start time, whose parent is the server.
+    VERIFIED = "verified"
+    # No such process, or a zombie: it has exited, so there is nothing to signal.
+    GONE = "gone"
+    # Not the pane's process: another start time, another parent, or a server outside
+    # termctl's PID namespace. Never signaled.
+    MISMATCH = "mismatch"
+    # The check could not be made; never signaled. ``problem`` says why.
+    UNCHECKABLE = "uncheckable"
+
+
+@dataclass(frozen=True)
+class Verification:
+    identity: Identity
+    problem: str | None = None
+
+
+def verify(
+    gateway: Gateway, socket_path: str, pid: int, start: str, server_pid: int
+) -> Verification:
+    """Prove that ``pid`` is the recorded pane process before ``close --force`` signals it:
+    the checks of interface.md "Open order" step 7, repeated in termctl's own namespace.
+
+    On Linux the server socket's ``SO_PEERCRED`` PID must be ``server_pid`` (tmux's
+    ``#{pid}``): tmux reports PIDs in the server's PID namespace and ``/proc`` is read in
+    termctl's. Then the process must exist, not be a zombie, have the recorded ``start`` time
+    and have the server as its parent. A check that cannot be made is ``UNCHECKABLE``.
+    """
+    if gateway.platform() != "darwin":
+        try:
+            peer = gateway.socket_peer_pid(socket_path)
+        except OSError as err:
+            return Verification(
+                Identity.UNCHECKABLE, f"cannot check the server: {err.strerror or err}"
+            )
+        if peer != server_pid:
+            return Verification(Identity.MISMATCH)
+    try:
+        process = read(gateway, pid)
+    except ProcessError as err:
+        return Verification(Identity.UNCHECKABLE, str(err))
+    if process is None or process.zombie:
+        return Verification(Identity.GONE)
+    if process.start != start or process.ppid != server_pid:
+        return Verification(Identity.MISMATCH)
+    return Verification(Identity.VERIFIED)
+
+
+# interface.md `close` step 5: SIGTERM after the grace period, SIGKILL 5 s later, then up to
+# 1 s for the process to exit (spike F3).
+TERM_WAIT_S = 5.0
+KILL_WAIT_S = 1.0
+# How often the waits look at the process.
+POLL_S = 0.05
+
+
+class _State(enum.Enum):
+    ALIVE = "alive"
+    EXITED = "exited"
+    # Alive with another start time: not the recorded process.
+    MISMATCH = "mismatch"
+    # It cannot be read: stop signaling.
+    UNKNOWN = "unknown"
+
+
+@dataclass
+class SignalOutcome:
+    """The ``close`` output fields of a signal sequence: ``signals_sent`` (``SIGTERM``, then
+    ``SIGKILL``), ``exited`` (None with ``pid_mismatch``) and warnings to print."""
+
+    signals_sent: list[str] = field(default_factory=list[str])
+    exited: bool | None = True
+    pid_mismatch: bool = False
+    warnings: list[str] = field(default_factory=list[str])
+
+
+def signal_sequence(
+    gateway: Gateway,
+    clock: Clock,
+    handle: ProcessHandle,
+    pid: int,
+    start: str,
+    grace_s: float,
+) -> SignalOutcome:
+    """interface.md `close` step 5, after the kernel's SIGHUP (the pane was killed, or was
+    found gone): wait up to ``grace_s`` for the process to exit, send SIGTERM, wait 5 seconds,
+    send SIGKILL, wait up to 1 second, stopping as soon as it has exited.
+
+    ``handle`` was opened on ``pid`` before its identity was proven (``verify``), so it names
+    the recorded process. Before each signal the process must still have the recorded
+    ``start`` time; another start time before the first signal is ``pid_mismatch`` (nothing
+    is sent), and after a signal means the recorded process has exited and its PID was
+    reused. A process that cannot be read stops the sequence with a warning; it is reported
+    as exited only if the handle says so. A process that survives SIGKILL is ``exited:
+    False``.
+    """
+    outcome = SignalOutcome()
+
+    def state() -> _State:
+        if handle.exited():
+            return _State.EXITED
+        try:
+            process = read(gateway, pid)
+        except ProcessError as err:
+            outcome.warnings.append(f"cannot check process {pid}: {err}; not signaling it")
+            return _State.UNKNOWN
+        if process is None or process.zombie:
+            return _State.EXITED
+        if process.start != start:
+            return _State.MISMATCH
+        return _State.ALIVE
+
+    def wait(seconds: float) -> _State:
+        deadline = clock.monotonic() + seconds
+        while True:
+            current = state()
+            if current is not _State.ALIVE:
+                return current
+            remaining = deadline - clock.monotonic()
+            if remaining <= 0:
+                return current
+            clock.sleep(min(POLL_S, remaining))
+
+    for seconds, signum in (
+        (grace_s, signal.SIGTERM),
+        (TERM_WAIT_S, signal.SIGKILL),
+        (KILL_WAIT_S, None),
+    ):
+        current = wait(seconds)
+        if current is _State.MISMATCH and not outcome.signals_sent:
+            outcome.pid_mismatch, outcome.exited = True, None
+            return outcome
+        if current in (_State.EXITED, _State.MISMATCH):
+            return outcome  # exited (a reused PID means the recorded process is gone)
+        if current is _State.UNKNOWN:
+            outcome.exited = handle.exited()
+            return outcome
+        if signum is None:
+            outcome.exited = False
+            return outcome
+        if not _send(handle, signum, pid, outcome.warnings.append):
+            outcome.exited = handle.exited() or _gone(gateway, pid)
+            return outcome
+        outcome.signals_sent.append(signum.name)
+    raise AssertionError("unreachable")  # pragma: no cover
+
+
+def _send(
+    handle: ProcessHandle, signum: signal.Signals, pid: int, warn: Callable[[str], None]
+) -> bool:
+    """Send ``signum``; whether it was sent. A process gone meanwhile is not a failure the
+    caller reports; any other is a warning."""
+    try:
+        if handle.send_signal(signum):
+            return True
+    except OSError as err:
+        warn(f"cannot send {signum.name} to process {pid}: {err.strerror or err}")
+    return False
+
+
+def _gone(gateway: Gateway, pid: int) -> bool:
+    try:
+        process = read(gateway, pid)
+    except ProcessError:
+        return False
+    return process is None or process.zombie

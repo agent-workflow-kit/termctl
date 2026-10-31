@@ -7,7 +7,10 @@ run with an argv list; the gateway never adds a shell (a hook's ``sh -c`` is in 
 
 from __future__ import annotations
 
+import ctypes
+import errno
 import os
+import platform
 import pwd
 import select
 import selectors
@@ -104,6 +107,26 @@ class GroupRun(NamedTuple):
     @property
     def timed_out(self) -> bool:
         return self.returncode is None
+
+
+class ProcessHandle(Protocol):
+    """A handle on one process, from ``Gateway.open_process``: on Linux a pidfd, which keeps
+    naming that process even if it exits and its PID is reused; on macOS only the PID, so the
+    caller checks the start time immediately before each signal (``procs.signal_sequence``)."""
+
+    def exited(self) -> bool:
+        """Whether the process is known to have exited (a zombie included). False when the
+        handle cannot tell (macOS); the caller also reads the process."""
+        ...
+
+    def send_signal(self, signum: int) -> bool:
+        """Send ``signum`` to the process and nothing else, never a group; False when it is
+        gone (``ESRCH``). Raises ``OSError`` for any other failure (``EPERM``)."""
+        ...
+
+    def close(self) -> None:
+        """Release the handle; idempotent."""
+        ...
 
 
 class Gateway(Protocol):
@@ -230,6 +253,12 @@ class Gateway(Protocol):
         listener is not visible there). Sends nothing. Raises ``OSError`` if it cannot."""
         ...
 
+    def open_process(self, pid: int) -> ProcessHandle | None:
+        """A handle on process ``pid`` (``close --force``), or None when no such process
+        exists. Linux: ``pidfd_open``; raises ``OSError`` when the kernel or Python has no
+        pidfd (the caller then sends no signal). macOS: a handle on the PID alone."""
+        ...
+
 
 class Clock(Protocol):
     def now(self) -> datetime:
@@ -238,6 +267,10 @@ class Clock(Protocol):
 
     def monotonic(self) -> float:
         """Seconds on a clock that never goes backwards, for timeouts and durations."""
+        ...
+
+    def sleep(self, seconds: float) -> None:
+        """Wait ``seconds`` (the waits of ``close --force``)."""
         ...
 
 
@@ -398,6 +431,114 @@ class SystemGateway:
             creds = sock.getsockopt(socket.SOL_SOCKET, socket.SO_PEERCRED, struct.calcsize("3i"))
         pid, _uid, _gid = struct.unpack("3i", creds)
         return pid
+
+    def open_process(self, pid: int) -> ProcessHandle | None:
+        if sys.platform == "darwin":  # pragma: no cover - macOS only
+            return _PidHandle(pid)
+        try:
+            fd = _pidfd_open(pid)
+        except ProcessLookupError:
+            return None
+        return _PidfdHandle(fd)
+
+
+# The Linux system call numbers of pidfd_send_signal (5.1) and pidfd_open (5.3): the same on
+# every architecture, which share one numbering for calls added since 5.1 (alpha excepted).
+_SYS_PIDFD_SEND_SIGNAL = 424
+_SYS_PIDFD_OPEN = 434
+
+
+def _syscall(number: int, *args: ctypes.c_int | ctypes.c_uint | None) -> int:
+    """A raw Linux system call through libc's ``syscall``, for Python builds whose ``os`` lacks
+    the pidfd functions (some standalone builds); raises ``OSError`` with its errno."""
+    if platform.machine().startswith("alpha"):  # pragma: no cover - other numbering
+        raise OSError(errno.ENOSYS, "pidfd system calls are not known on this architecture")
+    libc = ctypes.CDLL(None, use_errno=True)
+    result = libc.syscall(ctypes.c_long(number), *args)
+    if result < 0:
+        code = ctypes.get_errno()
+        raise OSError(code, os.strerror(code))
+    return int(result)
+
+
+def _pidfd_open(pid: int) -> int:
+    """``pidfd_open(pid, 0)``; ``ProcessLookupError`` when no such process exists, another
+    ``OSError`` (``ENOSYS`` before Linux 5.3) when no handle can be opened."""
+    if hasattr(os, "pidfd_open"):
+        return os.pidfd_open(pid)
+    try:
+        fd = _syscall(_SYS_PIDFD_OPEN, ctypes.c_int(pid), ctypes.c_uint(0))
+    except OSError as err:
+        if err.errno == errno.ESRCH:
+            raise ProcessLookupError(err.errno, err.strerror) from None
+        raise
+    os.set_inheritable(fd, False)  # pidfd_open sets O_CLOEXEC itself; made sure here
+    return fd
+
+
+def _pidfd_send_signal(fd: int, signum: int) -> None:
+    """``pidfd_send_signal(fd, signum, NULL, 0)``; ``ProcessLookupError`` when its process
+    has exited."""
+    if hasattr(signal, "pidfd_send_signal"):
+        signal.pidfd_send_signal(fd, signum)
+        return
+    try:
+        _syscall(
+            _SYS_PIDFD_SEND_SIGNAL, ctypes.c_int(fd), ctypes.c_int(signum), None, ctypes.c_uint(0)
+        )
+    except OSError as err:
+        if err.errno == errno.ESRCH:
+            raise ProcessLookupError(err.errno, err.strerror) from None
+        raise
+
+
+class _PidfdHandle:
+    """A Linux pidfd: signals reach the process it was opened on, or nobody (``ESRCH``)."""
+
+    def __init__(self, fd: int) -> None:
+        self._fd: int | None = fd
+
+    def exited(self) -> bool:
+        if self._fd is None:
+            raise ValueError("the process handle is closed")
+        # A pidfd polls readable once its process has exited (a zombie included).
+        poller = select.poll()
+        poller.register(self._fd, select.POLLIN)
+        return bool(poller.poll(0))
+
+    def send_signal(self, signum: int) -> bool:
+        if self._fd is None:
+            raise ValueError("the process handle is closed")
+        try:
+            _pidfd_send_signal(self._fd, signum)
+        except ProcessLookupError:
+            return False
+        return True
+
+    def close(self) -> None:
+        if self._fd is not None:
+            fd, self._fd = self._fd, None
+            os.close(fd)
+
+
+class _PidHandle:  # pragma: no cover - macOS only
+    """macOS: the PID alone. The caller checks the start time just before each signal."""
+
+    def __init__(self, pid: int) -> None:
+        self._pid = pid
+
+    def exited(self) -> bool:
+        return False
+
+    def send_signal(self, signum: int) -> bool:
+        try:
+            os.kill(self._pid, signum)
+        except ProcessLookupError:
+            return False
+        return True
+
+    def close(self) -> None:
+        pass
 
 
 def _kill(proc: subprocess.Popen[bytes]) -> None:
@@ -712,3 +853,6 @@ class SystemClock:
 
     def monotonic(self) -> float:
         return time.monotonic()
+
+    def sleep(self, seconds: float) -> None:
+        time.sleep(max(seconds, 0.0))

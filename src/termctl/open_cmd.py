@@ -384,7 +384,7 @@ def record(
     if gateway.platform() != "darwin":
         # #{pid} and #{pane_pid} are in the server's PID namespace, /proc in termctl's: the
         # server's PID as the kernel shows it to termctl must be #{pid} (macOS has no PID
-        # namespaces). TODO(#23): close --force repeats this check before signaling.
+        # namespaces). close --force repeats this check before signaling (procs.verify).
         try:
             peer = gateway.socket_peer_pid(socket_path)
         except OSError as err:

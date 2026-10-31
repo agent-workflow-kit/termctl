@@ -17,6 +17,7 @@ from typing import Any, NoReturn, TextIO
 
 from . import (
     __version__,
+    close_cmd,
     hooks,
     ids,
     jsonlog,
@@ -74,10 +75,18 @@ class Context:
     logged: bool = False
     # The actor, resolved once per run (``resolve_actor``).
     actor: str | None = None
-    # ``open``: the --decision-id values, then the ids its pre-open hooks returned (step 4),
-    # and every hook it started (interface.md "Hooks").
+    # ``open`` and ``close``: the --decision-id values, then the ids their pre-hooks
+    # returned, and every hook they started (interface.md "Hooks").
     decision_ids: list[str] = field(default_factory=list[str])
     hook_processes: list[hooks.HookProcess] = field(default_factory=list[hooks.HookProcess])
+    # ``close``: whether step 1 or step 3 saw the pane running (a forced run is then audited).
+    close_saw_running: bool = False
+
+    def log_id(self) -> str | None:
+        """The id a log record names: ``open``'s generated id, or the resolved pane's."""
+        if self.open_id is not None:
+            return self.open_id
+        return None if self.pane is None else self.pane.id
 
     def socket_path(self) -> str | None:
         """The resolved server's socket path; None before step 2 resolved it."""
@@ -93,7 +102,7 @@ class Context:
                     self.clock.now(),
                     event="warning",
                     result="warning",
-                    id=self.open_id,
+                    id=self.log_id(),
                     socket_path=self.socket_path(),
                     message=message,
                 )
@@ -428,9 +437,8 @@ def check_args(args: argparse.Namespace, ctx: Context) -> None:
     Replaces ``open``'s ``args.cwd`` with the resolved working directory and, for ``open``
     and ``close``, sets ``args.flag_hooks`` to the parsed ``--hook`` values. Checks that need
     config (a marker or placement being defined) or the pane list (the label limit of
-    ``label add``) belong to later steps. Some step-1 checks are not here yet (see the TODO).
+    ``label add``) belong to later steps.
     """
-    # TODO(#23): remaining step-1 usage check: the `close --force` gate.
     if args.socket is not None:
         validate.check_socket_flag(args.socket)
     command = args.command
@@ -447,6 +455,10 @@ def check_args(args: argparse.Namespace, ctx: Context) -> None:
         args.flag_hooks = hooks.parse_flag_hooks(command, args.hooks)
         hooks.check_override_gate(
             args.override_escalation, actor=args.actor, stdin_is_tty=ctx.gateway.stdin_isatty()
+        )
+    if command == "close":
+        close_cmd.check_force_gate(
+            args.force, actor=args.actor, stdin_is_tty=ctx.gateway.stdin_isatty()
         )
     if hasattr(args, "labels"):
         labels = validate.parse_labels(args.labels)
@@ -781,7 +793,7 @@ def _hook_warnings(ctx: Context, warnings: Sequence[hooks.HookWarning]) -> None:
         ctx.out.warn(warning.message)
         if warning.hook_stderr and not (ctx.out.json or ctx.out.quiet):
             ctx.out.hook_stderr(warning.hook_stderr)
-        ctx.log(warning.log_record(ctx.clock.now(), id=ctx.open_id, socket_path=ctx.socket_path()))
+        ctx.log(warning.log_record(ctx.clock.now(), id=ctx.log_id(), socket_path=ctx.socket_path()))
 
 
 def _open_record(
@@ -912,7 +924,263 @@ def _opened(ctx: Context, backend: Backend, created: Created, created_at: str) -
     return Result(data, ctx.open_id)
 
 
-COMMAND_STEPS = {"show": show, "exists": exists, "list": list_panes, "open": open_pane}
+# --- close --------------------------------------------------------------------------------------
+
+
+def close_pane(args: argparse.Namespace, ctx: Context) -> Result:
+    """The close order (interface.md `close`) after id resolution (step 4)."""
+    assert ctx.pane is not None
+    first = ctx.pane
+    socket_path = _socket_path(ctx)
+    grace = close_cmd.grace_ms(args.grace, ctx.config)
+    # Step 1: the check.
+    ctx.close_saw_running = not first.dead
+    if not first.dead and not args.force:
+        raise close_cmd.refuse_running(first)
+    if args.dry_run:
+        return _close_dry_run(args, ctx, grace)
+    started = ctx.clock.monotonic()
+    pid_mismatch = close_cmd.row_mismatch(first)
+    proof: close_cmd.Probe | None = None
+    if not first.dead and first.pid is not None and not pid_mismatch:
+        proof = close_cmd.probe(connect(ctx), ctx.gateway, socket_path, first)
+        identity = proof.verification.identity
+        if identity in (close_cmd.Identity.MISMATCH, close_cmd.Identity.UNCHECKABLE):
+            pid_mismatch = True
+            if proof.verification.problem is not None:
+                ctx.warn(f"{proof.verification.problem}; the recorded process is not signaled")
+    # Step 2: the pre-close hooks; a veto exits 11, an escalation 13.
+    run_pre_close_hooks(args, ctx, first, grace)
+    # Step 3: the re-check, with a fresh read (the hooks may have run long).
+    backend = connect(ctx)
+    reread = _reread(ctx, backend)
+    # Before the re-check can fail: a forced run that sees the pane running here is audited.
+    if any(pane.id == first.id and not pane.dead for pane in reread.panes):
+        ctx.close_saw_running = True
+    current = close_cmd.recheck(reread, first)
+    if current is not None:
+        pid_mismatch = pid_mismatch or close_cmd.recheck_mismatch(first, current)
+    closing = close_cmd.Closing(
+        first=first,
+        current=current,
+        force=bool(args.force),
+        grace_s=grace / 1000,
+        pid_mismatch=pid_mismatch,
+        proof=proof,
+    )
+    # Steps 4 and 5.
+    closed = close_cmd.close(backend, ctx.gateway, ctx.clock, socket_path, closing, ctx.warn)
+    data = {
+        "id": first.id,
+        "pane_closed": True,
+        "was_running": not first.dead,
+        "forced": bool(args.force),
+        "signals_sent": closed.signals_sent,
+        "exited": closed.exited,
+        "pid_mismatch": closed.pid_mismatch,
+        "decision_ids": list(ctx.decision_ids),
+        "duration_ms": max(0, round((ctx.clock.monotonic() - started) * 1000)),
+        "socket_path": socket_path,
+    }
+    run_post_close_hooks(args, ctx, data, first.labels)
+    ctx.log(_close_record(args, ctx, result="ok", exit_code=0))
+    _audit_close(args, ctx, data)
+    return Result(data, f"closed {first.id}")
+
+
+def _reread(ctx: Context, backend: Backend | None) -> PaneRead:
+    """A fresh read of the server's panes (no server: none); warnings not printed before are
+    printed now."""
+    if backend is None:
+        return PaneRead(server_running=False, panes=(), warnings=())
+    read = backend.read_panes()
+    seen = () if ctx.pane_read is None else ctx.pane_read.warnings
+    for warning in read.warnings:
+        if warning not in seen:
+            ctx.warn(warning)
+    return read
+
+
+def _close_dry_run(args: argparse.Namespace, ctx: Context, grace: int) -> Result:
+    """``close --dry-run``: the check of step 1 only; no hooks, no change, no records."""
+    assert ctx.pane is not None
+    pane = ctx.pane
+    socket_path = _socket_path(ctx)
+    found = close_cmd.dry_run(connect(ctx), ctx.gateway, socket_path, pane, ctx.warn)
+    data = {
+        "dry_run": True,
+        "id": pane.id,
+        "state": pane.state,
+        "forced": bool(args.force),
+        "pid": pane.pid,
+        "pid_mismatch": found.pid_mismatch,
+        "signals_possible": found.signals_possible,
+        "grace_ms": grace,
+        "socket_path": socket_path,
+        "actor": resolve_actor(args, ctx),
+        "decision_ids": list(args.decision_ids),
+        "override_escalation": bool(args.override_escalation),
+    }
+    human = (
+        f"{pane.state} pid={'none' if pane.pid is None else pane.pid}"
+        f" pid_mismatch={'true' if found.pid_mismatch else 'false'}"
+        f" signals_possible={','.join(found.signals_possible) or 'none'}"
+    )
+    return Result(data, human)
+
+
+def run_pre_close_hooks(
+    args: argparse.Namespace, ctx: Context, pane: ManagedPane, grace: int
+) -> None:
+    """Step 2: the ``pre-close`` hooks, with the pane object read at step 1; a veto exits 11
+    and an escalation 13 (not on an ``--override-escalation`` run), closing nothing."""
+    override = bool(args.override_escalation)
+    payload = hooks.pre_close_payload(
+        pane=pane.pane_object(_socket_path(ctx)),
+        force=bool(args.force),
+        grace_ms=grace,
+        actor=resolve_actor(args, ctx),
+        decision_ids=args.decision_ids,
+        override_escalation=override,
+    )
+    outcome = hooks.run_pre_hooks(
+        hooks.hooks_for(ctx.config, "pre-close", args.flag_hooks),
+        payload,
+        decision_ids=args.decision_ids,
+        override_escalation=override,
+        gateway=ctx.gateway,
+        environ=ctx.environ,
+    )
+    ctx.hook_processes.extend(outcome.processes)
+    ctx.decision_ids = list(outcome.decision_ids)
+    _hook_warnings(ctx, outcome.warnings)
+    outcome.check()
+
+
+def run_post_close_hooks(
+    args: argparse.Namespace, ctx: Context, output: dict[str, Any], labels: Sequence[str]
+) -> None:
+    """The ``post-close`` hooks, with the ``close`` output as their payload's ``result``; a
+    failure is a warning and a ``hook_failed`` record, never an error."""
+    outcome = hooks.run_post_hooks(
+        hooks.hooks_for(ctx.config, "post-close", args.flag_hooks),
+        hooks.post_close_payload(result=output, labels=labels),
+        gateway=ctx.gateway,
+        environ=ctx.environ,
+    )
+    ctx.hook_processes.extend(outcome.processes)
+    _hook_warnings(ctx, outcome.warnings)
+
+
+def _close_record(
+    args: argparse.Namespace,
+    ctx: Context,
+    *,
+    result: str,
+    exit_code: int,
+    message: str | None = None,
+    details: dict[str, Any] | None = None,
+) -> dict[str, Any]:
+    """The ``log.jsonl`` record of this ``close`` (interface.md "Audit and log")."""
+    actor = resolve_actor(args, ctx)  # first: its warning record precedes this one
+    return jsonlog.log_record(
+        ctx.clock.now(),
+        event="close",
+        result=result,
+        id=ctx.log_id(),
+        socket_path=ctx.socket_path(),
+        exit_code=exit_code,
+        message=message,
+        details=details,
+        actor=actor,
+        decision_ids=ctx.decision_ids,
+        escalation_override=bool(args.override_escalation),
+        force=bool(args.force),
+        hooks=[process.log_entry() for process in ctx.hook_processes],
+    )
+
+
+def _audit_close(args: argparse.Namespace, ctx: Context, result: Mapping[str, Any]) -> None:
+    """The audit record of a ``close --force`` in which step 1 or 3 saw a running pane, and of
+    an ``--override-escalation`` run, once the id is resolved; ``result`` is the ``--json``
+    output or the error envelope."""
+    if ctx.pane is None:
+        return
+    forced = bool(args.force) and ctx.close_saw_running
+    if not (forced or args.override_escalation):
+        return
+    assert ctx.server is not None
+    ctx.audit(
+        jsonlog.audit_close_record(
+            ctx.clock.now(),
+            actor=resolve_actor(args, ctx),
+            decision_ids=ctx.decision_ids,
+            target=ctx.pane.id,
+            force=bool(args.force),
+            escalation_override=bool(args.override_escalation),
+            socket_path=ctx.server.socket_path,
+            pid=ctx.pane.pid,
+            grace_ms=close_cmd.grace_ms(args.grace, ctx.config) if args.force else None,
+            result=result,
+        )
+    )
+
+
+def _close_failed(args: argparse.Namespace, ctx: Context, err: TermctlError) -> None:
+    """Log (and audit, where ``_audit_close`` says) a ``close`` that failed after step 1."""
+    if err.decision_ids is None and ctx.decision_ids:
+        err.decision_ids = list(ctx.decision_ids)
+    if err.code in ("vetoed", "escalated"):
+        result, details = err.code, {"hook": err.hook}
+    elif err.code == "refused":
+        result, details = "refused", err.details
+    else:
+        result, details = "error", err.details
+    ctx.log(
+        _close_record(
+            args, ctx, result=result, exit_code=err.exit_code, message=err.message, details=details
+        )
+    )
+    _audit_close(args, ctx, err.envelope())
+
+
+def _close_stopped(args: argparse.Namespace, ctx: Context, stop: BaseException) -> None:
+    """Log a ``close`` stopped by a signal (exit 128 plus its number); no audit record, as for
+    ``open``."""
+    if isinstance(stop, Terminated):
+        signum, message = stop.signum, f"terminated by signal {stop.signum}"
+    else:
+        signum, message = int(signal.SIGINT), "interrupted"
+    ctx.log(_close_record(args, ctx, result="error", exit_code=128 + signum, message=message))
+
+
+def _logged_close(args: argparse.Namespace, ctx: Context) -> Result:
+    """``close`` past step 1, not a dry run: every outcome gets a ``log.jsonl`` record, and a
+    forced run that saw a running pane or an ``--override-escalation`` run an audit record
+    once its id is resolved (interface.md "Audit and log")."""
+    ctx.logged = True
+    ctx.decision_ids = list(args.decision_ids)
+    try:
+        return _resolve_and_run(args, ctx)
+    except TermctlError as err:
+        _close_failed(args, ctx, err)
+        raise
+    except (KeyboardInterrupt, Terminated) as stop:
+        _close_stopped(args, ctx, stop)
+        raise
+    except Exception as exc:
+        err = internal_error(exc)
+        _close_failed(args, ctx, err)
+        raise err from exc
+
+
+COMMAND_STEPS = {
+    "show": show,
+    "exists": exists,
+    "list": list_panes,
+    "open": open_pane,
+    "close": close_pane,
+}
 
 
 def run_command(args: argparse.Namespace, ctx: Context) -> Result:
@@ -933,6 +1201,8 @@ def dispatch(args: argparse.Namespace, ctx: Context) -> Result:
     load_config(args, ctx)
     if args.command == "open" and not args.dry_run:
         return _logged_open(args, ctx)
+    if args.command == "close" and not args.dry_run:
+        return _logged_close(args, ctx)
     return _resolve_and_run(args, ctx)
 
 
