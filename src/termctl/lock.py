@@ -11,11 +11,11 @@ files. Should one be deleted anyway (by hand), a lock taken on the deleted file 
 exclude a process that creates a new file of the same name; so after each ``flock`` the
 descriptor is compared (device and inode) with what the name points to now, and a mismatch
 drops the descriptor and opens the name again. The lock is never held while hooks run;
-callers keep the ``with`` block around the read-modify-write only, and ``held()`` lets the
-hook runner assert it. The lock descriptor is close-on-exec, so no child inherits it.
+callers keep the ``with`` block around the read-modify-write only, and the hook runner
+(``hooks.py``) refuses to run while ``held()`` is true. The lock descriptor is
+close-on-exec, so no child inherits it.
 """
 
-# TODO(#6): hooks.py refuses to run a hook while held() is true.
 # TODO(#19): rename (then #20 mark/unmark, #21 labels) wraps its read-modify-write in
 # server_lock, with environ and clock from the CLI context.
 

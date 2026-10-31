@@ -1,0 +1,1 @@
+{"error": {"code": "usage", "message": "--override-escalation needs a terminal on stdin or --actor human:<user>; automation never overrides an escalation on its own"}}

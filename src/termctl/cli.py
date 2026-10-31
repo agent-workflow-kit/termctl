@@ -9,18 +9,30 @@ from __future__ import annotations
 import argparse
 import io
 import os
+import signal
 import sys
 from collections.abc import Mapping, Sequence
 from dataclasses import dataclass, field
 from typing import Any, NoReturn, TextIO
 
-from . import __version__, ids, jsonlog, open_cmd, panes, placement, tmux_bin, tmux_socket, validate
+from . import (
+    __version__,
+    hooks,
+    ids,
+    jsonlog,
+    open_cmd,
+    panes,
+    placement,
+    tmux_bin,
+    tmux_socket,
+    validate,
+)
 from . import config as config_module
 from .argv import Scan, scan
 from .backend import Backend, Created, TmuxBackend
 from .config import Config
 from .errors import TermctlError, UsageError
-from .gateway import Clock, Gateway, SystemClock, SystemGateway
+from .gateway import Clock, Gateway, SystemClock, SystemGateway, Terminated
 from .output import PROG, Output, Result, flush_standard_streams
 from .panes import ManagedPane, PaneRead
 from .statedir import StateDirError
@@ -369,13 +381,12 @@ COMMANDS: dict[str, CommandSpec] = {
 def check_args(args: argparse.Namespace, ctx: Context) -> None:
     """Part of step 1: the grammars and limits of the arguments, and ``open``'s cwd (exit 2).
 
-    Replaces ``open``'s ``args.cwd`` with the resolved working directory. Checks that need
+    Replaces ``open``'s ``args.cwd`` with the resolved working directory and, for ``open``
+    and ``close``, sets ``args.flag_hooks`` to the parsed ``--hook`` values. Checks that need
     config (a marker or placement being defined) or the pane list (the label limit of
     ``label add``) belong to later steps. Some step-1 checks are not here yet (see the TODO).
     """
-    # TODO: remaining step-1 usage checks, owned by later issues: the --override-escalation
-    # gate (TTY or a human: actor) and --hook name validity (#6, #17); the `close --force`
-    # gate (#23).
+    # TODO(#23): remaining step-1 usage check: the `close --force` gate.
     if args.socket is not None:
         validate.check_socket_flag(args.socket)
     command = args.command
@@ -388,6 +399,11 @@ def check_args(args: argparse.Namespace, ctx: Context) -> None:
         validate.check_actor(args.actor)
     if hasattr(args, "decision_ids"):
         validate.check_decision_ids(args.decision_ids)
+    if hasattr(args, "hooks"):
+        args.flag_hooks = hooks.parse_flag_hooks(command, args.hooks)
+        hooks.check_override_gate(
+            args.override_escalation, actor=args.actor, stdin_is_tty=ctx.gateway.stdin_isatty()
+        )
     if hasattr(args, "labels"):
         labels = validate.parse_labels(args.labels)
         if command in ("open", "placements"):
@@ -818,6 +834,13 @@ def main(
             clock=clock or SystemClock(),
             environ=os.environ if environ is None else environ,
         )
+    except KeyboardInterrupt:
+        # A hook that was running has been killed (gateway.run_group).
+        out.interrupted("interrupted")
+        return 128 + signal.SIGINT
+    except Terminated as stop:
+        out.interrupted(f"terminated by signal {stop.signum}")
+        return 128 + stop.signum
     finally:
         if stdout is None or stderr is None:
             flush_standard_streams()

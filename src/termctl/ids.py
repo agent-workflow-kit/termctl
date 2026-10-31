@@ -16,6 +16,7 @@ from .validate import show
 PREFIX = "tc-"
 FULL_LENGTH = 8
 _BODY = re.compile(r"[a-z2-7]{4,8}")
+_FULL = re.compile(r"tc-[a-z2-7]{8}")
 _MAX_ATTEMPTS = 100
 
 
@@ -33,6 +34,11 @@ def generate_unique(
         if candidate not in taken:
             return candidate
     raise TermctlError("internal", f"no free id after {_MAX_ATTEMPTS} attempts")
+
+
+def is_id(value: object) -> bool:
+    """Whether ``value`` is a full termctl id (``^tc-[a-z2-7]{8}$``)."""
+    return isinstance(value, str) and _FULL.fullmatch(value) is not None
 
 
 @dataclass(frozen=True)
