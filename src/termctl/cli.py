@@ -35,7 +35,9 @@ class Context:
     environ: Mapping[str, str]
     out: Output = field(repr=False)
     config: Config = field(default_factory=config_module.defaults)
-    # The resolved tmux binary and version, set once by the tmux checks (step 3).
+    # `tmux_bin` resolved to an absolute path, once: by `open`'s resolve step or the tmux checks.
+    tmux_path: str | None = None
+    # The resolved tmux binary and version, set by the tmux checks (step 3) after `tmux -V`.
     tmux: TmuxBinary | None = None
 
 
@@ -411,9 +413,16 @@ def resolve_server(args: argparse.Namespace, ctx: Context) -> None:
 def check_tmux(args: argparse.Namespace, ctx: Context) -> None:
     """Step 3: tmux binary, version and socket safety checks (exit 12)."""
     if ctx.tmux is None:
+        if ctx.tmux_path is None:
+            ctx.tmux_path = tmux_bin.resolve(ctx.config.tmux_bin, ctx.environ, ctx.gateway)
         # TODO(#5): a version warning also gets a `warning` log record in logged commands.
         ctx.tmux = tmux_bin.probe(
-            ctx.config.tmux_bin, ctx.environ, ctx.gateway, ctx.out.warn, ctx.out.trace
+            ctx.config.tmux_bin,
+            ctx.environ,
+            ctx.gateway,
+            ctx.out.warn,
+            ctx.out.trace,
+            path=ctx.tmux_path,
         )
     # TODO: socket safety - issue #8
 

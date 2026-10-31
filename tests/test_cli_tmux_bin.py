@@ -11,6 +11,7 @@ import pytest
 
 from termctl import cli
 from termctl.cli import Context, Output, Result
+from termctl.errors import TermctlError
 from termctl.tmux_bin import TmuxBinary, TmuxVersion
 
 from .fakes import TMUX, FakeClock, FakeGateway, completed
@@ -102,8 +103,41 @@ def test_check_tmux_probes_only_once() -> None:
     cli.check_tmux(args, ctx)
     assert first == TmuxBinary(TMUX, TmuxVersion(3, 5, "3.5"))
     assert ctx.tmux is first
+    assert ctx.tmux_path == TMUX
     assert gateway.calls == [[TMUX, "-V"]]
     assert gateway.executable_checks == [TMUX]
+
+
+def test_earlier_resolution_is_reused_and_the_version_still_checked() -> None:
+    # `open` resolves tmux_bin in step 2 of its order; step 3 must not resolve it again,
+    # and must not skip `tmux -V`.
+    gateway = FakeGateway({("/a/tmux", "-V"): completed("tmux 3.1\n")}, executables=set())
+    out = Output(stdout=io.StringIO(), stderr=io.StringIO())
+    ctx = Context(gateway=gateway, clock=FakeClock(), environ={}, out=out)
+    ctx.tmux_path = "/a/tmux"
+    with pytest.raises(TermctlError) as caught:
+        cli.check_tmux(cli.parse_args(["show", ID]), ctx)
+    assert caught.value.code == "tmux_too_old"
+    assert caught.value.details == {"tmux_bin": "tmux", "path": "/a/tmux", "tmux_version": "3.1"}
+    assert gateway.executable_checks == []
+    assert gateway.calls == [["/a/tmux", "-V"]]
+    assert ctx.tmux is None
+
+
+def test_version_query_gets_the_callers_locale_only() -> None:
+    environ = {**ENVIRON, "LANG": "de_DE.UTF-8", "LC_ALL": "de_DE.UTF-8", "SECRET": "x"}
+    run = Run(["show", ID], environ=environ)
+    assert run.gateway.envs == [{"LANG": "de_DE.UTF-8", "LC_ALL": "de_DE.UTF-8"}]
+
+
+def test_failed_version_query_escapes_tmux_stderr() -> None:
+    stderr = "need UTF-8 locale\x1b[2J\n"
+    gateway = FakeGateway({(TMUX, "-V"): completed("", stderr=stderr, returncode=1)})
+    run = Run(["show", ID], gateway)
+    assert run.code == 12
+    assert run.stderr == (
+        "termctl: cannot run /usr/bin/tmux -V: exit status 1 'need UTF-8 locale\\x1b[2J'\n"
+    )
 
 
 def test_configured_tmux_bin(monkeypatch: pytest.MonkeyPatch) -> None:

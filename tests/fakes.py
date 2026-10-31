@@ -5,18 +5,26 @@ from __future__ import annotations
 import subprocess
 from collections.abc import Mapping
 from datetime import UTC, datetime, timedelta
+from typing import Any
+
+from termctl.gateway import BoundedOutput
 
 # The tmux binary the fakes know about by default, found on ``PATH=/usr/bin``.
 TMUX = "/usr/bin/tmux"
 
-Response = subprocess.CompletedProcess[str] | BaseException
+# A scripted result: text for ``run``; text or bytes for ``run_bounded``.
+Response = subprocess.CompletedProcess[Any] | BaseException
 
 
 def completed(
-    stdout: str = "", *, stderr: str = "", returncode: int = 0
-) -> subprocess.CompletedProcess[str]:
-    """A scripted result of one ``run`` call."""
+    stdout: str | bytes = "", *, stderr: str | bytes = "", returncode: int = 0
+) -> subprocess.CompletedProcess[Any]:
+    """A scripted result of one ``run`` or ``run_bounded`` call."""
     return subprocess.CompletedProcess([], returncode, stdout, stderr)
+
+
+def _as_bytes(output: str | bytes) -> bytes:
+    return output.encode() if isinstance(output, str) else output
 
 
 class FakeGateway:
@@ -45,6 +53,8 @@ class FakeGateway:
         self.executables = {TMUX} if executables is None else set(executables)
         self.executable_checks: list[str] = []
         self.calls: list[list[str]] = []
+        # The ``env`` argument of each call, in the order of ``calls``.
+        self.envs: list[Mapping[str, str] | None] = []
         self.cwd = cwd
         # By default only the caller's current directory exists.
         if dirs is None:
@@ -62,7 +72,28 @@ class FakeGateway:
         timeout: float | None = None,
         env: Mapping[str, str] | None = None,
     ) -> subprocess.CompletedProcess[str]:
+        return self._respond(argv, env)
+
+    def run_bounded(
+        self,
+        argv: list[str],
+        *,
+        env: Mapping[str, str],
+        timeout: float,
+        limit: int,
+    ) -> BoundedOutput:
+        """Answers like ``run``; output over ``limit`` is cut to it and marked truncated."""
+        response = self._respond(argv, env)
+        stdout, stderr = _as_bytes(response.stdout), _as_bytes(response.stderr)
+        truncated = len(stdout) > limit or len(stderr) > limit
+        returncode = -9 if truncated else response.returncode
+        return BoundedOutput(returncode, stdout[:limit], stderr[:limit], truncated)
+
+    def _respond(
+        self, argv: list[str], env: Mapping[str, str] | None
+    ) -> subprocess.CompletedProcess[Any]:
         self.calls.append(list(argv))
+        self.envs.append(None if env is None else dict(env))
         try:
             response = self.responses[tuple(argv)]
         except KeyError:

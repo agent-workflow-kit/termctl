@@ -2,6 +2,7 @@
 
 from __future__ import annotations
 
+import json
 import os
 import shutil
 import stat
@@ -191,9 +192,22 @@ def test_unicode_and_spaces_in_path_entries() -> None:
 # --- the version check --------------------------------------------------------------------------
 
 
+def check(
+    gateway: FakeGateway, environ: dict[str, str] | None = None
+) -> tuple[TmuxVersion | None, str | None]:
+    return tmux_bin.check_version("tmux", TMUX, {} if environ is None else environ, gateway)
+
+
+def check_error(gateway: FakeGateway, code: str) -> TermctlError:
+    with pytest.raises(TermctlError) as caught:
+        check(gateway)
+    assert (caught.value.code, caught.value.exit_code) == (code, 12)
+    return caught.value
+
+
 def test_check_version_accepts_the_floor() -> None:
     gateway = FakeGateway({(TMUX, "-V"): completed("tmux 3.2a\n")})
-    version, warning = tmux_bin.check_version(TMUX, gateway)
+    version, warning = check(gateway)
     assert version == TmuxVersion(3, 2, "3.2")
     assert warning is None
     assert gateway.calls == [[TMUX, "-V"]]
@@ -201,21 +215,18 @@ def test_check_version_accepts_the_floor() -> None:
 
 @pytest.mark.parametrize("output", ["tmux 3.1c\n", "tmux 2.6\n", "tmux next-3.1\n"])
 def test_check_version_below_the_floor_is_too_old(output: str) -> None:
-    gateway = FakeGateway({(TMUX, "-V"): completed(output)})
-    with pytest.raises(TermctlError) as caught:
-        tmux_bin.check_version(TMUX, gateway)
-    err = caught.value
-    assert (err.code, err.exit_code) == ("tmux_too_old", 12)
+    err = check_error(FakeGateway({(TMUX, "-V"): completed(output)}), "tmux_too_old")
     assert "3.2" in err.message
-    assert err.details is not None and err.details["tmux_bin"] == TMUX
+    assert err.details is not None
+    assert (err.details["tmux_bin"], err.details["path"]) == ("tmux", TMUX)
 
 
 @pytest.mark.parametrize(
-    "output", ["tmux master\n", "", "garbage\n", "x" * 100_000, "\x1b]0;evil\x07\n"]
+    "output", ["tmux master\n", "", "garbage\n", "x" * 4096, "\x1b]0;evil\x07\n"]
 )
 def test_check_version_without_a_match_warns_and_continues(output: str) -> None:
     gateway = FakeGateway({(TMUX, "-V"): completed(output)})
-    version, warning = tmux_bin.check_version(TMUX, gateway)
+    version, warning = check(gateway)
     assert version is None
     assert warning is not None and "assuming" in warning
     # The warning quotes at most a short prefix of what tmux printed.
@@ -224,15 +235,29 @@ def test_check_version_without_a_match_warns_and_continues(output: str) -> None:
 
 def test_check_version_reads_stdout_only() -> None:
     gateway = FakeGateway({(TMUX, "-V"): completed("tmux master\n", stderr="tmux 2.1\n")})
-    version, warning = tmux_bin.check_version(TMUX, gateway)
+    version, warning = check(gateway)
     assert (version, warning is not None) == (None, True)
 
 
 def test_check_version_nonzero_exit_is_missing() -> None:
     gateway = FakeGateway({(TMUX, "-V"): completed("tmux 3.5a\n", returncode=1)})
-    with pytest.raises(TermctlError) as caught:
-        tmux_bin.check_version(TMUX, gateway)
-    assert caught.value.code == "tmux_missing"
+    err = check_error(gateway, "tmux_missing")
+    assert err.message == f"cannot run {TMUX} -V: exit status 1"
+    assert err.details == {"tmux_bin": "tmux", "path": TMUX}
+
+
+def test_check_version_nonzero_exit_quotes_stderr() -> None:
+    stderr = "need UTF-8 locale (LC_CTYPE) but have ANSI_X3.4-1968" + " padding" * 20 + "\n"
+    gateway = FakeGateway({(TMUX, "-V"): completed("", stderr=stderr, returncode=1)})
+    err = check_error(gateway, "tmux_missing")
+    assert err.message == f"cannot run {TMUX} -V: exit status 1 '{stderr.strip()[:80]}'"
+
+
+def test_check_version_nonzero_exit_quotes_control_characters_for_escaping() -> None:
+    gateway = FakeGateway({(TMUX, "-V"): completed("", stderr="bad\x1b[2J\n", returncode=2)})
+    err = check_error(gateway, "tmux_missing")
+    # Kept raw here; human output escapes it (tests/test_cli_tmux_bin.py).
+    assert err.message == f"cannot run {TMUX} -V: exit status 2 'bad\x1b[2J'"
 
 
 @pytest.mark.parametrize(
@@ -245,30 +270,104 @@ def test_check_version_nonzero_exit_is_missing() -> None:
     ],
 )
 def test_check_version_unrunnable_binary_is_missing(exc: Exception) -> None:
-    gateway = FakeGateway({(TMUX, "-V"): exc})
-    with pytest.raises(TermctlError) as caught:
-        tmux_bin.check_version(TMUX, gateway)
-    assert caught.value.code == "tmux_missing"
-    assert caught.value.details == {"tmux_bin": TMUX}
+    err = check_error(FakeGateway({(TMUX, "-V"): exc}), "tmux_missing")
+    assert err.details == {"tmux_bin": "tmux", "path": TMUX}
 
 
-def test_check_version_undecodable_output_warns_and_continues() -> None:
-    exc = UnicodeDecodeError("utf-8", b"\xff", 0, 1, "invalid start byte")
-    gateway = FakeGateway({(TMUX, "-V"): exc})
-    version, warning = tmux_bin.check_version(TMUX, gateway)
-    assert version is None and warning is not None
+# Undecodable bytes never bypass the exit status or the floor (review item A).
 
 
-def test_check_version_runs_with_a_timeout_and_an_empty_environment() -> None:
+def test_check_version_old_tmux_with_undecodable_stderr_is_too_old() -> None:
+    gateway = FakeGateway({(TMUX, "-V"): completed(b"tmux 3.1\n", stderr=b"\xff\n")})
+    check_error(gateway, "tmux_too_old")
+
+
+def test_check_version_undecodable_stderr_and_nonzero_exit_is_missing() -> None:
+    gateway = FakeGateway({(TMUX, "-V"): completed(b"", stderr=b"\xff\n", returncode=1)})
+    err = check_error(gateway, "tmux_missing")
+    assert err.message == f"cannot run {TMUX} -V: exit status 1 '\ufffd'"
+
+
+def test_check_version_undecodable_byte_after_an_old_version_is_too_old() -> None:
+    err = check_error(FakeGateway({(TMUX, "-V"): completed(b"tmux 1.8\xff\n")}), "tmux_too_old")
+    assert err.details is not None and err.details["tmux_version"] == "1.8"
+
+
+def test_check_version_good_tmux_with_undecodable_stderr_is_accepted() -> None:
+    gateway = FakeGateway({(TMUX, "-V"): completed(b"tmux 3.5a\n", stderr=b"\xfe\xff")})
+    assert check(gateway) == (TmuxVersion(3, 5, "3.5"), None)
+
+
+def test_check_version_only_undecodable_bytes_warns_and_continues() -> None:
+    gateway = FakeGateway({(TMUX, "-V"): completed(b"\xff\xfe\x80\n")})
+    version, warning = check(gateway)
+    assert version is None
+    assert warning == (
+        f"no version in {TMUX} -V output '\ufffd\ufffd\ufffd'; assuming tmux 3.2 or newer"
+    )
+
+
+# Output is read only up to a limit (review items B and C).
+
+
+@pytest.mark.parametrize(
+    ("stdout", "stderr"),
+    [
+        ("tmux 3.5a\n" + "x" * tmux_bin.OUTPUT_LIMIT, ""),
+        ("tmux 3.5a\n", "y" * (tmux_bin.OUTPUT_LIMIT + 1)),
+        ("tmux " + "1" * 2_000_000 + ".0\n", ""),
+    ],
+)
+def test_check_version_oversized_output_is_missing(stdout: str, stderr: str) -> None:
+    gateway = FakeGateway({(TMUX, "-V"): completed(stdout, stderr=stderr)})
+    err = check_error(gateway, "tmux_missing")
+    assert err.message == f"cannot run {TMUX} -V: output exceeds 4096 bytes"
+    assert len(err.message) < 300
+
+
+def test_check_version_long_version_within_the_limit_is_reported_whole() -> None:
+    text = "0" * 4000 + "3.1"
+    gateway = FakeGateway({(TMUX, "-V"): completed(f"tmux {text}\n")})
+    err = check_error(gateway, "tmux_too_old")
+    assert err.details is not None and err.details["tmux_version"] == text
+    assert len(json.dumps(err.envelope())) < 10 * 1024
+
+
+def test_check_version_runs_bounded_with_a_timeout() -> None:
     seen: dict[str, object] = {}
 
     class Recording(FakeGateway):
-        def run(self, argv, *, stdin=None, timeout=None, env=None):  # type: ignore[no-untyped-def]
-            seen.update(timeout=timeout, env=env, stdin=stdin)
-            return super().run(argv, stdin=stdin, timeout=timeout, env=env)
+        def run_bounded(self, argv, *, env, timeout, limit):  # type: ignore[no-untyped-def]
+            seen.update(timeout=timeout, limit=limit)
+            return super().run_bounded(argv, env=env, timeout=timeout, limit=limit)
 
-    tmux_bin.check_version(TMUX, Recording())
-    assert seen == {"timeout": tmux_bin.VERSION_TIMEOUT, "env": {}, "stdin": None}
+    check(Recording())
+    assert seen == {"timeout": tmux_bin.VERSION_TIMEOUT, "limit": tmux_bin.OUTPUT_LIMIT}
+
+
+def test_check_version_passes_only_the_locale_variables() -> None:
+    gateway = FakeGateway()
+    environ = {
+        "LANG": "de_DE.UTF-8",
+        "LC_ALL": "de_DE.UTF-8",
+        "LC_CTYPE": "de_DE.UTF-8",
+        "HOME": "/home/u",
+        "TMUX": "/tmp/tmux-1000/default,1,0",
+        "SECRET": "s3cret",
+        "PATH": "/usr/bin",
+        "XLANG": "x",
+        "lc_all": "x",
+    }
+    check(gateway, environ)
+    assert gateway.envs == [
+        {"LANG": "de_DE.UTF-8", "LC_ALL": "de_DE.UTF-8", "LC_CTYPE": "de_DE.UTF-8"}
+    ]
+
+
+def test_check_version_with_no_locale_variables_passes_an_empty_environment() -> None:
+    gateway = FakeGateway()
+    check(gateway, {"HOME": "/home/u"})
+    assert gateway.envs == [{}]
 
 
 # --- probe: resolution, then the version, once --------------------------------------------------
@@ -291,6 +390,15 @@ def test_probe_reports_the_warning() -> None:
     assert result == TmuxBinary(TMUX, None)
     assert result.version_text is None
     assert len(warnings) == 1
+
+
+def test_probe_with_a_resolved_path_skips_resolution_but_not_the_version() -> None:
+    gateway = FakeGateway({(TMUX, "-V"): completed("tmux 3.1\n")})
+    with pytest.raises(TermctlError) as caught:
+        tmux_bin.probe("tmux", {}, gateway, lambda _: None, path=TMUX)
+    assert caught.value.code == "tmux_too_old"
+    assert gateway.executable_checks == []
+    assert gateway.calls == [[TMUX, "-V"]]
 
 
 def test_probe_missing_binary_never_runs_anything() -> None:
@@ -341,6 +449,8 @@ REAL_TMUX = shutil.which("tmux")
 @pytest.mark.tmux
 def test_probe_real_tmux() -> None:
     if REAL_TMUX is None:
+        # TODO(#25): CI installs tmux and sets TERMCTL_REQUIRE_TMUX=1 so this test cannot be
+        # skipped there; the shared CI workflow does neither yet.
         if os.environ.get("TERMCTL_REQUIRE_TMUX"):
             pytest.fail("tmux is not installed, and TERMCTL_REQUIRE_TMUX requires the tmux tests")
         pytest.skip("tmux is not installed")

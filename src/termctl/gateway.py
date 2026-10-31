@@ -9,11 +9,23 @@ from __future__ import annotations
 
 import os
 import pwd
+import selectors
 import subprocess
 import time
 from collections.abc import Mapping
 from datetime import UTC, datetime
-from typing import Protocol
+from typing import NamedTuple, Protocol
+
+
+class BoundedOutput(NamedTuple):
+    """The result of ``Gateway.run_bounded``: at most ``limit`` bytes of each stream, and
+    whether either stream had more (the program was then killed, so ``returncode`` is its
+    signal status)."""
+
+    returncode: int
+    stdout: bytes
+    stderr: bytes
+    truncated: bool
 
 
 class Gateway(Protocol):
@@ -27,6 +39,22 @@ class Gateway(Protocol):
         timeout: float | None = None,
         env: Mapping[str, str] | None = None,
     ) -> subprocess.CompletedProcess[str]: ...
+
+    def run_bounded(
+        self,
+        argv: list[str],
+        *,
+        env: Mapping[str, str],
+        timeout: float,
+        limit: int,
+    ) -> BoundedOutput:
+        """Run ``argv`` with no stdin and keep at most ``limit`` bytes of stdout and of stderr.
+
+        Output beyond ``limit`` kills the program and sets ``truncated``. Raises
+        ``subprocess.TimeoutExpired`` (after killing it) if it has not finished, and closed
+        both streams, within ``timeout`` seconds, and ``OSError`` if it cannot be started.
+        """
+        ...
 
     def current_dir(self) -> str:
         """The caller's current directory; raises ``OSError`` if it cannot be read."""
@@ -84,6 +112,40 @@ class SystemGateway:
             check=False,
         )
 
+    def run_bounded(
+        self,
+        argv: list[str],
+        *,
+        env: Mapping[str, str],
+        timeout: float,
+        limit: int,
+    ) -> BoundedOutput:
+        deadline = time.monotonic() + timeout
+        proc = subprocess.Popen(
+            argv,
+            stdin=subprocess.DEVNULL,
+            stdout=subprocess.PIPE,
+            stderr=subprocess.PIPE,
+            env=dict(env),
+        )
+        try:
+            stdout, stderr, truncated = _read_bounded(proc, deadline, limit)
+            if truncated:
+                _kill(proc)
+            else:
+                proc.wait(timeout=max(deadline - time.monotonic(), 0))
+        except subprocess.TimeoutExpired:
+            _kill(proc)
+            raise subprocess.TimeoutExpired(argv, timeout) from None
+        except BaseException:
+            _kill(proc)
+            raise
+        finally:
+            for stream in (proc.stdout, proc.stderr):
+                if stream is not None:
+                    stream.close()
+        return BoundedOutput(proc.returncode, stdout, stderr, truncated)
+
     def current_dir(self) -> str:
         return os.getcwd()
 
@@ -105,6 +167,43 @@ class SystemGateway:
             return pwd.getpwuid(os.getuid()).pw_name
         except KeyError:
             return None
+
+
+def _kill(proc: subprocess.Popen[bytes]) -> None:
+    """Kill and reap the one child ``run_bounded`` started (never anything else)."""
+    if proc.poll() is None:
+        proc.kill()
+    proc.wait()
+
+
+def _read_bounded(
+    proc: subprocess.Popen[bytes], deadline: float, limit: int
+) -> tuple[bytes, bytes, bool]:
+    """Read ``proc``'s stdout and stderr until both close, keeping at most ``limit`` bytes of
+    each. Stops early, with ``truncated`` set, once either has more than ``limit`` bytes;
+    raises ``subprocess.TimeoutExpired`` at ``deadline``."""
+    assert proc.stdout is not None and proc.stderr is not None
+    buffers = {proc.stdout.fileno(): bytearray(), proc.stderr.fileno(): bytearray()}
+    with selectors.DefaultSelector() as selector:
+        for fd in buffers:
+            selector.register(fd, selectors.EVENT_READ)
+        while selector.get_map():
+            remaining = deadline - time.monotonic()
+            if remaining <= 0:
+                raise subprocess.TimeoutExpired(proc.args, 0)
+            for key, _ in selector.select(remaining):
+                buffer = buffers[key.fd]
+                # One byte past the limit is enough to know the limit was exceeded.
+                chunk = os.read(key.fd, limit + 1 - len(buffer))
+                if not chunk:
+                    selector.unregister(key.fd)
+                    continue
+                buffer += chunk
+                if len(buffer) > limit:
+                    out, err = (bytes(b[:limit]) for b in buffers.values())
+                    return out, err, True
+    out, err = (bytes(b) for b in buffers.values())
+    return out, err, False
 
 
 class SystemClock:

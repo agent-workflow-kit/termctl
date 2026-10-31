@@ -22,6 +22,8 @@ from .gateway import Gateway
 FLOOR = (3, 2)
 # Seconds; `tmux -V` prints and exits without reaching a server.
 VERSION_TIMEOUT = 10.0
+# Bytes of `tmux -V` stdout and of its stderr that termctl reads; more is `tmux_missing`.
+OUTPUT_LIMIT = 4096
 # The first `\d+\.\d+` of the output (interface.md), ASCII digits only. The lookbehind starts a
 # match only at the start of a run of digits: the first match is the same, but the search stays
 # linear on a long run of digits with no dot, where a plain search backtracks quadratically.
@@ -30,7 +32,7 @@ _VERSION = re.compile(r"(?<![0-9])([0-9]+)\.([0-9]+)", re.ASCII)
 # refuses to convert strings of more than 4300 digits to int.
 _MAX_DIGITS = 9
 _HUGE = 10**_MAX_DIGITS
-# How much of unparsable `tmux -V` output a warning quotes.
+# How much of unparsable `tmux -V` output a warning, or of its stderr an error, quotes.
 _QUOTED = 80
 
 
@@ -70,8 +72,24 @@ def parse_version(output: str) -> TmuxVersion | None:
     return TmuxVersion(_component(match[1]), _component(match[2]), match[0])
 
 
-def _missing(tmux_bin: str, message: str) -> TermctlError:
-    return TermctlError("tmux_missing", message, details={"tmux_bin": tmux_bin})
+def _missing(tmux_bin: str, message: str, path: str | None = None) -> TermctlError:
+    """``tmux_missing``: ``details.tmux_bin`` is the configured value, ``details.path`` the
+    resolved path once resolution succeeded."""
+    details = {"tmux_bin": tmux_bin}
+    if path is not None:
+        details["path"] = path
+    return TermctlError("tmux_missing", message, details=details)
+
+
+def _quote(output: bytes) -> str:
+    """A short, quoted prefix of ``output`` for a message (escaped on output)."""
+    return "'" + output.decode("utf-8", errors="replace").strip()[:_QUOTED] + "'"
+
+
+def _locale(environ: Mapping[str, str]) -> dict[str, str]:
+    """The caller's ``LANG`` and ``LC_*`` variables: tmux exits at once without a UTF-8
+    locale, and the default filtered environment passes these."""
+    return {k: v for k, v in environ.items() if k == "LANG" or k.startswith("LC_")}
 
 
 def resolve(tmux_bin: str, environ: Mapping[str, str], gateway: Gateway) -> str:
@@ -101,37 +119,47 @@ def resolve(tmux_bin: str, environ: Mapping[str, str], gateway: Gateway) -> str:
 
 
 def check_version(
-    path: str, gateway: Gateway, trace: Callable[[str], None] | None = None
+    tmux_bin: str,
+    path: str,
+    environ: Mapping[str, str],
+    gateway: Gateway,
+    trace: Callable[[str], None] | None = None,
 ) -> tuple[TmuxVersion | None, str | None]:
-    """Run ``<path> -V`` and enforce the 3.2 floor.
+    """Run ``<path> -V`` (``path`` is ``tmux_bin`` resolved) and enforce the 3.2 floor.
 
     Returns the version and a warning: output with no version is assumed new enough, with a
     warning. Raises ``tmux_too_old`` below the floor and ``tmux_missing`` when the binary
-    cannot be run, times out or exits non-zero.
+    cannot be run, times out, exits non-zero or prints more than ``OUTPUT_LIMIT`` bytes.
     """
     argv = [path, "-V"]
     if trace is not None:
         trace(shlex.join(argv))
     try:
-        # TODO(#15): run with the filtered environment; `tmux -V` needs none, so it gets none.
-        result = gateway.run(argv, timeout=VERSION_TIMEOUT, env={})
-    except UnicodeDecodeError:
-        return None, f"cannot decode the output of {path} -V; assuming tmux 3.2 or newer"
+        # TODO(#15): run with the full filtered environment; until then only the locale.
+        result = gateway.run_bounded(
+            argv, env=_locale(environ), timeout=VERSION_TIMEOUT, limit=OUTPUT_LIMIT
+        )
     except subprocess.TimeoutExpired:
-        raise _missing(path, f"cannot run {path} -V: timed out") from None
+        raise _missing(tmux_bin, f"cannot run {path} -V: timed out", path) from None
     except OSError as exc:
-        raise _missing(path, f"cannot run {path}: {exc.strerror or exc}") from None
+        raise _missing(tmux_bin, f"cannot run {path}: {exc.strerror or exc}", path) from None
+    if result.truncated:
+        raise _missing(tmux_bin, f"cannot run {path} -V: output exceeds {OUTPUT_LIMIT} bytes", path)
     if result.returncode != 0:
-        raise _missing(path, f"cannot run {path} -V: exit status {result.returncode}")
-    version = parse_version(result.stdout)
+        message = f"cannot run {path} -V: exit status {result.returncode}"
+        if result.stderr.strip():
+            message += f" {_quote(result.stderr)}"
+        raise _missing(tmux_bin, message, path)
+    version = parse_version(result.stdout.decode("utf-8", errors="replace"))
     if version is None:
-        shown = result.stdout.strip()[:_QUOTED]
-        return None, f"no version in {path} -V output '{shown}'; assuming tmux 3.2 or newer"
+        return None, (
+            f"no version in {path} -V output {_quote(result.stdout)}; assuming tmux 3.2 or newer"
+        )
     if version < FLOOR:
         raise TermctlError(
             "tmux_too_old",
             f"tmux {version.text} is too old; termctl needs tmux 3.2 or newer ({path})",
-            details={"tmux_bin": path, "tmux_version": version.text},
+            details={"tmux_bin": tmux_bin, "path": path, "tmux_version": version.text},
         )
     return version, None
 
@@ -142,10 +170,14 @@ def probe(
     gateway: Gateway,
     warn: Callable[[str], None],
     trace: Callable[[str], None] | None = None,
+    *,
+    path: str | None = None,
 ) -> TmuxBinary:
-    """Resolve ``tmux_bin`` and check its version (the first two tmux checks of step 3)."""
-    path = resolve(tmux_bin, environ, gateway)
-    version, warning = check_version(path, gateway, trace)
+    """Resolve ``tmux_bin``, unless ``path`` already holds its resolution, and check its
+    version (the first two tmux checks of step 3)."""
+    if path is None:
+        path = resolve(tmux_bin, environ, gateway)
+    version, warning = check_version(tmux_bin, path, environ, gateway, trace)
     if warning is not None:
         warn(warning)
     return TmuxBinary(path, version)

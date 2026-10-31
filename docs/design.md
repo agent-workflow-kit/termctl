@@ -79,7 +79,7 @@ Terminal placement, tmux backend. Layer 1 (primitive), fully standalone (archite
 | `jsonlog.py` | `log.jsonl` and `audit.jsonl` |
 | `lock.py` | per-server `flock` (D20) |
 
-Data flow for `open`: `cli` → `config` + `validate` → `placement` → `tmux_backend` + `panes` (socket checks, version check, id-collision check) → `hooks` (pre) → `tmux_backend` (session, placeholder pane, options, respawn) → `procs` (record PID) → `hooks` (post) → `jsonlog`. All tmux reads use one `list-panes -a -F` call with tab-separated fields, free-text fields sanitized in the format string and an end-of-record sentinel (spike A8). Targets are always exact ids (`=session:`, `@N`, `%N`), never names or indexes (spike A6, B7).
+Data flow for `open`: `cli` → `config` + `validate` → `placement` → `tmux_bin` (resolution, version check) → `tmux_backend` + `panes` (socket checks, id-collision check) → `hooks` (pre) → `tmux_backend` (session, placeholder pane, options, respawn) → `procs` (record PID) → `hooks` (post) → `jsonlog`. All tmux reads use one `list-panes -a -F` call with tab-separated fields, free-text fields sanitized in the format string and an end-of-record sentinel (spike A8). Targets are always exact ids (`=session:`, `@N`, `%N`), never names or indexes (spike A6, B7).
 
 Error handling: usage and config problems are detected before any tmux call; tmux failures map to exit 12 codes; a pane that vanished mid-command or a guard non-match maps to exit 10 (D28), except in `open` (D35) and in `close`, where a pane gone at the guarded kill counts as closed (exit 0, [`close`](interface.md#close)); a partially created pane is killed under the ownership guard (D28, [Open order](interface.md#open-order)).
 
@@ -196,5 +196,6 @@ Run on 2026-10-30 against tmux 3.5a and 3.2a, each on a private `-S` socket with
 
 - Unit tests with a fake gateway for every module.
 - Integration tests against real tmux in CI (tmux from apt): each test pre-starts its own server with `tmux -f /dev/null -S <path>` on a private socket path and passes `--socket <path>` to termctl, so the server never loads a user's config; a `make verify-floor` target runs them with tmux 3.2 when available locally.
+- Tests marked `tmux` run a real tmux binary; without tmux on `PATH` they are skipped, unless `TERMCTL_REQUIRE_TMUX` is set to a non-empty value, which makes a missing tmux a test failure (for CI, which installs tmux; D18).
 - Golden `--json` files, validated against `schemas/`.
 - No `live` tests: nothing termctl touches needs credentials or a model.
