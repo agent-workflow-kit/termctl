@@ -390,13 +390,26 @@ def test_focus_never_attaches_even_from_a_terminal() -> None:
 
 @pytest.mark.usefixtures("fixed_id")
 def test_focus_inside_tmux_uses_step_1() -> None:
-    caller = key(tb.caller_session("%9"))
+    caller = key(tb.pane_sessions())
     flow = focus_flow(
         "/dev/pts/2 10 $1 @0\n/dev/pts/7 1 $4 @6\n", extra={caller: completed("%9 $4\n")}
     )
     flow.responses[key(tb.switch_client("/dev/pts/7", "%5"))] = completed()
-    result = run(["--focus", "--", "true"], flow, {"TMUX": f"{SOCK},1,0", "TMUX_PANE": "%9"})
+    result = run(["--focus", "--", "true"], flow, {"TMUX": f"{SOCK},1,4", "TMUX_PANE": "%9"})
     assert result.json()["focused"] is True
+
+
+@pytest.mark.usefixtures("fixed_id")
+def test_a_chosen_client_that_went_away_is_a_warning_naming_it() -> None:
+    flow = focus_flow("/dev/pts/2 10 $1 @0\n")
+    flow.responses[key(tb.switch_client("/dev/pts/2", "%5"))] = completed(
+        stderr="can't find client: /dev/pts/2\n", returncode=1
+    )
+    result = run(["--focus", "--", "true"], flow)
+    assert result.code == 0
+    assert result.json()["focused"] is False
+    assert "could not focus" in result.stderr
+    assert "/dev/pts/2" in result.stderr and "went away" in result.stderr
 
 
 @pytest.mark.usefixtures("fixed_id")

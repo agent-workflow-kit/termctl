@@ -30,13 +30,22 @@ import pytest
 from termctl.cli import main
 from termctl.gateway import SystemGateway
 
-from .conftest import TmuxServer, wait_for
+from .conftest import TMUX_VERSION, TmuxServer, wait_for
 from .schemas import validate
 
 pytestmark = pytest.mark.tmux
 
 NO_CONFIG = str(Path(__file__).parent / "no-config")
 AGENT = "/tmp/termctl-test-agent.sock"
+
+# TODO(#25): tmux 3.2 differs from 3.3+ where these tests expect 3.5a's behaviour: it reports a
+# "$" in a session name as "\\$" (as for window names, test_tmux_integration.py). #25 covers
+# tmux 3.2.
+XFAIL_3_2_DOLLAR = pytest.mark.xfail(
+    TMUX_VERSION is not None and TMUX_VERSION < (3, 3),
+    reason="#25: tmux 3.2 reports '$' as '\\$' in session_name",
+    strict=True,
+)
 
 
 @dataclass
@@ -180,6 +189,11 @@ def focused(server: TmuxServer, *argv: str, **kwargs: Any) -> Any:
     return out
 
 
+def tmux_env(server: TmuxServer, session: str) -> str:
+    """``TMUX`` as tmux sets it in a pane of ``session``: socket, server pid, session id."""
+    return f"{server.socket_path},1,{fmt(server, session, '#{session_id}').removeprefix('$')}"
+
+
 def session_has(server: TmuxServer, session_id: str, entry: str) -> bool:
     return entry in server.raw("show-environment", "-t", session_id).stdout.splitlines()
 
@@ -197,16 +211,17 @@ def test_switches_the_client_to_the_pane(tmux_server: TmuxServer, terminals: Ter
     assert client_view(tmux_server, client) == (session_id, pane["window_id"], pane["pane_id"])
 
 
+@pytest.mark.parametrize("name", ["my work", pytest.param("my $work", marks=XFAIL_3_2_DOLLAR)])
 def test_a_session_the_user_renamed_is_focused(
-    tmux_server: TmuxServer, terminals: Terminals
+    name: str, tmux_server: TmuxServer, terminals: Terminals
 ) -> None:
     """#9's note: a session renamed to a name outside termctl's session grammar."""
     tmux_server.start("base")
     pane = opened(tmux_server, "--session", "work")
-    assert tmux_server.raw("rename-session", "-t", "=work", "my $work").returncode == 0
+    assert tmux_server.raw("rename-session", "-t", "=work", name).returncode == 0
     client = terminals.client("=base:")
     out = focused(tmux_server, pane["id"], "--no-attach")
-    assert out["session"] == "my $work"
+    assert out["session"] == name
     assert client_view(tmux_server, client)[2] == pane["pane_id"]
 
 
@@ -259,11 +274,32 @@ def test_step_1_switches_only_a_client_on_the_callers_session(
     mine = terminals.client("=mine:")
     theirs = terminals.client("=theirs:")  # attached later: the more recent one
     theirs_view = client_view(tmux_server, theirs)
-    inside = {"TMUX": f"{tmux_server.socket_path},1,0", "TMUX_PANE": caller_pane}
+    inside = {"TMUX": tmux_env(tmux_server, "=mine:"), "TMUX_PANE": caller_pane}
     out = focused(tmux_server, pane["id"], environ=inside)
     assert out["client"] == mine
     assert client_view(tmux_server, mine)[2] == pane["pane_id"]
     assert client_view(tmux_server, theirs) == theirs_view
+
+
+def test_step_1_with_grouped_sessions_switches_the_client_on_the_session_tmux_names(
+    tmux_server: TmuxServer, terminals: Terminals
+) -> None:
+    """The caller's pane is in "mine" and in "grouped" (one window group); tmux would report
+    either for the pane, so the caller's session comes from the third field of TMUX."""
+    caller_pane = tmux_server.start("mine")
+    assert tmux_server.raw("new-session", "-d", "-t", "=mine:", "-s", "grouped").returncode == 0
+    pane = opened(tmux_server, "--session", "work")
+    mine = terminals.client("=mine:")
+    grouped = terminals.client("=grouped:")
+    grouped_view = client_view(tmux_server, grouped)
+    inside = {"TMUX": tmux_env(tmux_server, "=mine:"), "TMUX_PANE": caller_pane}
+    assert focused(tmux_server, pane["id"], environ=inside)["client"] == mine
+    assert client_view(tmux_server, grouped) == grouped_view
+    mine_view = client_view(tmux_server, mine)
+    inside = {"TMUX": tmux_env(tmux_server, "=grouped:"), "TMUX_PANE": caller_pane}
+    assert focused(tmux_server, pane["id"], environ=inside)["client"] == grouped
+    assert client_view(tmux_server, grouped)[2] == pane["pane_id"]
+    assert client_view(tmux_server, mine) == mine_view
 
 
 # --- spike F1: -E keeps the client's environment out of the session -----------------------------

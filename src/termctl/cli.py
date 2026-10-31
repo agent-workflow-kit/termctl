@@ -960,7 +960,7 @@ def _focus_opened(ctx: Context, backend: Backend, pane: ManagedPane) -> bool:
             backend, pane, where, client=None, attach_ok=False, tmux_bin=ctx.tmux.path
         )
         assert decision.client is not None
-        backend.switch_client(decision.client, pane.pane_id, pane.id)
+        focus_cmd.switch(backend, pane, decision.client, named=False)
     except TermctlError as err:
         ctx.warn(f"could not focus pane {pane.id}: {err.message}")
         return False
@@ -969,8 +969,8 @@ def _focus_opened(ctx: Context, backend: Backend, pane: ManagedPane) -> bool:
 
 def focus(args: argparse.Namespace, ctx: Context) -> Result:
     """`focus` after id resolution: decide (steps 1 to 4), then switch the client or attach.
-    A real run logs its record before it switches or execs; ``_logged_focus`` logs a
-    failure."""
+    A real run logs a switch after it succeeds and an attach before the exec;
+    ``_logged_focus`` logs a failure."""
     assert ctx.pane is not None and ctx.tmux is not None
     pane, socket_path = ctx.pane, _socket_path(ctx)
     backend = connect(ctx)
@@ -995,16 +995,18 @@ def focus(args: argparse.Namespace, ctx: Context) -> Result:
     if decision.argv is None:
         assert decision.client is not None
         if not args.dry_run:
-            backend.switch_client(decision.client, pane.pane_id, pane.id)
+            focus_cmd.switch(backend, pane, decision.client, named=args.client is not None)
             ctx.log(_focus_record(ctx, result="ok", exit_code=0))
         return Result(data, decision.client)
     if args.dry_run:
         return Result(data, shlex.join(decision.argv))
     # An attach is logged before the exec (interface.md "Audit and log"); with --json the
-    # caller execs the argv itself, with its own environment.
-    ctx.log(_focus_record(ctx, result="ok", exit_code=0))
+    # caller execs the argv itself, with its own environment, and termctl exits 0. Without
+    # --json the exit status is tmux's after the exec, so the record has no exit_code.
     if ctx.out.json:
+        ctx.log(_focus_record(ctx, result="ok", exit_code=0))
         return Result(data, "")
+    ctx.log(_focus_record(ctx, result="ok", exit_code=None))
     ctx.out.flush()
     try:
         # The caller's unfiltered environment: it is the user's own terminal, and -E keeps
@@ -1023,12 +1025,12 @@ def _focus_record(
     ctx: Context,
     *,
     result: str,
-    exit_code: int,
+    exit_code: int | None,
     message: str | None = None,
     details: dict[str, Any] | None = None,
 ) -> dict[str, Any]:
     """The ``log.jsonl`` record of this ``focus``; ``action`` is the action decided, or
-    ``switched`` when it failed before one was."""
+    ``switched`` when it failed before one was. ``exit_code`` None: not known (an exec)."""
     return jsonlog.log_record(
         ctx.clock.now(),
         event="focus",
@@ -1044,7 +1046,8 @@ def _focus_record(
 
 def _logged_focus(args: argparse.Namespace, ctx: Context) -> Result:
     """``focus`` past step 1, not a dry run: every outcome gets a ``log.jsonl`` record (the
-    success record is written by ``focus`` itself, before it switches or execs)."""
+    success record is written by ``focus`` itself: after a switch, before an exec; a failed
+    exec then adds its error record)."""
     ctx.logged = True
     try:
         return _resolve_and_run(args, ctx)

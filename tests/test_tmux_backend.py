@@ -1950,34 +1950,31 @@ def test_parse_clients_of_nothing_is_empty() -> None:
     assert tb.parse_clients("") == ()
 
 
-def test_caller_session_asks_for_the_pane_and_its_session() -> None:
-    assert tb.caller_session("%4").argv(FOCUS_BIN, FOCUS_SOCK) == [
-        FOCUS_BIN, "-S", FOCUS_SOCK, "display", "-p", "-t", "%4", "--",
-        "#{pane_id} #{session_id}",
+def test_pane_sessions_lists_every_pane_with_its_session() -> None:
+    assert tb.pane_sessions().argv(FOCUS_BIN, FOCUS_SOCK) == [
+        FOCUS_BIN, "-S", FOCUS_SOCK, "list-panes", "-a", "-F", "#{pane_id} #{session_id}",
     ]  # fmt: skip
-
-
-@pytest.mark.parametrize("value", ["", "4", "%4;", "$1", "%4 x"])
-def test_caller_session_takes_a_pane_id_only(value: str) -> None:
-    with pytest.raises(ValueError):
-        tb.caller_session(value)
 
 
 @pytest.mark.parametrize(
     ("stdout", "expected"),
     [
-        ("%4 $2\n", "$2"),
-        ("%4 $2", "$2"),
-        (" \n", None),  # display of a missing pane prints empty fields (spike E6)
-        ("", None),
-        ("%5 $2\n", None),
-        ("%4 $2\n%4 $3\n", None),
-        ("%4 2\n", None),
-        ("%4  $2\n", None),
+        ("%4 $2\n", True),
+        ("%4 $2", True),
+        ("%1 $0\n%4 $1\n%4 $2\n", True),  # a window in several sessions: once per session
+        ("%4 $1\n", False),
+        ("%5 $2\n", False),
+        ("", False),
+        (" \n", False),
+        ("%4 $20\n", False),
+        ("%44 $2\n", False),
+        ("%4  $2\n", False),
+        ("%4 $2 x\n", False),
+        ("x%4 $2\n", False),
     ],
 )
-def test_parse_caller_session(stdout: str, expected: str | None) -> None:
-    assert tb.parse_caller_session(stdout, "%4") == expected
+def test_has_pane_in_session_needs_that_exact_pair(stdout: str, expected: bool) -> None:
+    assert tb.has_pane_in_session(stdout, "%4", "$2") is expected
 
 
 def test_switch_client_names_the_client_passes_e_and_targets_the_pane_id() -> None:

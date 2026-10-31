@@ -91,13 +91,17 @@ def switches(gw: FakeGateway) -> list[list[str]]:
     return [call for call in gw.calls if "switch-client" in call]
 
 
+# The step 1 query: every pane with its session (is the caller's pane in its session?).
+CALLER = key(tb.pane_sessions())
+
+
 def displays(gw: FakeGateway) -> list[list[str]]:
-    return [call for call in gw.calls if "display" in call]
+    """The step 1 queries made."""
+    return [call for call in gw.calls if tuple(call) == CALLER]
 
 
-# Inside tmux on the resolved server, in pane %9.
-INSIDE = {"TMUX": f"{SOCK},123,0", "TMUX_PANE": "%9"}
-CALLER = key(tb.caller_session("%9"))
+# Inside tmux on the resolved server, in pane %9 of session $4.
+INSIDE = {"TMUX": f"{SOCK},123,4", "TMUX_PANE": "%9"}
 
 
 # --- step 3: any client, preferring the pane's session ------------------------------------------
@@ -214,9 +218,9 @@ def test_step_1_with_no_client_on_the_callers_session_continues_at_step_3() -> N
 
 
 GONE_ANSWERS = [
+    completed(""),
     completed(" \n"),
     completed("%8 $4\n"),
-    completed(stderr="can't find pane: %9\n", returncode=1),
 ]
 
 
@@ -226,10 +230,54 @@ def test_a_caller_pane_that_is_gone_continues_at_step_3(answer: Any) -> None:
     assert output(run_json([], gw, INSIDE))["client"] == "/dev/pts/3"
 
 
+def test_grouped_sessions_take_the_callers_session_from_tmux() -> None:
+    """The caller's window is in $4 and $6 (grouped sessions); TMUX names $6, so the client on
+    $6 is switched, whichever session tmux would report for the pane."""
+    gw = gateway(
+        ["/dev/pts/1 900 $4 @2", "/dev/pts/2 100 $6 @8"],
+        switched=["/dev/pts/2"],
+        extra={CALLER: completed("%1 $1\n%9 $4\n%9 $6\n")},
+    )
+    environ = {"TMUX": f"{SOCK},123,6", "TMUX_PANE": "%9"}
+    assert output(run_json([], gw, environ))["client"] == "/dev/pts/2"
+
+
+def test_a_session_that_does_not_hold_the_callers_pane_continues_at_step_3() -> None:
+    gw = gateway(
+        ["/dev/pts/1 900 $4 @8", "/dev/pts/3 100 $1 @2"],
+        switched=["/dev/pts/3"],
+        extra={CALLER: completed("%9 $5\n%4 $4\n")},
+    )
+    assert output(run_json([], gw, INSIDE))["client"] == "/dev/pts/3"
+
+
+@pytest.mark.parametrize(
+    "tmux",
+    [
+        f"{SOCK},123",
+        f"{SOCK},123,",
+        f"{SOCK},123,x",
+        f"{SOCK},123,-1",
+        f"{SOCK},123,$4",
+        f"{SOCK},123,04",
+        f"{SOCK},123, 4",
+        f"{SOCK},123,4,5",
+        f"{SOCK},123," + "1" * 21,
+    ],
+)
+def test_an_invalid_session_field_in_tmux_skips_step_1_and_never_attaches(tmux: str) -> None:
+    gw = gateway(
+        ["/dev/pts/1 900 $4 @8", "/dev/pts/3 100 $1 @2"], switched=["/dev/pts/3"], tty=True
+    )
+    out = output(run_json([], gw, {"TMUX": tmux, "TMUX_PANE": "%9"}))
+    assert (out["action"], out["client"]) == ("switched", "/dev/pts/3")
+    assert displays(gw) == [] and gw.execs == []
+
+
 @pytest.mark.parametrize("tmux_pane", ["", "9", "%9;", "%x", " %9", "%9\n", "$1"])
 def test_an_invalid_tmux_pane_skips_step_1_and_never_attaches(tmux_pane: str) -> None:
     gw = gateway(["/dev/pts/3 100 $1 @2"], switched=["/dev/pts/3"], tty=True)
-    environ = {"TMUX": f"{SOCK},123,0", "TMUX_PANE": tmux_pane}
+    environ = {"TMUX": f"{SOCK},123,4", "TMUX_PANE": tmux_pane}
     out = output(run_json([], gw, environ))
     assert out["action"] == "switched"
     assert displays(gw) == [] and gw.execs == []
@@ -261,7 +309,7 @@ def test_tmux_naming_the_server_through_a_symlink_is_the_same_server() -> None:
         links={"/run/link": f"/tmp/tmux-{UID}"},
         files={**FakeGateway().files, "/run": FakeGateway().files["/tmp"]},
     )
-    out = output(run_json([], gw, {"TMUX": "/run/link/default,1,0", "TMUX_PANE": "%9",
+    out = output(run_json([], gw, {"TMUX": "/run/link/default,1,4", "TMUX_PANE": "%9",
                                    "TERMCTL_SOCKET": SOCK}))  # fmt: skip
     assert out["client"] == "/dev/pts/2"
     assert displays(gw) == [list(CALLER)]
@@ -297,9 +345,10 @@ def test_attach_execs_with_the_callers_unfiltered_environment(private_state_home
     assert argv == ATTACH
     # The whole caller's environment, not the filtered one tmux commands get.
     assert env["SSH_AUTH_SOCK"] == "/tmp/agent.sock" and env["SECRET_TOKEN"] == "x"
-    # Logged before the exec.
+    # Logged before the exec, without an exit code: after the exec the status is tmux's.
     [[record]] = seen_at_exec
     assert (record["result"], record["action"], record["id"]) == ("ok", "attach", ID)
+    assert "exit_code" not in record
     # Steps 2 needs no client list and switches nothing.
     assert LIST_CLIENTS not in {tuple(call) for call in gw.calls} and switches(gw) == []
 
@@ -314,6 +363,8 @@ def test_attach_with_json_prints_the_argv_and_does_not_exec(private_state_home: 
     assert gw.execs == []
     [record] = records(private_state_home)
     assert (record["result"], record["action"]) == ("ok", "attach")
+    # termctl itself exits 0 here.
+    assert record["exit_code"] == 0
 
 
 def test_a_renamed_session_is_attached_by_its_id() -> None:
@@ -346,6 +397,7 @@ def test_a_failed_exec_is_attach_failed_and_logged(private_state_home: Path) -> 
     assert "Permission denied" in result.stderr
     ok, failed = records(private_state_home)
     assert (ok["result"], ok["action"]) == ("ok", "attach")
+    assert "exit_code" not in ok
     assert (failed["result"], failed["exit_code"], failed["action"]) == ("error", 12, "attach")
 
 
@@ -364,16 +416,44 @@ def test_client_switches_that_client_and_skips_steps_1_and_2() -> None:
     assert displays(gw) == [] and gw.execs == []
 
 
+def test_a_short_tty_client_name_switches_the_listed_client() -> None:
+    """tmux takes ``pts/5`` for ``/dev/pts/5``; termctl switches and reports the listed name."""
+    gw = gateway(["/dev/pts/11 9 $9 @0", "/dev/pts/5 1 $9 @0"], switched=["/dev/pts/5"])
+    out = output(run_json(["--client", "pts/5"], gw))
+    assert out["client"] == "/dev/pts/5"
+    assert switches(gw) == [[TMUX, "-S", SOCK, "switch-client", "-E", "-c", "/dev/pts/5",
+                             "-t", "%3"]]  # fmt: skip
+    human = run(["--client", "pts/5"], gateway(["/dev/pts/5 1 $9 @0"], switched=["/dev/pts/5"]))
+    assert (human.code, human.stdout) == (0, "/dev/pts/5\n")
+
+
 def test_client_with_no_attach_is_allowed() -> None:
     gw = gateway(["/dev/pts/5 1 $9 @0"], switched=["/dev/pts/5"], tty=True)
     assert output(run_json(["--client", "/dev/pts/5", "--no-attach"], gw))["client"] == "/dev/pts/5"
 
 
-@pytest.mark.parametrize("client", ["/dev/pts/6", "pts/5", "/dev/pts/", "client-1"])
+@pytest.mark.parametrize(
+    "client",
+    [
+        "/dev/pts/6",
+        "pts/6",
+        "dev/pts/5",
+        "/pts/5",
+        "/dev/pts/1",
+        "pts/1",
+        "/dev/pts/",
+        "pts/",
+        "/dev",
+        "/",
+        ".",
+        "client-1",
+        "pts/7",
+    ],
+)
 def test_a_client_that_is_not_attached_is_client_not_found(
     client: str, private_state_home: Path
 ) -> None:
-    gw = gateway(["/dev/pts/5 1 $9 @0", "/dev/pts/7 1  "], tty=True)
+    gw = gateway(["/dev/pts/5 1 $9 @0", "/dev/pts/11 1 $9 @0", "/dev/pts/7 1  "], tty=True)
     error(run_json(["--client", client], gw), "client_not_found", 10)
     assert switches(gw) == []
     [record] = records(private_state_home)
@@ -399,6 +479,18 @@ def test_a_client_detached_before_the_switch_is_client_not_found() -> None:
                                                returncode=1)},
     )  # fmt: skip
     error(run_json(["--client", "/dev/pts/5"], gw), "client_not_found", 10)
+
+
+def test_a_client_termctl_chose_that_went_away_is_no_client(private_state_home: Path) -> None:
+    gw = gateway(
+        ["/dev/pts/5 1 $1 @0"],
+        extra={switch("/dev/pts/5"): completed(stderr="can't find client: /dev/pts/5\n",
+                                               returncode=1)},
+    )  # fmt: skip
+    err = error(run_json([], gw), "no_client", 12)
+    assert "/dev/pts/5" in err["message"] and "went away" in err["message"]
+    [record] = records(private_state_home)
+    assert (record["result"], record["exit_code"], record["action"]) == ("error", 12, "switched")
 
 
 # --- tmux failures ------------------------------------------------------------------------------

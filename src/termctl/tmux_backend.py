@@ -293,7 +293,9 @@ def pane_in_session(session_id: str, window_id: str, pane_id: str) -> Target:
     The session is named by its id, not its name: a session a user renamed may have any name
     (``my work``, one with characters tmux prints escaped, or ``$9``, which ``=$9`` would look
     up as a session id), while the id is tmux's own and still enforces containment (#24;
-    checked on tmux 3.5a)."""
+    checked on tmux 3.2a and 3.5a).
+
+    TODO(#25): the ``=$N:`` form on tmux 3.2 beyond that containment check is #25's."""
     _fullmatch(_SESSION_ID, session_id, "session id")
     _fullmatch(_WINDOW_ID, window_id, "window id")
     _fullmatch(_PANE_ID, pane_id, "pane id")
@@ -1233,11 +1235,12 @@ def is_session_missing(result: subprocess.CompletedProcess[str], name: str) -> b
 
 # One line per client: its name, last activity (seconds), and its session's id and current
 # window. A client attached to no session prints empty session and window fields.
+# TODO(#25): `list-clients -F` with these fields is checked on tmux 3.5a only; #25 verifies
+# tmux 3.2 (the floor).
 CLIENT_FORMAT = fields("client_name", "client_activity", "session_id", "window_id")
 _CLIENT_LINE = re.compile(r"(\S+) ([0-9]{1,20}) (\$[0-9]+) (@[0-9]+)")
-# The caller's own pane and its session (focus step 1).
-CALLER_FORMAT = fields("pane_id", "session_id")
-_CALLER_LINE = re.compile(r"(%[0-9]+) (\$[0-9]+)\n?")
+# Every pane with its session, once per session its window is in (focus step 1).
+PANE_SESSION_FORMAT = fields("pane_id", "session_id")
 
 
 class ClientInfo(NamedTuple):
@@ -1254,6 +1257,7 @@ def list_clients() -> Invocation:
     return Invocation.of(command("list-clients").format("-F", CLIENT_FORMAT).build())
 
 
+# TODO(#25): parse_clients follows tmux 3.5a's `list-clients -F` output; #25 checks tmux 3.2.
 def parse_clients(stdout: str) -> tuple[ClientInfo, ...]:
     """The clients ``list_clients`` printed that termctl can name: a line that is not exactly
     the format (a client attached to no session) or whose name breaks the ``--client`` grammar
@@ -1268,20 +1272,17 @@ def parse_clients(stdout: str) -> tuple[ClientInfo, ...]:
     return tuple(found)
 
 
-def caller_session(pane_id: str) -> Invocation:
-    """``display -p -t %N '#{pane_id} #{session_id}'``: the session of the caller's pane."""
-    return Invocation.of(
-        command("display").flag("-p").target(pane(pane_id)).format_arg(CALLER_FORMAT).build()
-    )
+def pane_sessions() -> Invocation:
+    """``list-panes -a -F '#{pane_id} #{session_id}'``: every pane with each session its window
+    is in, read-only (focus step 1 checks the caller's pane against the session ``TMUX``
+    names; ``display -t %N`` would report one session of tmux's choosing)."""
+    return Invocation.of(command("list-panes").flag("-a").format("-F", PANE_SESSION_FORMAT).build())
 
 
-def parse_caller_session(stdout: str, pane_id: str) -> str | None:
-    """The session id ``caller_session`` printed, or None unless it printed exactly that pane's
-    line (``display`` of a missing pane prints empty fields, spike E6)."""
-    match = _CALLER_LINE.fullmatch(stdout)
-    if match is None or match.group(1) != pane_id:
-        return None
-    return match.group(2)
+def has_pane_in_session(stdout: str, pane_id: str, session_id: str) -> bool:
+    """Whether ``pane_sessions`` printed exactly the line ``pane_id session_id``: the pane
+    exists and its window is in that session."""
+    return f"{pane_id} {session_id}" in stdout.split("\n")
 
 
 def switch_client(client: str, pane_id: str) -> Invocation:
