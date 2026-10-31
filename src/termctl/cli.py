@@ -92,8 +92,8 @@ class Context:
     audited: bool = False
     # A logged ``open``: its stop-signal handling (``gateway.stop_signals``).
     signals: RunSignals | None = None
-    # A pane change (``rename``) that changed nothing: no log record (interface.md "Audit and
-    # log").
+    # A pane change (``rename``, the label commands) that changed nothing: no log record
+    # (interface.md "Audit and log").
     no_op: bool = False
 
     def socket_path(self) -> str | None:
@@ -992,12 +992,56 @@ def rename(args: argparse.Namespace, ctx: Context) -> Result:
     return Result(data, outcome.pane.display_name)
 
 
+def label_change(args: argparse.Namespace, ctx: Context) -> Result:
+    """``label add`` and ``label remove``: the pane's labels are a set of pairs, so adding a
+    present pair or removing an absent one changes nothing; they are written in canonical
+    form (sorted by code point, unique, single spaces) and the window is never renamed
+    (interface.md `label add` / `label remove`, "Labels")."""
+    if args.dry_run:
+        # TODO(#22): label --dry-run prints the pane as it would be (interface.md "Dry runs").
+        raise TermctlError("internal", f"{PROG} {args.command} --dry-run is not implemented yet")
+    assert ctx.pane is not None and ctx.tmux is not None
+    pairs = set(validate.parse_labels(args.pairs))
+    adding = args.command == "label add"
+
+    def plan(pane: ManagedPane) -> Change:
+        current = set(pane.labels)
+        labels = sorted(current | pairs if adding else current - pairs)
+        # The limit applies to the labels read under the lock, after id resolution, so the
+        # failure is logged; a removal never grows the set.
+        if len(labels) > validate.MAX_LABELS:
+            raise UsageError(
+                f"managed pane {pane.id} would carry {len(labels)} labels "
+                f"(at most {validate.MAX_LABELS})"
+            )
+        return Change(options={"@termctl_labels": " ".join(labels)}, display_name=None)
+
+    outcome = change_pane(
+        _change_backend(ctx),
+        ctx.pane.id,
+        plan,
+        version=ctx.tmux.version,
+        environ=ctx.environ,
+        clock=ctx.clock,
+    )
+    ctx.no_op = not outcome.changed
+    data = {
+        **outcome.pane.pane_object(_socket_path(ctx)),
+        "changed": outcome.changed,
+        "display_updated": outcome.display_updated,
+        "dry_run": False,
+    }
+    return Result(data, " ".join(outcome.pane.labels))
+
+
 COMMAND_STEPS = {
     "show": show,
     "exists": exists,
     "list": list_panes,
     "open": open_pane,
     "rename": rename,
+    "label add": label_change,
+    "label remove": label_change,
 }
 
 
@@ -1070,8 +1114,12 @@ def _logged_open(args: argparse.Namespace, ctx: Context) -> Result:
 
 
 # The pane-change commands, by their log.jsonl event (interface.md "Audit and log").
-# TODO(#20): mark, unmark; TODO(#21): label_add, label_remove.
-CHANGE_EVENTS = {"rename": "rename"}
+# TODO(#20): mark, unmark.
+CHANGE_EVENTS = {
+    "rename": "rename",
+    "label add": "label_add",
+    "label remove": "label_remove",
+}
 
 
 def _logged_change(args: argparse.Namespace, ctx: Context) -> Result:
