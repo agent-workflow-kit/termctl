@@ -539,8 +539,8 @@ def test_a_config_error_is_not_logged(tmp_path: Path, private_state_home: Path) 
 
 
 def test_a_dry_run_is_not_logged_and_runs_no_hooks(private_state_home: Path) -> None:
-    gateway = FakeGateway(panes=[], executables=TRUE)
-    error(run(["--dry-run", "--hook", "pre-open=gate", "--", "true"], gateway), "internal", 1)
+    gateway = FakeGateway({key(tb.has_session("termctl")): completed()}, panes=[], executables=TRUE)
+    assert run(["--dry-run", "--hook", "pre-open=gate", "--", "true"], gateway).code == 0
     assert gateway.group_calls == []
     assert records(private_state_home) == []
 
