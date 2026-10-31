@@ -4,6 +4,7 @@ import os
 import pwd
 import selectors
 import signal
+import stat
 import subprocess
 import sys
 import time
@@ -16,6 +17,7 @@ import pytest
 from termctl import gateway as gateway_module
 from termctl import hookwatch
 from termctl.gateway import (
+    BoundedOutput,
     Clock,
     Gateway,
     GroupNotStopped,
@@ -38,6 +40,83 @@ def test_system_gateway_passes_stdin_and_env() -> None:
     script = "import os, sys; print(sys.stdin.read() + os.environ['X'])"
     result = SystemGateway().run([sys.executable, "-c", script], stdin="a", env={"X": "b"})
     assert result.stdout == "ab\n"
+
+
+def write_script(path: Path, body: str) -> list[str]:
+    path.write_text(f"#!{sys.executable}\n{body}")
+    path.chmod(0o755)
+    return [str(path)]
+
+
+def assert_reaped(pid_file: Path) -> None:
+    pid = int(pid_file.read_text())
+    # A child that was killed but never waited for would linger as a zombie, which still
+    # answers signal 0.
+    with pytest.raises(ProcessLookupError):
+        os.kill(pid, 0)
+
+
+def test_run_bounded_returns_the_output_and_status(tmp_path: Path) -> None:
+    script = (
+        "import os, sys\n"
+        "sys.stdout.write('out ' + os.environ['X'])\n"
+        "sys.stderr.write('err')\n"
+        "sys.exit(3)\n"
+    )
+    argv = write_script(tmp_path / "s", script)
+    result = SystemGateway().run_bounded(argv, env={"X": "b"}, timeout=30, limit=4096)
+    assert result == BoundedOutput(3, b"out b", b"err", False)
+
+
+def test_run_bounded_passes_only_the_given_environment_and_no_stdin(tmp_path: Path) -> None:
+    script = "import os, sys; print(sorted(os.environ)); print(repr(sys.stdin.read()))"
+    argv = write_script(tmp_path / "s", script)
+    result = SystemGateway().run_bounded(argv, env={"A": "1"}, timeout=30, limit=4096)
+    lines = result.stdout.decode().splitlines()
+    assert [line for line in lines if not line.startswith("[")] == ["''"]
+    assert "'A'" in lines[0] and "'HOME'" not in lines[0]
+
+
+@pytest.mark.parametrize("stream", ["stdout", "stderr"])
+def test_run_bounded_stops_reading_at_the_limit_and_reaps_the_child(
+    tmp_path: Path, stream: str
+) -> None:
+    pid_file = tmp_path / "pid"
+    script = (
+        "import os, sys\n"
+        f"open({str(pid_file)!r}, 'w').write(str(os.getpid()))\n"
+        f"out = sys.{stream}.buffer\n"
+        "while True:\n"
+        "    out.write(b'x' * 65536)\n"
+        "    out.flush()\n"
+    )
+    argv = write_script(tmp_path / "s", script)
+    start = time.monotonic()
+    result = SystemGateway().run_bounded(argv, env={}, timeout=60, limit=4096)
+    # Endless output ends at the limit, long before the timeout.
+    assert time.monotonic() - start < 30
+    assert result.truncated
+    assert len(getattr(result, stream)) == 4096
+    assert result.returncode < 0
+    assert_reaped(pid_file)
+
+
+def test_run_bounded_times_out_and_reaps_the_child(tmp_path: Path) -> None:
+    pid_file = tmp_path / "pid"
+    script = (
+        f"import os, time\nopen({str(pid_file)!r}, 'w').write(str(os.getpid()))\ntime.sleep(600)\n"
+    )
+    argv = write_script(tmp_path / "s", script)
+    start = time.monotonic()
+    with pytest.raises(subprocess.TimeoutExpired):
+        SystemGateway().run_bounded(argv, env={}, timeout=3, limit=4096)
+    assert time.monotonic() - start < 30
+    assert_reaped(pid_file)
+
+
+def test_run_bounded_cannot_start(tmp_path: Path) -> None:
+    with pytest.raises(OSError):
+        SystemGateway().run_bounded([str(tmp_path / "missing")], env={}, timeout=5, limit=10)
 
 
 def test_system_clock_is_timezone_aware_and_monotonic() -> None:
@@ -592,3 +671,44 @@ def test_watchdog_kills_the_hook_on_a_stop_signal_while_it_starts(tmp_path: Path
     )
     assert proc.returncode == 1, proc.stderr
     assert wait_gone(int(read_when_ready(marker)))
+
+
+def test_system_gateway_real_uid(monkeypatch: pytest.MonkeyPatch) -> None:
+    monkeypatch.setattr(os, "getuid", lambda: 4242)
+    assert SystemGateway().real_uid() == 4242
+
+
+def test_system_gateway_lstat_does_not_follow_symlinks(tmp_path: Path) -> None:
+    (tmp_path / "dir").mkdir(mode=0o750)
+    (tmp_path / "dir").chmod(0o750)
+    (tmp_path / "link").symlink_to(tmp_path / "dir")
+    gateway = SystemGateway()
+    info = gateway.lstat(str(tmp_path / "dir"))
+    assert (stat.S_ISDIR(info.mode), stat.S_IMODE(info.mode)) == (True, 0o750)
+    assert info.uid == os.getuid()
+    assert stat.S_ISLNK(gateway.lstat(str(tmp_path / "link")).mode)
+    with pytest.raises(FileNotFoundError):
+        gateway.lstat(str(tmp_path / "missing"))
+
+
+def test_system_gateway_real_path_is_strict(tmp_path: Path) -> None:
+    (tmp_path / "dir").mkdir()
+    (tmp_path / "link").symlink_to(tmp_path / "dir")
+    (tmp_path / "dangling").symlink_to(tmp_path / "nowhere")
+    gateway = SystemGateway()
+    assert gateway.real_path(str(tmp_path / "link")) == os.path.realpath(tmp_path / "dir")
+    with pytest.raises(OSError):
+        gateway.real_path(str(tmp_path / "dangling"))
+    with pytest.raises(OSError):
+        gateway.real_path(str(tmp_path / "missing" / ".."))
+
+
+def test_system_gateway_read_link(tmp_path: Path) -> None:
+    (tmp_path / "link").symlink_to("relative/target")
+    (tmp_path / "file").write_text("")
+    gateway = SystemGateway()
+    assert gateway.read_link(str(tmp_path / "link")) == "relative/target"
+    with pytest.raises(OSError):
+        gateway.read_link(str(tmp_path / "file"))
+    with pytest.raises(FileNotFoundError):
+        gateway.read_link(str(tmp_path / "missing"))

@@ -53,6 +53,11 @@ def show(value: str, limit: int = SHOW_LIMIT) -> str:
     return f"'{escape(value)}'"
 
 
+def has_control(value: str) -> bool:
+    """Whether ``value`` has a C0 (tab and newline included), DEL or C1 control character."""
+    return _CONTROL.search(value) is not None
+
+
 def has_surrogate(value: str) -> bool:
     """Whether ``value`` has a lone surrogate, so is not valid Unicode text."""
     return _SURROGATE.search(value) is not None
@@ -176,8 +181,12 @@ def check_placement_name(value: str) -> str:
     return value
 
 
+def is_client(value: str) -> bool:
+    return _fullmatch(_CLIENT, value)
+
+
 def check_client(value: str) -> str:
-    if not _fullmatch(_CLIENT, value):
+    if not is_client(value):
         raise UsageError(f"invalid client {show(value)}: must match /?[A-Za-z0-9_./-]{{1,100}}")
     return value
 

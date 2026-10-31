@@ -25,6 +25,7 @@ from pydantic import (
     BeforeValidator,
     ConfigDict,
     Field,
+    PrivateAttr,
     TypeAdapter,
     ValidationError,
     field_validator,
@@ -219,6 +220,15 @@ class Config(_Model):
     placements: dict[PlacementName, Placement]
     rules: list[Rule]
     hooks: Hooks
+
+    # The fields of placements.default that the config files set (empty for the built-in
+    # config). Merging over DEFAULTS hides where a field came from; `placements` reports it.
+    _configured_default_fields: frozenset[str] = PrivateAttr(default=frozenset())
+
+    @property
+    def configured_default_fields(self) -> frozenset[str]:
+        """The fields of the ``default`` placement that config files set."""
+        return self._configured_default_fields
 
 
 def defaults() -> Config:
@@ -652,14 +662,28 @@ def _check_rules(cfg: Config) -> None:
             raise _key_error(f"rules[{index}].placement", f"undefined placement {rule.placement!r}")
 
 
+def _configured_default_fields(files: Mapping[str, Any]) -> frozenset[str]:
+    """The keys of ``placements.default`` in the merged files (before ``DEFAULTS``)."""
+    placements = files.get("placements")
+    default = placements.get("default") if isinstance(placements, dict) else None
+    return frozenset(default) if isinstance(default, dict) else frozenset()  # pyright: ignore[reportUnknownArgumentType]
+
+
 def load(environ: Mapping[str, str], explicit: str | None = None) -> Config:
     """Load the effective config: built-in defaults, the main file, the drop-ins in code point
     order, then ``TERMCTL_<KEY>`` scalars. Raises ``ConfigError`` naming the key, variable or
     file. A missing main file is an error only when given with ``--config``."""
     main = config_path(environ, explicit)
-    data = merge(copy.deepcopy(DEFAULTS), _read(main, optional=explicit is None))
+    files = _read(main, optional=explicit is None)
+    data = merge(copy.deepcopy(DEFAULTS), files)
     for path in _dropins(main):
-        data = merge(data, _read(path))
+        dropin = _read(path)
+        data = merge(data, dropin)
+        files = merge(files, dropin)
+    if isinstance(data.get("placements"), dict):
+        # A scalar replaced by a later map (in a file, or for placements.default) dropped the
+        # built-in placements, or the built-in default's fields: merge them back beneath.
+        data["placements"] = merge(copy.deepcopy(DEFAULTS["placements"]), data["placements"])
 
     _check_unicode(data)
     _check_pre_hooks(data)
@@ -669,4 +693,5 @@ def load(environ: Mapping[str, str], explicit: str | None = None) -> Config:
         raise _key_error(*_first_error(exc)) from None
     cfg = cfg.model_copy(update=_from_environment(environ))
     _check_rules(cfg)
+    cfg._configured_default_fields = _configured_default_fields(files)  # pyright: ignore[reportPrivateUsage]
     return cfg

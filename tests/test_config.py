@@ -1398,3 +1398,26 @@ def test_cli_empty_config_flag_is_a_usage_error(argv: list[str]) -> None:
     validate(envelope, "termctl/cli/error.json")
     assert envelope["error"]["code"] == "usage"
     assert envelope["error"]["message"] == "--config must not be empty"
+
+
+def test_scalar_placements_replaced_by_a_dropin_map_keeps_the_built_in_default(
+    home: Path, main_file: Path, dropins: Path
+) -> None:
+    write(main_file, "placements: 5\nrules: [{match: {}, placement: default}]\n")
+    write(dropins / "a.yaml", {"placements": {"foo": {"session": "f"}}})
+    cfg = load_home(home)
+    assert list(cfg.placements) == ["default", "foo"]
+    default = cfg.placements["default"]
+    assert (default.session, default.target) == ("termctl", "window")
+    assert cfg.configured_default_fields == frozenset()
+
+
+def test_scalar_default_replaced_by_a_dropin_map_keeps_built_in_fields(
+    home: Path, main_file: Path, dropins: Path
+) -> None:
+    write(main_file, "placements: {default: 5}\n")
+    write(dropins / "a.yaml", {"placements": {"default": {"target": "window"}}})
+    cfg = load_home(home)
+    default = cfg.placements["default"]
+    assert (default.session, default.target) == ("termctl", "window")
+    assert cfg.configured_default_fields == frozenset({"target"})
