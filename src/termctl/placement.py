@@ -1,0 +1,163 @@
+"""Placement and rule resolution, and the ``placements`` command.
+
+interface.md "Placement" and "`placements`" are normative. A placement is resolved to its
+*effective* fields: the built-in ``default`` with the configured ``default`` merged over it field
+by field, and every other placement's missing fields taken from that effective ``default``.
+"""
+
+from __future__ import annotations
+
+import json
+import re
+from collections.abc import Iterable
+from dataclasses import dataclass
+from typing import Any, Literal
+
+from .config import DEFAULTS, Config, Placement, Rule
+from .errors import TermctlError
+from .output import Result
+
+DEFAULT = "default"
+
+# The built-in default placement (interface.md "Placement").
+BUILT_IN_DEFAULT: dict[str, Any] = dict(DEFAULTS["placements"][DEFAULT])
+
+# Fields in the order they are printed.
+FIELDS = ("session", "target", "max_panes", "layout", "group_by")
+
+# Fields of `target: pane` placements, which this version does not support (interface.md
+# "Placement", design.md D2).
+PANE_FIELDS = ("max_panes", "layout", "group_by")
+
+_PLAIN = re.compile(r"[A-Za-z0-9_-]+")
+
+Origin = Literal["built-in", "config"]
+
+
+def _set_fields(placement: Placement) -> dict[str, Any]:
+    """The fields ``placement`` sets, explicit nulls included."""
+    return {name: getattr(placement, name) for name in FIELDS if name in placement.model_fields_set}
+
+
+def _ordered(fields: dict[str, Any]) -> dict[str, Any]:
+    return {name: fields[name] for name in FIELDS if name in fields}
+
+
+def effective(cfg: Config) -> dict[str, dict[str, Any]]:
+    """Every placement's effective fields, ``default`` first, then config order. Returns new
+    dicts; the config is not changed."""
+    configured = cfg.placements.get(DEFAULT)
+    default = {**BUILT_IN_DEFAULT, **(_set_fields(configured) if configured else {})}
+    result = {DEFAULT: _ordered(default)}
+    for name, placement in cfg.placements.items():
+        if name != DEFAULT:
+            result[name] = _ordered({**default, **_set_fields(placement)})
+    return result
+
+
+def origin(cfg: Config, name: str) -> Origin:
+    """``config`` when any field of ``name`` comes from config, else ``built-in``. A placement
+    other than ``default`` exists only because config defines it, so it is always ``config``."""
+    if name != DEFAULT or cfg.configured_default_fields:
+        return "config"
+    return "built-in"
+
+
+def _pair(label: str) -> tuple[str, str]:
+    key, _, value = label.partition("=")
+    return key, value
+
+
+def match_rule(rules: Iterable[Rule], labels: Iterable[str]) -> int | None:
+    """The index of the first rule whose every ``match`` pair is among ``labels`` (``key=value``
+    strings, split at the first ``=``), or None. An empty ``match`` matches everything."""
+    pairs = {_pair(label) for label in labels}
+    for index, rule in enumerate(rules):
+        if all(pair in pairs for pair in rule.match.items()):
+            return index
+    return None
+
+
+def check_supported(name: str, fields: dict[str, Any]) -> None:
+    """Exit 2 (``not_supported``) when the placement uses ``target: pane`` or its fields
+    (present at all, an explicit null included)."""
+    used = (["target"] if fields.get("target") == "pane" else []) + [
+        field for field in PANE_FIELDS if field in fields
+    ]
+    if not used:
+        return
+    shown = ", ".join("target: pane" if field == "target" else field for field in used)
+    raise TermctlError(
+        "not_supported",
+        f"placement {name!r} uses {shown}, which this version does not support"
+        " (only target: window)",
+        details={"placement": name, "fields": used},
+    )
+
+
+@dataclass(frozen=True)
+class Selection:
+    """The placement ``open`` would use: the matching rule's index (None for none), the
+    placement's name and its effective fields."""
+
+    rule: int | None
+    name: str
+    fields: dict[str, Any]
+
+
+def select(cfg: Config, labels: Iterable[str]) -> Selection:
+    """The first matching rule's placement, else ``default``; ``not_supported`` when it uses
+    ``target: pane`` or its fields."""
+    # TODO(#13): `open --placement NAME` (skips the rules) and the `--session`/`--target`
+    # overrides; this resolves the rules only.
+    rule = match_rule(cfg.rules, labels)
+    name = DEFAULT if rule is None else cfg.rules[rule].placement
+    fields = effective(cfg)[name]
+    check_supported(name, fields)
+    return Selection(rule=rule, name=name, fields=fields)
+
+
+# --- the placements command ---------------------------------------------------------------------
+
+
+def _show_value(value: Any) -> str:
+    """Session names, targets and integers as they are; free text (``layout``, ``group_by``)
+    and null as JSON, so a line stays unambiguous."""
+    if isinstance(value, str) and _PLAIN.fullmatch(value):
+        return value
+    if isinstance(value, int):
+        return str(value)
+    return json.dumps(value, ensure_ascii=False)
+
+
+def _placement_line(name: str, fields: dict[str, Any], origin: Origin) -> str:
+    shown = " ".join(f"{field}={_show_value(value)}" for field, value in fields.items())
+    return f"placement {name}: {shown} ({origin})"
+
+
+def _rule_line(index: int, rule: Rule) -> str:
+    pairs = " ".join(f"{key}={value}" for key, value in rule.match.items()) or "(any)"
+    return f"rule {index}: {pairs} -> {rule.placement}"
+
+
+def report(cfg: Config, labels: list[str] | None) -> Result:
+    """The ``placements`` output; ``labels`` (sorted, unique ``key=value`` pairs) is None
+    without ``--label``."""
+    placements = {
+        name: {**fields, "origin": origin(cfg, name)} for name, fields in effective(cfg).items()
+    }
+    rules = [rule.model_dump() for rule in cfg.rules]
+    lines = [
+        _placement_line(name, {k: v for k, v in fields.items() if k != "origin"}, fields["origin"])
+        for name, fields in placements.items()
+    ]
+    lines += [_rule_line(index, rule) for index, rule in enumerate(cfg.rules)]
+    match = None
+    if labels is not None:
+        selected = select(cfg, labels)
+        match = {"labels": labels, "rule": selected.rule, "placement": selected.name}
+        found = "no rule" if selected.rule is None else f"rule {selected.rule}"
+        lines.append(f"match {' '.join(labels)}: {found} -> {selected.name}")
+    return Result(
+        data={"placements": placements, "rules": rules, "match": match}, human="\n".join(lines)
+    )
