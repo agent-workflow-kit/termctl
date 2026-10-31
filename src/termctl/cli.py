@@ -107,6 +107,8 @@ class Context:
     no_op: bool = False
     # ``focus``: the action decided, for its log record (``switched`` until one is decided).
     focus_action: focus_cmd.Action = "switched"
+    # ``focus``: the attach argv to exec, once the run's stop-signal handling is gone.
+    focus_exec: list[str] | None = None
 
     def socket_path(self) -> str | None:
         """The resolved server's socket path; None before step 2 resolved it."""
@@ -1508,17 +1510,25 @@ def focus(args: argparse.Namespace, ctx: Context) -> Result:
         ctx.log(_focus_record(ctx, result="ok", exit_code=0))
         return Result(data, "")
     ctx.log(_focus_record(ctx, result="ok", exit_code=None))
+    # ``_logged_focus`` execs it once the stop-signal handlers are restored.
+    ctx.focus_exec = decision.argv
+    return Result(data, "")
+
+
+def _focus_attach(ctx: Context, argv: list[str]) -> NoReturn:
+    """Exec the attach argv (``focus`` step 2), after its log record and with the run's
+    stop-signal handlers gone, so the tmux client starts with the caller's dispositions."""
     ctx.out.flush()
     try:
         # The caller's unfiltered environment: it is the user's own terminal, and -E keeps
         # that environment out of the session.
-        ctx.gateway.exec_replace(decision.argv, ctx.environ)
+        ctx.gateway.exec_replace(argv, ctx.environ)
     except (OSError, ValueError) as exc:
         reason = exc.strerror if isinstance(exc, OSError) and exc.strerror else str(exc)
         raise TermctlError(
             "attach_failed",
-            f"cannot run {validate.show(decision.argv[0], 200)}: {reason}",
-            details={"socket_path": socket_path},
+            f"cannot run {validate.show(argv[0], 200)}: {reason}",
+            details={"socket_path": _socket_path(ctx)},
         ) from None
 
 
@@ -1546,27 +1556,45 @@ def _focus_record(
 
 
 def _logged_focus(args: argparse.Namespace, ctx: Context) -> Result:
-    """``focus`` past step 1, not a dry run: every outcome gets a ``log.jsonl`` record (the
-    success record is written by ``focus`` itself: after a switch, before an exec; a failed
-    exec then adds its error record)."""
+    """``focus`` past step 1, not a dry run: every outcome gets a ``log.jsonl`` record, a stop
+    by a signal (exit 128 plus its number) included (the success record is written by
+    ``focus`` itself: after a switch, before an exec; a failed exec then adds its error
+    record). Stop signals raise as for ``open`` (``stop_signals``) but are never deferred; the
+    attach exec runs after their handlers are restored."""
     ctx.logged = True
-    try:
-        return _resolve_and_run(args, ctx)
-    except TermctlError as err:
-        ctx.log(
-            _focus_record(
-                ctx,
-                result="error",
-                exit_code=err.exit_code,
-                message=err.message,
-                details=err.details,
-            )
+    with stop_signals() as signals:
+        try:
+            result = _resolve_and_run(args, ctx)
+        except TermctlError as err:
+            signals.finish()
+            _focus_failed(ctx, err)
+            raise
+        except (KeyboardInterrupt, Terminated) as stop:
+            signals.finish()
+            exit_code, message = _stopped(stop)
+            ctx.log(_focus_record(ctx, result="error", exit_code=exit_code, message=message))
+            raise
+        except Exception as exc:
+            signals.finish()
+            err = internal_error(exc)
+            _focus_failed(ctx, err)
+            raise err from exc
+        signals.finish()
+    if ctx.focus_exec is not None:
+        try:
+            _focus_attach(ctx, ctx.focus_exec)
+        except TermctlError as err:
+            _focus_failed(ctx, err)
+            raise
+    return result
+
+
+def _focus_failed(ctx: Context, err: TermctlError) -> None:
+    ctx.log(
+        _focus_record(
+            ctx, result="error", exit_code=err.exit_code, message=err.message, details=err.details
         )
-        raise
-    except Exception as exc:
-        err = internal_error(exc)
-        ctx.log(_focus_record(ctx, result="error", exit_code=err.exit_code, message=err.message))
-        raise err from exc
+    )
 
 
 COMMAND_STEPS = {

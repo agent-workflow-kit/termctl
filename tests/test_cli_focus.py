@@ -4,6 +4,8 @@ Real-tmux end-to-end tests are in test_cli_focus_integration.py."""
 from __future__ import annotations
 
 import json
+import os
+import signal
 import subprocess
 from collections.abc import Mapping, Sequence
 from pathlib import Path
@@ -11,11 +13,12 @@ from typing import Any
 
 import pytest
 
+from termctl import cli, focus_cmd
 from termctl import tmux_backend as tb
 
 from .fakes import TMUX, UID, Execed, FakeGateway, completed, pane_row
 from .schemas import validate
-from .test_cli import ENVIRON, Run
+from .test_cli import ENVIRON, GOLDEN, Run
 
 SOCK = f"/tmp/tmux-{UID}/default"
 ID = "tc-abcdefgh"
@@ -580,3 +583,71 @@ def test_the_schema_takes_only_a_session_id_attach_target(target: str) -> None:
     }  # fmt: skip
     with pytest.raises(Exception, match="does not match"):
         validate(out, "termctl/cli/focus.json")
+
+
+# --- stop signals (interface.md "Stop signals", "Audit and log") --------------------------------
+
+
+@pytest.mark.parametrize(("stop", "code"), [(KeyboardInterrupt(), 130), (cli.Terminated(15), 143)])
+def test_a_signal_during_the_switch_is_logged_as_stopped(
+    private_state_home: Path, stop: BaseException, code: int
+) -> None:
+    gw = gateway(["/dev/pts/2 300 $1 @5"], extra={switch("/dev/pts/2"): stop})
+    result = run_json([], gw)
+    assert result.code == code
+    # A signal exit prints no error object.
+    assert result.stdout == ""
+    [record] = records(private_state_home)
+    assert (record["event"], record["result"], record["exit_code"], record["action"]) == (
+        "focus", "error", code, "switched",
+    )  # fmt: skip
+
+
+def test_a_real_sigterm_during_the_switch_is_logged_as_stopped(
+    private_state_home: Path, monkeypatch: pytest.MonkeyPatch
+) -> None:
+    def terminated(*args: object, **kwargs: object) -> None:
+        os.kill(os.getpid(), signal.SIGTERM)
+
+    monkeypatch.setattr(focus_cmd, "switch", terminated)
+    before = signal.getsignal(signal.SIGTERM)
+    result = run_json([], gateway(["/dev/pts/2 300 $1 @5"]))
+    assert result.code == 128 + signal.SIGTERM
+    [record] = records(private_state_home)
+    assert (record["result"], record["exit_code"]) == ("error", 128 + signal.SIGTERM)
+    assert signal.getsignal(signal.SIGTERM) == before
+
+
+def test_the_signal_dispositions_are_restored_before_the_attach_exec() -> None:
+    stops = (signal.SIGINT, signal.SIGTERM, signal.SIGHUP)
+    before = {signum: signal.getsignal(signum) for signum in stops}
+    gw = gateway(tty=True)
+    at_exec: list[dict[int, Any]] = []
+    exec_replace = gw.exec_replace
+
+    def exec_and_check(argv: list[str], env: Mapping[str, str]) -> Any:
+        at_exec.append({signum: signal.getsignal(signum) for signum in stops})
+        return exec_replace(argv, env)
+
+    gw.exec_replace = exec_and_check  # type: ignore[method-assign]
+    with pytest.raises(Execed):
+        run([], gw)
+    assert at_exec == [before]
+
+
+# --- golden output ------------------------------------------------------------------------------
+
+
+def golden(name: str) -> Any:
+    expected = json.loads((GOLDEN / name).read_text(encoding="utf-8"))
+    validate(expected, "termctl/cli/focus.json")
+    return expected
+
+
+def test_switched_golden() -> None:
+    gw = gateway(["/dev/pts/2 300 $1 @5"], switched=["/dev/pts/2"])
+    assert output(run_json([], gw)) == golden("focus-switched.json")
+
+
+def test_attach_golden() -> None:
+    assert output(run_json([], gateway(tty=True))) == golden("focus-attach.json")
