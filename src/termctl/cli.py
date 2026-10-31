@@ -17,6 +17,7 @@ from typing import Any, NoReturn, TextIO
 
 from . import (
     __version__,
+    display,
     hooks,
     ids,
     jsonlog,
@@ -42,6 +43,7 @@ from .gateway import (
     stop_signals,
 )
 from .output import PROG, Output, Result, flush_standard_streams
+from .pane_change import Change, change_pane
 from .panes import ManagedPane, PaneRead
 from .statedir import StateDirError
 from .tmux_backend import Tmux, WindowSpec
@@ -77,9 +79,13 @@ class Context:
     plan: open_cmd.Plan | None = None
     window: WindowSpec | None = None
     open_id: str | None = None
-    # A command that writes log records (``open`` other than a dry run, once past step 1):
-    # each of its warnings also becomes a ``warning`` log record (``warn``).
+    # A command that writes log records (``open`` or a pane change of ``CHANGE_EVENTS``, not a
+    # dry run, once past step 1): each of its warnings also becomes a ``warning`` log record
+    # (``warn``).
     logged: bool = False
+    # A logged pane change: its ``warning`` records, held until its outcome is known, then
+    # written before its own record, or dropped if it changed nothing (``_logged_change``).
+    held_warnings: list[dict[str, Any]] | None = None
     # The actor, resolved once per run (``resolve_actor``).
     actor: str | None = None
     # ``open``: the --decision-id values, then the ids its pre-open hooks returned (step 4),
@@ -90,26 +96,44 @@ class Context:
     audited: bool = False
     # A logged ``open``: its stop-signal handling (``gateway.stop_signals``).
     signals: RunSignals | None = None
+    # A pane change (``rename``) that changed nothing: no log record (interface.md "Audit and
+    # log").
+    no_op: bool = False
 
     def socket_path(self) -> str | None:
         """The resolved server's socket path; None before step 2 resolved it."""
         return None if self.server is None else self.server.socket_path
+
+    def record_id(self) -> str | None:
+        """The id a log record names: ``open``'s generated id, else the pane step 4 resolved;
+        None before either exists."""
+        if self.open_id is not None:
+            return self.open_id
+        return None if self.pane is None else self.pane.id
 
     def warn(self, message: str) -> None:
         """Print a warning (unless ``--quiet``); a logged command also writes it as a
         ``warning`` log record (interface.md "Audit and log")."""
         self.out.warn(message)
         if self.logged:
-            self.log(
-                jsonlog.log_record(
-                    self.clock.now(),
-                    event="warning",
-                    result="warning",
-                    id=self.open_id,
-                    socket_path=self.socket_path(),
-                    message=message,
-                )
+            record = jsonlog.log_record(
+                self.clock.now(),
+                event="warning",
+                result="warning",
+                id=self.record_id(),
+                socket_path=self.socket_path(),
+                message=message,
             )
+            if self.held_warnings is not None:
+                self.held_warnings.append(record)
+            else:
+                self.log(record)
+
+    def write_held_warnings(self) -> None:
+        """Write the held ``warning`` records, in order, and stop holding them."""
+        held, self.held_warnings = self.held_warnings or [], None
+        for record in held:
+            self.log(record)
 
     def log(self, record: dict[str, Any]) -> None:
         """Append a ``log.jsonl`` record. One that cannot be written only warns: the action
@@ -880,11 +904,15 @@ def _open_stopped(args: argparse.Namespace, ctx: Context, stop: BaseException) -
     """Log an ``open`` stopped by a signal (exit 128 plus its number). Its audit record, if
     any, was written once the output existed (``open_pane``); a run stopped before then has
     neither output nor error object, and gets none."""
+    exit_code, message = _stopped(stop)
+    ctx.log(_open_record(args, ctx, result="error", exit_code=exit_code, message=message))
+
+
+def _stopped(stop: BaseException) -> tuple[int, str]:
+    """The exit code (128 plus the signal number) and message of a run a signal stopped."""
     if isinstance(stop, Terminated):
-        signum, message = stop.signum, f"terminated by signal {stop.signum}"
-    else:
-        signum, message = int(signal.SIGINT), "interrupted"
-    ctx.log(_open_record(args, ctx, result="error", exit_code=128 + signum, message=message))
+        return 128 + stop.signum, f"terminated by signal {stop.signum}"
+    return 128 + int(signal.SIGINT), "interrupted"
 
 
 def _opened(ctx: Context, backend: Backend, created: Created, created_at: str) -> Result:
@@ -935,7 +963,60 @@ def _opened(ctx: Context, backend: Backend, created: Created, created_at: str) -
     return Result(data, ctx.open_id)
 
 
-COMMAND_STEPS = {"show": show, "exists": exists, "list": list_panes, "open": open_pane}
+# --- pane changes -------------------------------------------------------------------------------
+
+
+def _change_backend(ctx: Context) -> Backend:
+    """The backend for a pane change. The server may have gone since step 4: the pane went
+    with it (interface.md "Panes that vanish")."""
+    backend = connect(ctx)
+    if backend is None:
+        assert ctx.pane is not None
+        raise TermctlError(
+            "not_found", f"managed pane {ctx.pane.id} is gone (no tmux server is running)"
+        )
+    return backend
+
+
+def rename(args: argparse.Namespace, ctx: Context) -> Result:
+    """Set ``@termctl_name`` and recompute the displayed name, keeping a set marker; the
+    window is renamed only while termctl may (interface.md `rename`, "Names")."""
+    if args.dry_run:
+        # TODO(#22): rename --dry-run prints the pane as it would be (interface.md "Dry runs").
+        raise TermctlError("internal", f"{PROG} rename --dry-run is not implemented yet")
+    assert ctx.pane is not None and ctx.tmux is not None
+
+    def plan(pane: ManagedPane) -> Change:
+        shown = display.displayed_name(args.name, pane.marker_text, ctx.config.marker_display)
+        return Change(options={"@termctl_name": args.name}, display_name=shown)
+
+    outcome = change_pane(
+        _change_backend(ctx),
+        ctx.pane.id,
+        plan,
+        version=ctx.tmux.version,
+        environ=ctx.environ,
+        clock=ctx.clock,
+        warn=ctx.warn,
+        seen=() if ctx.pane_read is None else ctx.pane_read.warnings,
+    )
+    ctx.no_op = not outcome.changed
+    data = {
+        **outcome.pane.pane_object(_socket_path(ctx)),
+        "changed": outcome.changed,
+        "display_updated": outcome.display_updated,
+        "dry_run": False,
+    }
+    return Result(data, outcome.pane.display_name)
+
+
+COMMAND_STEPS = {
+    "show": show,
+    "exists": exists,
+    "list": list_panes,
+    "open": open_pane,
+    "rename": rename,
+}
 
 
 def run_command(args: argparse.Namespace, ctx: Context) -> Result:
@@ -946,7 +1027,8 @@ def run_command(args: argparse.Namespace, ctx: Context) -> Result:
     if args.command == "placements":
         labels = validate.parse_labels(args.labels) if args.labels else None
         return placement.report(ctx.config, labels)
-    # TODO: each remaining command lands in its own issue (#19-#24).
+    # TODO(#20): mark, unmark. TODO(#21): label add, label remove. TODO(#23): close.
+    # TODO(#24): focus.
     raise TermctlError("internal", f"{PROG} {args.command} is not implemented yet")
 
 
@@ -956,6 +1038,8 @@ def dispatch(args: argparse.Namespace, ctx: Context) -> Result:
     load_config(args, ctx)
     if args.command == "open" and not args.dry_run:
         return _logged_open(args, ctx)
+    if args.command in CHANGE_EVENTS and not args.dry_run:
+        return _logged_change(args, ctx)
     return _resolve_and_run(args, ctx)
 
 
@@ -1002,6 +1086,72 @@ def _logged_open(args: argparse.Namespace, ctx: Context) -> Result:
             err = internal_error(exc)
             _open_failed(args, ctx, err)
             raise err from exc
+
+
+# The pane-change commands, by their log.jsonl event (interface.md "Audit and log").
+# TODO(#20): mark, unmark; TODO(#21): label_add, label_remove.
+CHANGE_EVENTS = {"rename": "rename"}
+
+
+def _logged_change(args: argparse.Namespace, ctx: Context) -> Result:
+    """A pane change past step 1, not a dry run: one ``log.jsonl`` record for its outcome,
+    failures from step 2 on and a stop by a signal (exit 128 plus its number) included, except
+    a no-op, which writes no record at all (interface.md "Audit and log"). Its warnings are
+    printed at once; their ``warning`` records are held and written before that record, or
+    dropped with a no-op. Stop signals raise as for ``open`` (``stop_signals``) but are never
+    deferred: a change stopped after its write was applied is logged as stopped."""
+    ctx.logged = True
+    ctx.held_warnings = []
+    event = CHANGE_EVENTS[args.command]
+
+    def write(record: dict[str, Any]) -> None:
+        ctx.write_held_warnings()
+        ctx.log(record)
+
+    with stop_signals() as signals:
+        try:
+            result = _resolve_and_run(args, ctx)
+        except TermctlError as err:
+            signals.finish()
+            write(_change_record(ctx, event, "error", err.exit_code, err))
+            raise
+        except (KeyboardInterrupt, Terminated) as stop:
+            signals.finish()
+            exit_code, message = _stopped(stop)
+            write(_change_record(ctx, event, "error", exit_code, message=message))
+            raise
+        except Exception as exc:
+            signals.finish()
+            err = internal_error(exc)
+            write(_change_record(ctx, event, "error", err.exit_code, err))
+            raise err from exc
+        signals.finish()
+        if ctx.no_op:
+            ctx.held_warnings = None
+        else:
+            write(_change_record(ctx, event, "ok", result.exit_code))
+    return result
+
+
+def _change_record(
+    ctx: Context,
+    event: str,
+    result: str,
+    exit_code: int,
+    err: TermctlError | None = None,
+    *,
+    message: str | None = None,
+) -> dict[str, Any]:
+    return jsonlog.log_record(
+        ctx.clock.now(),
+        event=event,
+        result=result,
+        id=ctx.record_id(),
+        socket_path=ctx.socket_path(),
+        exit_code=exit_code,
+        message=message if err is None else err.message,
+        details=None if err is None else err.details,
+    )
 
 
 def internal_error(exc: Exception) -> TermctlError:

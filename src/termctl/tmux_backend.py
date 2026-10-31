@@ -208,9 +208,31 @@ def fields(*names: str) -> Format:
     return _format(" ".join(f"#{{{_fullmatch(_FIELD_NAME, n, 'field name')}}}" for n in names))
 
 
+def length_probe(*names: str) -> Format:
+    """``#{pane_id} #{window_id} #{@termctl_pane} #{@termctl_id} #{n:a} #{n:b}...``: who
+    answers (so a caller can tell a reused ``%N`` from its pane), then the length in bytes of
+    each named field or user option as stored, before tmux escapes it for output (a control
+    byte counts one, its escape text four). With ``window_name`` among the names it ends with
+    ``#{m/r:[<TAB><LF>],#{window_name}}``: 1 when the window name holds a tab or newline,
+    which the pane reader shows as a space (``record``), else 0."""
+    if not names:
+        raise ValueError("length_probe needs at least one name")
+    for name in names:
+        _fullmatch(_FIELD_NAME, name, "field name")
+    pieces = ["#{pane_id}", "#{window_id}", "#{@termctl_pane}", "#{@termctl_id}"]
+    pieces.extend(f"#{{n:{name}}}" for name in names)
+    if "window_name" in names:
+        pieces.append(_HAS_TAB_OR_NEWLINE)
+    # The names are checked above; _HAS_TAB_OR_NEWLINE holds the only control characters,
+    # which a format passed as one argv element carries to tmux unchanged.
+    return _new_format(" ".join(pieces))
+
+
 # tmux's regex substitution (#{s/re/replacement/:field}) with a literal tab and newline in the
 # bracket: POSIX ERE has no "\t" escape, and a ":" (as in "[[:space:]]") ends the modifier.
 _SANITIZE = "s/[\t\n]/ /:"
+# A regex match against the same bracket (verified on tmux 3.5a: 1 for a tab or a newline).
+_HAS_TAB_OR_NEWLINE = "#{m/r:[\t\n],#{window_name}}"
 _RECORD_SEPARATOR = "\t"
 _SENTINEL = re.compile(r"[A-Za-z0-9-]{16,64}")
 

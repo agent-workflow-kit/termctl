@@ -16,8 +16,8 @@ callers keep the ``with`` block around the read-modify-write only, and the hook 
 close-on-exec, so no child inherits it.
 """
 
-# TODO(#19): rename (then #20 mark/unmark, #21 labels) wraps its read-modify-write in
-# server_lock, with environ and clock from the CLI context.
+# pane_change.change_pane takes the lock for rename (and, through it, #20 mark/unmark and
+# #21 labels), with environ and clock from the CLI context.
 
 from __future__ import annotations
 

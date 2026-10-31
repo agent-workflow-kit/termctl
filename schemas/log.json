@@ -62,7 +62,7 @@
     },
     "exit_code": {
       "type": "integer",
-      "description": "Invocations that fail the usage check are not logged; a label limit checked after id resolution is (exit 2), and so are open's exit 2 from step 2 of its open order, its exit 1 (internal) and its exit 128 plus the signal number when a signal stopped it."
+      "description": "Invocations that fail the usage check (check order step 1) are not logged; every later exit is, for example exit 2 from step 2 of the check order or of open's open order, the exit 2 of a label limit checked after id resolution, exit 1 (internal), and exit 128 plus the signal number when a signal stopped the invocation."
     },
     "actor": {
       "$ref": "defs.json#/$defs/actor",

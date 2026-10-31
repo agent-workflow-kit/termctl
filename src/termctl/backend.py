@@ -11,22 +11,35 @@ implements it:
   (``open_cmd.create_window`` runs them in the order of interface.md "Open order" step 5).
 - ``tag_pane`` and ``cleanup_pane``: ``open``'s pane (Open order step 6, ``open_cmd.tag``).
 - ``record_process``: ``open``'s PID recording (Open order step 7, ``open_cmd.record``).
-- TODO(#19): ``rename``; TODO(#20): ``mark`` and ``unmark``; TODO(#21): label changes.
+- ``write_pane`` and ``byte_lengths``: the guarded read-modify-write of a managed pane's
+  options and window name (``pane_change.py``); ``rename`` uses them, and TODO(#20) ``mark``
+  and ``unmark`` and TODO(#21) label changes reuse them.
 - TODO(#23): ``close``; TODO(#24): ``focus``.
 """
 
 from __future__ import annotations
 
 import enum
+import re
 import subprocess
-from collections.abc import Callable, Sequence
+from collections.abc import Callable, Mapping, Sequence
 from typing import NamedTuple, Protocol
 
 from . import panes
 from . import tmux_backend as tb
 from .errors import TermctlError
-from .panes import PaneRead
-from .tmux_backend import Tmux, WindowSpec
+from .panes import ManagedPane, PaneRead
+from .tmux_backend import (
+    GuardOutcome,
+    Invocation,
+    Tmux,
+    WindowSpec,
+    check_guard,
+    command,
+    tmux_failure,
+)
+
+_LENGTH = re.compile(r"0|[1-9][0-9]{0,9}")
 
 
 class SessionState(enum.Enum):
@@ -112,6 +125,23 @@ class Backend(Protocol):
         guarded by its being managed as ``termctl_id``, not dead and still running ``pid``.
         A tmux call that cannot be made (timeout, missing binary) is ``FAILED``; never
         raises for a tmux failure."""
+        ...
+
+    def write_pane(
+        self, pane: ManagedPane, options: Mapping[str, str], window_name: str | None
+    ) -> bool:
+        """Set ``options`` on ``pane`` and, with ``window_name``, rename its window while
+        termctl may (interface.md "Names"); every write is guarded by the pane's ownership.
+        Returns whether the window was renamed. A pane that is gone or no longer the one
+        resolved exits 10 (``not_found``)."""
+        ...
+
+    def byte_lengths(self, pane: ManagedPane, names: Sequence[str]) -> tuple[int, ...] | None:
+        """The stored length in bytes of each named field or option of ``pane``, or None when
+        tmux does not answer with one number per name, when the pane that answers is not
+        ``pane`` (its pane id, window id, ``@termctl_pane`` and ``@termctl_id``), or when
+        ``window_name`` is among the names and holds a tab or newline. The probe is read-only:
+        a mismatch can only turn a no-op into a guarded rewrite."""
         ...
 
 
@@ -224,3 +254,52 @@ class TmuxBackend:
             f"tmux failed: {tb.tmux_message(result)}",
             details={"socket_path": self.socket_path},
         )
+
+    def write_pane(
+        self, pane: ManagedPane, options: Mapping[str, str], window_name: str | None
+    ) -> bool:
+        """One guarded invocation when the window may be renamed: the options and
+        ``rename-window`` under ``owned_single_pane_window``, so both happen or neither. If that
+        guard does not match (the window was split, or the pane moved, since it was read; or
+        the pane is gone), the options alone under ``owned``; if that does not match either,
+        the pane is gone or no longer the one resolved: exit 10. ``options`` must not be
+        empty: every pane change writes at least one option."""
+        if not options:
+            raise ValueError("write_pane needs options")
+        target = tb.pane(pane.pane_id)
+        sets = [
+            command("set").flag("-p").target(target).arg(name).arg(value).build()
+            for name, value in options.items()
+        ]
+        if window_name is not None:
+            rename = command("rename-window").target(target).name(window_name).build()
+            guard = tb.guarded(target, tb.owned_single_pane_window(pane.id), *sets, rename)
+            result = self.tmux.run(Invocation.of(guard), utf8=True)
+            outcome = tb.guard_outcome(result)
+            if outcome is GuardOutcome.FAILED:
+                raise tmux_failure(result, pane.id, self.socket_path)
+            if outcome is GuardOutcome.MATCHED:
+                return True
+        guard = tb.guarded(target, tb.owned(pane.id), *sets)
+        check_guard(self.tmux.run(Invocation.of(guard), utf8=True), pane.id, self.socket_path)
+        return False
+
+    def byte_lengths(self, pane: ManagedPane, names: Sequence[str]) -> tuple[int, ...] | None:
+        probe = command("display").flag("-p").target(tb.pane(pane.pane_id))
+        result = self.tmux.run(
+            Invocation.of(probe.format_arg(tb.length_probe(*names)).build()), utf8=True
+        )
+        lines = result.stdout.splitlines()
+        if result.returncode != 0 or len(lines) != 1:
+            return None
+        values = lines[0].split(" ")
+        identity = [pane.pane_id, pane.window_id, pane.pane_id, pane.id]
+        flags = ["0"] if "window_name" in names else []
+        if len(values) != len(identity) + len(names) + len(flags):
+            return None
+        lengths = values[len(identity) : len(identity) + len(names)]
+        if values[: len(identity)] != identity or values[len(values) - len(flags) :] != flags:
+            return None
+        if not all(_LENGTH.fullmatch(v) for v in lengths):
+            return None
+        return tuple(int(v) for v in lengths)
