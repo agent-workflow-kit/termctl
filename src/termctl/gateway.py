@@ -69,14 +69,15 @@ class SystemGateway:
         """Run ``argv`` without a shell and capture its output as text.
 
         ``env`` replaces the whole environment when given; ``None`` inherits termctl's own.
-        Output is read as bytes and decoded as ``os.fsdecode`` does (UTF-8, each undecodable
-        byte kept as a lone surrogate, the way argv is decoded), with no newline translation, so
-        a ``\r`` in tmux's output reads back as ``\r`` and no byte makes the call fail.
-        ``stdin`` is encoded the same way.
+        Output is read as bytes and decoded with ``.decode("utf-8", "surrogateescape")``
+        whatever the locale (tmux runs with ``-u`` and writes UTF-8; each undecodable byte is
+        kept as a lone surrogate), with no newline translation, so a ``\r`` in tmux's output
+        reads back as ``\r`` and no byte makes the call fail. ``stdin`` is encoded with
+        ``.encode("utf-8", "surrogateescape")``.
         """
         completed = subprocess.run(
             argv,
-            input=None if stdin is None else os.fsencode(stdin),
+            input=None if stdin is None else stdin.encode("utf-8", "surrogateescape"),
             capture_output=True,
             timeout=timeout,
             env=None if env is None else dict(env),
@@ -85,8 +86,8 @@ class SystemGateway:
         return subprocess.CompletedProcess(
             completed.args,
             completed.returncode,
-            os.fsdecode(completed.stdout),
-            os.fsdecode(completed.stderr),
+            completed.stdout.decode("utf-8", "surrogateescape"),
+            completed.stderr.decode("utf-8", "surrogateescape"),
         )
 
     def current_dir(self) -> str:

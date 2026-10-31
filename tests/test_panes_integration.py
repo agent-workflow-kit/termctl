@@ -19,6 +19,7 @@ from termctl.errors import TermctlError
 from termctl.panes import PaneRead
 
 from .conftest import TMUX_VERSION, TmuxServer, wait_for
+from .schemas import validate
 
 pytestmark = pytest.mark.tmux
 
@@ -243,7 +244,19 @@ def test_a_dead_pane_reports_its_exit_signal(tmux_server: TmuxServer) -> None:
     assert wait_for(lambda: read(tmux_server).panes[0].exit_signal == 9)
     (pane,) = read(tmux_server).panes
     assert pane.exit_status is None
-    pane.pane_object("/tmp/x/s")  # never both exit fields
+    obj = pane.pane_object(tmux_server.socket_path)
+    validate(obj, "termctl/cli/pane.json")
+    assert (obj["state"], obj["exit_status"], obj["exit_signal"]) == ("dead", None, 9)
+
+
+def test_a_server_without_sessions_is_running_with_no_panes(tmux_server: TmuxServer) -> None:
+    started = tmux_server.raw(
+        "-f", "/dev/null", "start-server", ";", "set", "-s", "exit-empty", "off"
+    )  # fmt: skip
+    assert started.returncode == 0, started.stderr
+    sessions = tmux_server.raw("list-sessions")
+    assert (sessions.returncode, sessions.stdout) == (0, "")  # running, with no session
+    assert read(tmux_server) == PaneRead(server_running=True, panes=(), warnings=())
 
 
 # --- no server ----------------------------------------------------------------------------------

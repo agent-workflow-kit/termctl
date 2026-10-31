@@ -949,9 +949,9 @@ def test_guard_outcome(rc: int, stdout: str, outcome: GuardOutcome) -> None:
 
 def test_check_guard_raises_not_found_on_a_nomatch() -> None:
     with pytest.raises(TermctlError) as info:
-        tb.check_guard(_result(0, "termctl-nomatch\n"), "tc-abcdefgh")
+        tb.check_guard(_result(0, "termctl-nomatch\n"), "tc-abcdefgh", SOCK)
     assert info.value.code == "not_found" and info.value.exit_code == 10
-    tb.check_guard(_result(0, ""), "tc-abcdefgh")
+    tb.check_guard(_result(0, ""), "tc-abcdefgh", SOCK)
 
 
 def _failed(stderr: str, rc: int = 1) -> subprocess.CompletedProcess[str]:
@@ -971,7 +971,7 @@ def _failed(stderr: str, rc: int = 1) -> subprocess.CompletedProcess[str]:
 )
 def test_check_guard_maps_a_vanished_pane_to_not_found(stderr: str) -> None:
     with pytest.raises(TermctlError) as info:
-        tb.check_guard(_failed(stderr), ID)
+        tb.check_guard(_failed(stderr), ID, SOCK)
     assert info.value.code == "not_found" and info.value.exit_code == 10
     assert ID in info.value.message
 
@@ -993,32 +993,51 @@ def test_check_guard_maps_other_failures_to_server_unavailable(stderr: str) -> N
     """Never a match, and never not_found unless tmux said the pane, window, session or server
     is gone."""
     with pytest.raises(TermctlError) as info:
-        tb.check_guard(_failed(stderr), ID)
+        tb.check_guard(_failed(stderr), ID, SOCK)
     assert info.value.code == "server_unavailable" and info.value.exit_code == 12
 
 
 def test_check_guard_maps_a_killed_tmux_to_server_unavailable() -> None:
     with pytest.raises(TermctlError) as info:
-        tb.check_guard(_failed("can't find pane: %9\n", rc=-9), ID)
+        tb.check_guard(_failed("can't find pane: %9\n", rc=-9), ID, SOCK)
     assert info.value.code == "server_unavailable"
 
 
 def test_tmux_failure_message_is_one_bounded_line() -> None:
-    err = tb.tmux_failure(_failed("unknown command: " + "x" * 5000 + "\nsecond line\n"), ID)
+    err = tb.tmux_failure(_failed("unknown command: " + "x" * 5000 + "\nsecond line\n"), ID, SOCK)
     assert "second line" not in err.message
     assert len(err.message) < 400
 
 
 def test_is_no_server_only_on_a_refused_connection() -> None:
-    assert tb.is_no_server(_failed("no server running on /tmp/x/s\n"))
-    assert not tb.is_no_server(_failed("error connecting to /tmp/x/s (Permission denied)\n"))
+    def no_server(stderr: str) -> bool:
+        return tb.is_no_server(_failed(stderr), "/tmp/x/s")
+
+    assert no_server("no server running on /tmp/x/s\n")
+    assert not no_server("error connecting to /tmp/x/s (Permission denied)\n")
     # A missing socket file or parent directory (#8 checks the filesystem first; this covers a
     # socket removed in between). tmux sets only LC_CTYPE and LC_TIME, so strerror is English.
-    assert tb.is_no_server(_failed("error connecting to /tmp/x/s (No such file or directory)\n"))
-    assert not tb.is_no_server(_failed("error connecting to /tmp/x/s (Not a directory)\n"))
-    assert not tb.is_no_server(_failed("can't find pane: %1\n"))
+    assert no_server("error connecting to /tmp/x/s (No such file or directory)\n")
+    assert not no_server("error connecting to /tmp/x/s (Not a directory)\n")
+    assert not no_server("can't find pane: %1\n")
     no_server_but_ok = subprocess.CompletedProcess(["tmux"], 0, "", "no server running on /x\n")
-    assert not tb.is_no_server(no_server_but_ok)
+    assert not tb.is_no_server(no_server_but_ok, "/x")
+
+
+@pytest.mark.parametrize(
+    "stderr",
+    [
+        # A server hook (or anything else) printing the text first does not make it no-server.
+        "hook output\nno server running on /tmp/x/s\n",
+        "x\nerror connecting to /tmp/x/s (No such file or directory)\n",
+        "no server running on /tmp/x/other\n",
+        "no server running on /tmp/x/s and more\n",
+        "error connecting to /tmp/x/other (No such file or directory)\n",
+        " no server running on /tmp/x/s\n",
+    ],
+)
+def test_is_no_server_only_on_the_exact_first_line_for_this_socket(stderr: str) -> None:
+    assert not tb.is_no_server(_failed(stderr), "/tmp/x/s")
 
 
 # --- the runner ---------------------------------------------------------------------------------

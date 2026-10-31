@@ -69,7 +69,7 @@ Terminal placement, tmux backend. Layer 1 (primitive), fully standalone (archite
 | `ids.py` | id generation and prefix resolution |
 | `validate.py` | input grammars: name, label, marker, session, placement, env-name, duration, actor (and its default), decision-id, client, socket and cwd |
 | `placement.py` | placement and rule resolution |
-| `backend.py` | the `Backend` protocol (open, close, list, rename, mark, focus, labels) |
+| `backend.py` | the `Backend` protocol (open, close, list, rename, mark, focus, labels) and its tmux implementation `TmuxBackend` |
 | `tmux_backend.py` | the tmux argument builder ([tmux argument rules](interface.md#tmux-argument-rules)), guarded writes (`if-shell` wrapping, D28), format strings, command chains, version check, server env filtering, socket path resolution and socket directory checks (D26) |
 | `panes.py` | the pane reader: parses `list-panes -a -F` records, applies the ownership check and validates every `@termctl_*` value (D27) |
 | `procs.py` | process start time and parent check for the recorded PID, the `close --force` signal sequence |

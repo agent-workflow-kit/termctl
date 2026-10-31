@@ -224,7 +224,9 @@ def record(names: Sequence[str], sanitized: Collection[str], sentinel: str) -> F
     other control characters on output. Every other field is read as is: a tab or newline in
     one (only a value someone else wrote can hold one) breaks its record, which the reader
     detects. The sentinel ends each record; it is a fresh random token per read, so no value
-    can forge the end of a record.
+    can forge the end of a record. It does not protect against server hooks or commands run by
+    someone with socket access: an ``after-list-panes`` hook sees the format, sentinel
+    included, and can print a forged record.
     """
     names = tuple(names)
     if not names:
@@ -871,12 +873,11 @@ def guard_outcome(result: subprocess.CompletedProcess[str]) -> GuardOutcome:
     return GuardOutcome.MATCHED
 
 
-# What tmux prints when it cannot reach a server (client.c): a refused connection, and a missing
-# socket file or parent directory. tmux sets only LC_CTYPE and LC_TIME from the environment, so
-# strerror (the text in parentheses) is not translated.
-_NO_SERVER_PREFIX = "no server running on "
-_CONNECT_PREFIX = "error connecting to "
-_CONNECT_MISSING_SUFFIX = " (No such file or directory)"
+# What tmux prints when it cannot reach a server (client.c), naming the -S path exactly as given:
+# a refused connection, and a missing socket file or parent directory. tmux sets only LC_CTYPE and
+# LC_TIME from the environment, so strerror (the text in parentheses) is not translated.
+_NO_SERVER = "no server running on {}"
+_CONNECT_MISSING = "error connecting to {} (No such file or directory)"
 # What tmux prints when a target is gone (cmd-find.c).
 _GONE_PREFIXES = ("can't find pane: ", "can't find window: ", "can't find session: ")
 _MESSAGE_MAX = 200
@@ -886,16 +887,20 @@ def _stderr_lines(result: subprocess.CompletedProcess[str]) -> list[str]:
     return result.stderr.splitlines()
 
 
-def is_no_server(result: subprocess.CompletedProcess[str]) -> bool:
-    """Whether a failed tmux call failed because no server runs on the socket (interface.md
+def is_no_server(result: subprocess.CompletedProcess[str], socket_path: str) -> bool:
+    """Whether a failed tmux call failed because no server runs on ``socket_path`` (interface.md
     "Server selection": the connection is refused, or the socket file or its parent directory
-    does not exist). Any other connection error, such as permission denied, is not."""
+    does not exist). Any other connection error, such as permission denied, is not.
+
+    Only stderr's first line counts, and it must be exactly tmux's message for this socket: a
+    server hook can print any text, but only after tmux has connected.
+    """
     if result.returncode == 0:
         return False
-    return any(
-        line.startswith(_NO_SERVER_PREFIX)
-        or (line.startswith(_CONNECT_PREFIX) and line.endswith(_CONNECT_MISSING_SUFFIX))
-        for line in _stderr_lines(result)
+    lines = _stderr_lines(result)
+    return bool(lines) and lines[0] in (
+        _NO_SERVER.format(socket_path),
+        _CONNECT_MISSING.format(socket_path),
     )
 
 
@@ -912,25 +917,30 @@ def tmux_message(result: subprocess.CompletedProcess[str]) -> str:
     return first if len(first) <= _MESSAGE_MAX else first[:_MESSAGE_MAX] + "..."
 
 
-def tmux_failure(result: subprocess.CompletedProcess[str], termctl_id: str) -> TermctlError:
-    """The error for a failed tmux call that acts on managed pane ``termctl_id`` after id
-    resolution (interface.md "Panes that vanish"): ``not_found`` (exit 10) when tmux says the
+def tmux_failure(
+    result: subprocess.CompletedProcess[str], termctl_id: str, socket_path: str
+) -> TermctlError:
+    """The error for a failed tmux call on ``socket_path`` that acts on managed pane
+    ``termctl_id`` after id resolution (interface.md "Panes that vanish"): ``not_found`` (exit
+    10) when tmux says the
     pane, window or session is gone, or that no server runs any more (the pane went with it);
     ``server_unavailable`` (exit 12) for anything else, a tmux killed by a signal included.
     ``close`` counts the first case as closed instead."""
-    if result.returncode > 0 and (_is_gone(result) or is_no_server(result)):
+    if result.returncode > 0 and (_is_gone(result) or is_no_server(result, socket_path)):
         return TermctlError(
             "not_found", f"managed pane {termctl_id} is gone ({tmux_message(result)})"
         )
     return TermctlError("server_unavailable", f"tmux failed: {tmux_message(result)}")
 
 
-def check_guard(result: subprocess.CompletedProcess[str], termctl_id: str) -> None:
+def check_guard(
+    result: subprocess.CompletedProcess[str], termctl_id: str, socket_path: str
+) -> None:
     """Raise ``not_found`` (exit 10) on ``NOMATCH``, and ``tmux_failure`` on ``FAILED``;
     ``close`` instead treats ``NOMATCH`` as already closed and calls ``guard_outcome``."""
     outcome = guard_outcome(result)
     if outcome is GuardOutcome.FAILED:
-        raise tmux_failure(result, termctl_id)
+        raise tmux_failure(result, termctl_id, socket_path)
     if outcome is GuardOutcome.NOMATCH:
         raise TermctlError(
             "not_found", f"managed pane {termctl_id} is gone or no longer the one resolved"

@@ -9,6 +9,7 @@ from __future__ import annotations
 
 import os
 import shlex
+import socket
 import subprocess
 from pathlib import Path
 
@@ -847,3 +848,14 @@ def test_verbose_trace_hides_env_values(tmux_server: TmuxServer) -> None:
     )
     assert tmux_server.tmux(trace).run(Invocation.of(cmd)).returncode == 0
     assert len(trace) == 1 and "TOKEN" in trace[0] and "hunter2" not in trace[0]
+
+
+def test_is_no_server_matches_the_socket_path_tmux_prints(tmux_server: TmuxServer) -> None:
+    """tmux names the -S path exactly as given (no realpath), here for both no-server texts."""
+    missing = tmux_server.raw("list-panes", "-a")
+    assert tb.is_no_server(missing, tmux_server.socket_path), missing.stderr
+    stale = socket.socket(socket.AF_UNIX)
+    stale.bind(tmux_server.socket_path)
+    stale.close()
+    refused = tmux_server.raw("list-panes", "-a")
+    assert tb.is_no_server(refused, tmux_server.socket_path), refused.stderr

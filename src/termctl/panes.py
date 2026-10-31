@@ -2,18 +2,21 @@
 (interface.md "Pane options", "Managed panes", "Liveness", `list`; design.md D27).
 
 One tab-separated record per pane row, ended by a sentinel that is a fresh random token per
-read. The free-text fields tmux controls (session and window names) are read with tab and newline
-replaced by spaces in the format string; the ``@termctl_*`` options are read as is, so a value
-holding a tab or newline (one termctl never writes) breaks its record and the pane is ignored
-with a warning instead of being read wrongly. tmux prints the other control characters of every
-field escaped (``\\033``), and with ``-u`` writes UTF-8 whatever the locale.
+read, so data inside a value cannot end a record; it does not protect against server hooks or
+commands run by someone with socket access (a hook can see the format, sentinel included, and
+print a forged record). The free-text fields tmux controls (session and window names) are read
+with tab and newline replaced by spaces in the format string; the ``@termctl_*`` options are read
+as is, so a value holding a tab or newline (one termctl never writes) breaks its record and the
+pane is ignored with a warning instead of being read wrongly. tmux prints the other control
+characters of every field escaped (``\\033``), and with ``-u`` writes UTF-8 whatever the locale.
 
 A pane is managed only if its ``@termctl_pane`` equals its own pane id: a ``#{@...}`` format
 also returns values inherited from the window, session or global scope (spike F4), and such a
-value names another pane, or none. Every other ``@termctl_*`` value of a managed pane is checked
-against its grammar; a pane with a missing or invalid value, or an unknown ``@termctl_v``, is
-ignored with a warning. A window linked into several sessions gives one row per session
-(spike D6); the reader keeps one pane per pane id, with every session it is linked into.
+value names another pane, or none, unless it was deliberately set to name this pane (forgery).
+Every other ``@termctl_*`` value of a managed pane is checked against its grammar; a pane with
+a missing or invalid value, or an unknown ``@termctl_v``, is ignored with a warning. A window
+linked into several sessions gives one row per session (spike D6); the reader keeps one pane
+per pane id, with every session it is linked into.
 
 Everything read here is untrusted: anything with socket access can write these options and
 rename sessions and windows (interface.md "Residual risks").
@@ -84,7 +87,8 @@ State = Literal["running", "dead"]
 
 
 def new_sentinel() -> str:
-    """A fresh end-of-record token: unknown to anything that could write a pane option."""
+    """A fresh end-of-record token, unknown to anything that only writes a pane option value
+    (not to a server hook, which can see the format it ends)."""
     return _SENTINEL_PREFIX + secrets.token_hex(8)
 
 
@@ -166,17 +170,25 @@ class PaneRead:
     warnings: tuple[str, ...]
 
 
+# What list-panes -a prints, alone, on a running server with no sessions (tmux 3.5a).
+_NO_TARGET = "no current target"
+
+
 def read(tmux: Tmux, *, sentinel: str | None = None) -> PaneRead:
     """Read every managed pane of ``tmux``'s server with one ``list-panes -a``.
 
-    A refused connection, or a socket file or directory that does not exist, is no server; any
-    other tmux failure exits 12 (``server_unavailable``). The read never starts a server.
+    A refused connection, or a socket file or directory that does not exist, is no server. A
+    running server with no sessions makes tmux exit 1 with exactly ``no current target``: no
+    panes. Any other tmux failure exits 12 (``server_unavailable``). The read never starts a
+    server.
     """
     token = new_sentinel() if sentinel is None else sentinel
     result = tmux.run(invocation(token), utf8=True)
     if result.returncode != 0:
-        if is_no_server(result):
+        if is_no_server(result, tmux.socket_path):
             return PaneRead(server_running=False, panes=(), warnings=())
+        if result.returncode == 1 and result.stderr.splitlines() == [_NO_TARGET]:
+            return PaneRead(server_running=True, panes=(), warnings=())
         raise TermctlError("server_unavailable", f"cannot list the panes: {tmux_message(result)}")
     found, warnings = parse(result.stdout, token)
     return PaneRead(server_running=True, panes=found, warnings=warnings)
@@ -190,7 +202,9 @@ def parse(stdout: str, sentinel: str) -> tuple[tuple[ManagedPane, ...], tuple[st
     """The managed panes in ``list-panes`` output and the warnings for those ignored.
 
     Records are split at ``<TAB><sentinel><NEWLINE>``; anything after the last one (a cut-off
-    record) is ignored with a warning. Rows are merged by pane id before they are checked.
+    record) is ignored with a warning. The sentinel guards against data inside values, not
+    against output from server hooks or from anyone with socket access. Rows are merged by pane
+    id before they are checked.
     """
     terminator = "\t" + sentinel + "\n"
     chunks = stdout.split(terminator)

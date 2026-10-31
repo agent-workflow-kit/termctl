@@ -561,6 +561,9 @@ def test_read_reports_no_server(stderr: str) -> None:
         f"error connecting to {SOCK} (Permission denied)\n",
         "server exited unexpectedly\n",
         "",
+        "no current target: %1\n",
+        "something else\nno current target\n",
+        "no current target\nsomething else\n",
     ],
 )
 def test_read_maps_other_failures_to_server_unavailable(stderr: str) -> None:
@@ -568,6 +571,14 @@ def test_read_maps_other_failures_to_server_unavailable(stderr: str) -> None:
     with pytest.raises(TermctlError) as info:
         panes.read(tmux, sentinel=SENTINEL)
     assert info.value.code == "server_unavailable"
+
+
+def test_read_of_a_server_without_sessions_is_running_with_no_panes() -> None:
+    """tmux 3.5a: list-panes -a on a server with no sessions exits 1, "no current target"."""
+    tmux, _ = _tmux(rc=1, err="no current target\n")
+    assert panes.read(tmux, sentinel=SENTINEL) == PaneRead(
+        server_running=True, panes=(), warnings=()
+    )
 
 
 def test_read_generates_a_fresh_sentinel_each_time(monkeypatch: pytest.MonkeyPatch) -> None:

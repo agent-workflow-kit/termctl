@@ -1,5 +1,6 @@
 from __future__ import annotations
 
+import ast
 import os
 import pwd
 import sys
@@ -8,6 +9,7 @@ from pathlib import Path
 
 import pytest
 
+import termctl
 from termctl.gateway import Clock, Gateway, SystemClock, SystemGateway
 
 from .fakes import FakeClock, FakeGateway
@@ -22,6 +24,43 @@ def test_system_gateway_passes_stdin_and_env() -> None:
     script = "import os, sys; print(sys.stdin.read() + os.environ['X'])"
     result = SystemGateway().run([sys.executable, "-c", script], stdin="a", env={"X": "b"})
     assert result.stdout == "ab\n"
+
+
+# The child writes UTF-8 (a bell emoji and an accent) plus one invalid byte to stdout and
+# stderr, and echoes stdin back as bytes.
+_CHILD = (
+    "import sys; data = sys.stdin.buffer.read();"
+    "sys.stdout.buffer.write(data + b'caf\\xc3\\xa9 \\xf0\\x9f\\x94\\x94 \\xff');"
+    "sys.stderr.buffer.write(b'\\xc3\\xa9\\xff')"
+)
+_IN_ASCII_LOCALE = """
+import sys
+from termctl.gateway import SystemGateway
+r = SystemGateway().run([sys.executable, "-c", sys.argv[1]], stdin="\\u00e9\\udcfe")
+print(ascii((sys.getfilesystemencoding(), r.stdout, r.stderr)))
+"""
+
+
+def test_system_gateway_reads_and_writes_utf8_whatever_the_locale() -> None:
+    """tmux runs with -u and writes UTF-8, so output is decoded as UTF-8 (an undecodable byte
+    kept as a lone surrogate) even when termctl runs in a non-UTF-8 locale."""
+    src = str(Path(termctl.__file__).parent.parent)
+    env = {
+        "PATH": os.environ.get("PATH", "/usr/bin:/bin"),
+        "LC_ALL": "C",
+        "PYTHONCOERCECLOCALE": "0",
+        "PYTHONUTF8": "0",
+        "PYTHONPATH": src,
+    }
+    result = SystemGateway().run(
+        [sys.executable, "-c", _IN_ASCII_LOCALE, _CHILD], env=env, timeout=60
+    )
+    assert result.returncode == 0, result.stderr
+    fs_encoding, stdout, stderr = ast.literal_eval(result.stdout)
+    if fs_encoding.lower().replace("-", "") == "utf8":
+        pytest.skip("this host forces a UTF-8 filesystem encoding")
+    assert stdout == "\u00e9\udcfecaf\u00e9 \U0001f514 \udcff"
+    assert stderr == "\u00e9\udcff"
 
 
 def test_system_clock_is_timezone_aware_and_monotonic() -> None:
