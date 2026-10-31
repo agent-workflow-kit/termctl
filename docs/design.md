@@ -70,7 +70,8 @@ Terminal placement, tmux backend. Layer 1 (primitive), fully standalone (archite
 | `validate.py` | input grammars: name, label, marker, session, placement, env-name, duration, actor (and its default), decision-id, client, socket and cwd |
 | `placement.py` | placement and rule resolution |
 | `backend.py` | the `Backend` protocol (open, close, list, rename, mark, focus, labels) |
-| `tmux_backend.py` | the tmux argument builder ([tmux argument rules](interface.md#tmux-argument-rules)), guarded writes (`if-shell` wrapping, D28), format strings, command chains, version check, server env filtering, socket path resolution and socket directory checks (D26) |
+| `tmux_backend.py` | the tmux argument builder ([tmux argument rules](interface.md#tmux-argument-rules)), guarded writes (`if-shell` wrapping, D28), format strings, command chains, server env filtering, socket path resolution and socket directory checks (D26) |
+| `tmux_bin.py` | `tmux_bin` resolution to an absolute path on the caller's `PATH` and the `tmux -V` version check (3.2 floor) |
 | `panes.py` | the pane reader: parses `list-panes -a -F` records, applies the ownership check and validates every `@termctl_*` value (D27) |
 | `procs.py` | process start time and parent check for the recorded PID, the `close --force` signal sequence |
 | `gateway.py` | the only module that runs subprocesses or touches the filesystem outside config and logs (tmux, `ps`, `/proc`, socket `stat`, the cwd check, stdin TTY test and OS user name, BEL write); also holds the injectable clock |

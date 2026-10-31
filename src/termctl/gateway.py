@@ -36,6 +36,10 @@ class Gateway(Protocol):
         """Whether ``path`` exists and is a directory (symlinks followed)."""
         ...
 
+    def is_executable_file(self, path: str) -> bool:
+        """Whether ``path`` is a regular file (symlinks followed) the real uid may execute."""
+        ...
+
     def stdin_isatty(self) -> bool:
         """Whether stdin (fd 0) is a terminal."""
         ...
@@ -85,6 +89,12 @@ class SystemGateway:
 
     def is_dir(self, path: str) -> bool:
         return os.path.isdir(path)
+
+    def is_executable_file(self, path: str) -> bool:
+        try:
+            return os.path.isfile(path) and os.access(path, os.X_OK)
+        except ValueError:  # an embedded NUL
+            return False
 
     def stdin_isatty(self) -> bool:
         return os.isatty(0)

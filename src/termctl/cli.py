@@ -14,13 +14,14 @@ from collections.abc import Mapping, Sequence
 from dataclasses import dataclass, field
 from typing import Any, NoReturn, TextIO
 
-from . import __version__, ids, validate
+from . import __version__, ids, tmux_bin, validate
 from . import config as config_module
 from .argv import Scan, scan
 from .config import Config
 from .errors import TermctlError, UsageError
 from .gateway import Clock, Gateway, SystemClock, SystemGateway
 from .output import PROG, Output, Result, flush_standard_streams
+from .tmux_bin import TmuxBinary
 
 __all__ = ["Context", "Output", "Result", "main", "parse_args"]
 
@@ -34,6 +35,8 @@ class Context:
     environ: Mapping[str, str]
     out: Output = field(repr=False)
     config: Config = field(default_factory=config_module.defaults)
+    # The resolved tmux binary and version, set once by the tmux checks (step 3).
+    tmux: TmuxBinary | None = None
 
 
 # --- argument parsing ---------------------------------------------------------------------------
@@ -407,7 +410,12 @@ def resolve_server(args: argparse.Namespace, ctx: Context) -> None:
 
 def check_tmux(args: argparse.Namespace, ctx: Context) -> None:
     """Step 3: tmux binary, version and socket safety checks (exit 12)."""
-    # TODO: tmux binary and version - issue #10; socket safety - issue #8
+    if ctx.tmux is None:
+        # TODO(#5): a version warning also gets a `warning` log record in logged commands.
+        ctx.tmux = tmux_bin.probe(
+            ctx.config.tmux_bin, ctx.environ, ctx.gateway, ctx.out.warn, ctx.out.trace
+        )
+    # TODO: socket safety - issue #8
 
 
 def resolve_id(args: argparse.Namespace, ctx: Context) -> None:
