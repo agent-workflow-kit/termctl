@@ -776,6 +776,32 @@ def test_gone_at_the_step_1_probe_with_its_process_alive_warns_and_never_signals
     assert all(handle.closed for handle in gateway.handles)
 
 
+def foreign_proc(gateway: FakeGateway, monkeypatch: pytest.MonkeyPatch) -> None:
+    """A ``/proc`` of another PID namespace, where the recorded PID names no process, while
+    the handle (termctl's namespace) still names the live process."""
+    gateway.own_namespace = False
+
+    def read_proc_stat(pid: int) -> str | None:
+        gateway.proc_reads.append(pid)
+        return None
+
+    monkeypatch.setattr(gateway, "read_proc_stat", read_proc_stat)
+
+
+def test_gone_at_the_step_1_probe_trusts_the_handle_not_a_foreign_proc(
+    monkeypatch: pytest.MonkeyPatch,
+) -> None:
+    gateway, clock = gateway_for(responses={QUERY: NOMATCH})
+    hook(gateway, "gate", changing(gateway, []))
+    foreign_proc(gateway, monkeypatch)
+    result = close([ID, "--force", *HUMAN, "--hook", "pre-close=gate"], gateway, clock)
+    data = result.output()
+    assert (data["pid_mismatch"], data["exited"], data["signals_sent"]) == (True, None, [])
+    assert "the pane was gone before process 4242 could be checked" in result.stderr
+    assert gateway.signals == []
+    assert gateway.proc_reads == []
+
+
 def test_gone_at_the_step_1_probe_but_listed_at_the_re_check_is_never_signaled() -> None:
     result = forced(responses={QUERY: NOMATCH})
     data = result.output()
@@ -1050,6 +1076,19 @@ def test_dry_run_of_a_pane_gone_at_the_probe_with_its_process_alive_warns() -> N
     data = dry_output(result)
     assert (data["pid_mismatch"], data["signals_possible"]) == (True, [])
     assert "a real run would not signal the recorded process" in result.stderr
+
+
+def test_dry_run_of_a_pane_gone_at_the_probe_with_a_foreign_proc_warns(
+    monkeypatch: pytest.MonkeyPatch,
+) -> None:
+    gateway, clock = gateway_for(responses={QUERY: NOMATCH})
+    foreign_proc(gateway, monkeypatch)
+    result = close([ID, "--force", *HUMAN, "--dry-run"], gateway, clock)
+    data = dry_output(result)
+    assert (data["pid_mismatch"], data["signals_possible"]) == (True, [])
+    assert "/proc belongs to another PID namespace than termctl" in result.stderr
+    assert "a real run would not signal the recorded process" in result.stderr
+    assert gateway.proc_reads == []
 
 
 def test_dry_run_of_a_running_pane_without_force_is_refused() -> None:

@@ -240,7 +240,8 @@ def close(
 
 def gone_at_probe(gateway: Gateway, pid: int, warn: Warn) -> bool:
     """For a pane gone at step 1's probe, which therefore proved nothing: whether its recorded
-    process has exited (no such process, or a zombie, as its handle shows). Otherwise, or
+    process has exited (no such process, or a zombie, as its handle shows; only a handle that
+    cannot tell, on macOS, falls back to reading the process). Otherwise, or
     when that cannot be told, a warning: the process cannot be checked and is not signaled
     (``pid_mismatch``)."""
     try:
@@ -251,7 +252,9 @@ def gone_at_probe(gateway: Gateway, pid: int, warn: Warn) -> bool:
         exited = handle is None
     if handle is not None:
         try:
-            exited = handle.exited() or _exited(gateway, pid)
+            # On Linux the pidfd alone tells; /proc may show another PID namespace, which
+            # this path never checked. Only a handle that cannot tell (macOS) reads it.
+            exited = handle.exited() or (gateway.platform() == "darwin" and _exited(gateway, pid))
         finally:
             handle.close()
     if not exited:
@@ -421,13 +424,18 @@ def dry_run(
     when the recorded PID fails the ``#{pane_pid}`` check or the process no longer has the
     recorded start time (or cannot be proven, ``probe``); the signals a real run could send
     otherwise. A pane gone at the probe is no mismatch when its recorded process has exited
-    too, as ``gone_at_probe`` (reading it only). Read-only: a guarded ``display``,
+    too, as ``gone_at_probe`` (reading it only, and only when ``/proc`` shows termctl's PID
+    namespace: otherwise a mismatch with a warning). Read-only: a guarded ``display``,
     ``SO_PEERCRED`` and ``/proc``."""
     mismatch = row_mismatch(pane)
     if pane.dead or pane.pid is None or mismatch:
         return DryRun(mismatch, [])
     found = probe(backend, gateway, socket_path, pane)
     if found.pane_gone:
+        problem = None if gateway.platform() == "darwin" else procs.namespace_problem(gateway)
+        if problem is not None:
+            warn(f"{problem}; a real run would not signal the recorded process")
+            return DryRun(True, [])
         if _exited(gateway, pane.pid):
             return DryRun(False, [])
         _warn_unproven(pane.pid, warn, "a real run would not signal the recorded process")
