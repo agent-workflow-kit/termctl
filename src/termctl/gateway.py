@@ -19,8 +19,9 @@ from typing import NamedTuple, Protocol
 
 class BoundedOutput(NamedTuple):
     """The result of ``Gateway.run_bounded``: at most ``limit`` bytes of each stream, and
-    whether either stream had more (the program was then killed, so ``returncode`` is its
-    signal status)."""
+    whether either stream had more. When output was truncated the child is killed if still
+    running, so ``returncode`` is either its own exit status or the negative kill signal;
+    callers must not rely on it when ``truncated`` is true."""
 
     returncode: int
     stdout: bytes
