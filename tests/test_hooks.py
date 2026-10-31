@@ -1,7 +1,10 @@
 from __future__ import annotations
 
+import io
 import json
 import os
+import signal
+import sys
 from pathlib import Path
 from typing import Any
 
@@ -9,10 +12,12 @@ import pytest
 
 from termctl import config, hooks, lock
 from termctl.errors import TermctlError, UsageError
-from termctl.gateway import GroupRun, SystemGateway
-from termctl.hooks import Hook
+from termctl.gateway import GroupNotStopped, GroupRun, SystemGateway
+from termctl.hooks import Hook, HookProcess
+from termctl.output import Output
 
 from .fakes import FakeClock, FakeGateway, group_run
+from .procs import read_when_ready, wait_gone
 from .schemas import validate
 
 ID = "tc-abcdefgh"
@@ -264,7 +269,7 @@ def test_a_veto_stops_later_hooks_and_exits_11() -> None:
     err = info.value
     assert (err.code, err.exit_code) == ("vetoed", 11)
     assert (err.hook, err.hook_stderr) == ("b", "no way\n")
-    assert "no way" in err.message
+    assert err.message == "pre-open hook vetoed (exit 1): b"
     validate(err.envelope(), "termctl/cli/error.json")
 
 
@@ -307,11 +312,33 @@ def test_a_timeout_counts_as_a_veto() -> None:
     assert outcome.message is not None and "timed out after 7 s" in outcome.message
 
 
-def test_a_hook_that_cannot_start_counts_as_a_veto() -> None:
-    gateway = gateway_for({"a": OSError(2, "No such file or directory"), "b": group_run(0)})
+@pytest.mark.parametrize(
+    "error", [OSError(2, "No such file or directory"), ValueError("embedded null byte")]
+)
+def test_a_hook_that_cannot_start_counts_as_a_veto(error: Exception) -> None:
+    gateway = gateway_for({"a": error, "b": group_run(0)})
     outcome = run_pre(gateway, pre("a", "b"))
     assert (outcome.verdict, outcome.hook, outcome.hook_stderr) == ("vetoed", "a", "")
+    assert outcome.message is not None and "could not be started" in outcome.message
+    assert outcome.processes == []
     assert ran(gateway) == ["a"]
+
+
+def test_a_hook_that_cannot_be_stopped_counts_as_a_veto() -> None:
+    gateway = gateway_for({"a": GroupNotStopped(77), "b": group_run(0)})
+    outcome = run_pre(gateway, pre("a", "b", timeout=5))
+    assert (outcome.verdict, outcome.hook) == ("vetoed", "a")
+    assert outcome.message == (
+        "pre-open hook timed out after 5 s and could not be stopped, counted as a veto: a"
+    )
+    assert outcome.processes == [HookProcess("pre-open", "a", 77)]
+    assert ran(gateway) == ["a"]
+
+
+def test_pre_hook_outcome_records_each_process_group() -> None:
+    gateway = gateway_for({"a": group_run(0, pgid=11), "b": group_run(13, pgid=12)})
+    outcome = run_pre(gateway, pre("a", "b"))
+    assert outcome.processes == [HookProcess("pre-open", "a", 11), HookProcess("pre-open", "b", 12)]
 
 
 def test_no_hooks_allow() -> None:
@@ -370,6 +397,14 @@ def test_payload_is_ascii_json_without_lone_surrogates() -> None:
     assert json.loads(data)["cwd"] == "/home/\\xffé"
 
 
+@pytest.mark.parametrize("object_id", ["tc-ABCDEFGH", "tc-abcd", "x; rm -rf ~", "", None, 5])
+def test_payload_object_id_must_be_a_termctl_id(object_id: Any) -> None:
+    gateway = gateway_for({"a": group_run(0)})
+    with pytest.raises(ValueError, match="object_id"):
+        run_pre(gateway, pre("a"), payload={**pre_open(), "object_id": object_id})
+    assert gateway.group_calls == []
+
+
 def test_payload_hook_must_match_the_hooks() -> None:
     gateway = gateway_for({"a": group_run(0)})
     with pytest.raises(ValueError):
@@ -425,20 +460,55 @@ def test_cut_utf8(raw: bytes, expected: str) -> None:
     assert hooks.cut_stderr(raw) == expected
 
 
-def test_hook_stderr_control_characters_are_escaped_in_human_output() -> None:
-    from termctl.output import Output
+def human_error(err: TermctlError, *, json_mode: bool = False) -> tuple[str, str]:
+    out = Output(stdout=io.StringIO(), stderr=io.StringIO(), json=json_mode)
+    out.error(err)
+    return out.stdout.getvalue(), out.stderr.getvalue()  # type: ignore[attr-defined]
 
+
+def test_hook_stderr_control_characters_are_escaped_in_human_output() -> None:
     gateway = gateway_for({"a": group_run(1, stderr=b"\x1b]0;pwned\x07")})
     outcome = run_pre(gateway, pre("a"))
     with pytest.raises(TermctlError) as info:
         outcome.check()
-    import io
-
-    out = Output(stdout=io.StringIO(), stderr=io.StringIO())
-    out.error(info.value)
-    printed = out.stderr.getvalue()  # type: ignore[attr-defined]
+    printed = human_error(info.value)[1]
     assert "\x1b" not in printed and "\x07" not in printed
     assert "\\x1b]0;pwned\\x07" in printed
+
+
+def test_hook_stderr_lines_cannot_pass_for_termctl_lines() -> None:
+    forged = b"denied\ntermctl: open succeeded\r\nmore\n"
+    gateway = gateway_for({"a": group_run(1, stderr=forged)})
+    outcome = run_pre(gateway, pre("a"))
+    with pytest.raises(TermctlError) as info:
+        outcome.check()
+    printed = human_error(info.value)[1]
+    assert printed.split("\n") == [
+        "termctl: pre-open hook vetoed (exit 1): a",
+        "termctl: hook stderr: denied",
+        "termctl: hook stderr: termctl: open succeeded\\x0d",
+        "termctl: hook stderr: more",
+        "",
+    ]
+    # JSON keeps the stderr as it was, in hook_stderr only.
+    stdout, stderr = human_error(info.value, json_mode=True)
+    assert json.loads(stdout)["error"]["hook_stderr"] == forged.decode()
+    assert stderr == "termctl: pre-open hook vetoed (exit 1): a\n"
+
+
+@pytest.mark.parametrize(
+    "run",
+    [
+        group_run(1, stderr=b"SECRET-TEXT"),
+        group_run(13, stderr=b"SECRET-TEXT"),
+        group_run(-9, stderr=b"SECRET-TEXT"),
+        group_run(None, stderr=b"SECRET-TEXT"),
+    ],
+)
+def test_hook_output_never_enters_the_message(run: GroupRun) -> None:
+    outcome = run_pre(gateway_for({"a": run}), pre("a"))
+    assert outcome.message is not None and "SECRET" not in outcome.message
+    assert outcome.hook_stderr == "SECRET-TEXT"
 
 
 # --- decision ids -------------------------------------------------------------------------------
@@ -477,8 +547,34 @@ def test_invalid_decision_ids_are_dropped_with_a_warning(bad: str) -> None:
     assert outcome.decision_ids == ["ok-1", "ok-2"]
     (warning,) = outcome.warnings
     assert warning.hook == "pre-open" and warning.cmd == "h0"
-    assert "decision id" in warning.problem
-    assert "\n" not in warning.problem and "\x00" not in warning.problem
+    assert warning.problem == (
+        "dropped 1 decision id; the first: decision id #2 does not match [A-Za-z0-9._:@/-]{1,128}"
+    )
+
+
+def test_one_warning_per_hook_however_many_ids_are_dropped() -> None:
+    items: list[Any] = [f"bad id {index}" for index in range(5000)] + [1, "ok"]
+    outcome = stdout_ids(json.dumps({"decision_id": items}).encode())
+    assert outcome.decision_ids == ["ok"]
+    (warning,) = outcome.warnings
+    assert warning.problem.startswith("dropped 5001 decision ids; the first: decision id #1 ")
+    assert "bad id" not in warning.problem
+
+
+@pytest.mark.parametrize(
+    "stdout",
+    [
+        b'{"SECRET": 1, "SECRET": 2}',
+        b'{"decision_id": ["SECRET ID"]}',
+        b'{"decision_id": [{"SECRET": 1}]}',
+        b"SECRET",
+    ],
+)
+def test_warnings_never_echo_hook_output(stdout: bytes) -> None:
+    (warning,) = stdout_ids(stdout).warnings
+    assert "SECRET" not in warning.problem
+    record = warning.log_record(FakeClock().now(), id=ID, socket_path=SOCKET)
+    assert "SECRET" not in json.dumps(record)
 
 
 def test_decision_ids_beyond_32_are_dropped_with_a_warning() -> None:
@@ -489,7 +585,8 @@ def test_decision_ids_beyond_32_are_dropped_with_a_warning() -> None:
         given=given,
     )
     assert outcome.decision_ids == [*given, "h1", "h2"]
-    assert len(outcome.warnings) == 2
+    # One warning per hook.
+    assert [warning.cmd for warning in outcome.warnings] == ["h0", "h1"]
     assert all("32" in warning.problem for warning in outcome.warnings)
 
 
@@ -519,7 +616,10 @@ def test_unusable_stdout_is_ignored_with_a_warning(stdout: bytes) -> None:
 def test_non_string_items_are_dropped_with_a_warning() -> None:
     outcome = stdout_ids(b'{"decision_id": ["a", 1, null, ["b"], "c"]}')
     assert outcome.decision_ids == ["a", "c"]
-    assert len(outcome.warnings) == 3
+    (warning,) = outcome.warnings
+    assert warning.problem == (
+        "dropped 3 decision ids; the first: decision id #2 is not a string (int)"
+    )
 
 
 def test_truncated_stdout_is_ignored_with_a_warning() -> None:
@@ -560,8 +660,30 @@ def test_hook_failed_record_matches_the_log_schema() -> None:
         "warning",
         "warn",
     )
-    assert record["details"]["hook"] == "pre-open"
-    assert record["details"]["cmd"] == "h0"
+    assert record["details"] == {
+        "hook": "pre-open",
+        "cmd": "h0",
+        "problem": warning.problem,
+        "pgid": 4242,
+    }
+
+
+def test_hook_failed_record_carries_the_stderr_apart_from_the_problem() -> None:
+    gateway = gateway_for({"a": group_run(2, stderr=b"oops\n", pgid=55)})
+    outcome = hooks.run_post_hooks(
+        [Hook("post-open", "a", 5)], post_payload(), gateway=gateway, environ=CALLER_ENV
+    )
+    (warning,) = outcome.warnings
+    record = warning.log_record(FakeClock().now(), id=ID, socket_path=SOCKET)
+    validate(record, "termctl/log.json")
+    assert record["message"] == "post-open hook 'a': exited 2"
+    assert record["details"] == {
+        "hook": "post-open",
+        "cmd": "a",
+        "problem": "exited 2",
+        "pgid": 55,
+        "hook_stderr": "oops\n",
+    }
 
 
 # --- post-hooks ---------------------------------------------------------------------------------
@@ -574,32 +696,48 @@ def post_payload() -> dict[str, Any]:
 def test_post_hooks_run_in_order_and_failures_only_warn() -> None:
     gateway = gateway_for(
         {
-            "a": group_run(1, stderr=b"oops"),
-            "b": group_run(None),
+            "a": group_run(1, stderr=b"oops", pgid=1),
+            "b": group_run(None, pgid=2),
             "c": OSError(13, "Permission denied"),
-            "d": group_run(0, stdout=b'{"decision_id": "ignored"}'),
+            "d": group_run(0, stdout=b'{"decision_id": "ignored"}', pgid=4),
+            "e": ValueError("embedded null byte"),
+            "f": GroupNotStopped(6),
+            "g": group_run(-15, stderr=b"bye", pgid=7),
         }
     )
-    post = [Hook("post-open", cmd, 5) for cmd in "abcd"]
-    warnings = hooks.run_post_hooks(post, post_payload(), gateway=gateway, environ=CALLER_ENV)
-    assert ran(gateway) == ["a", "b", "c", "d"]
-    assert [w.cmd for w in warnings] == ["a", "b", "c"]
-    assert "exited 1" in warnings[0].problem and "oops" in warnings[0].problem
-    assert "timed out after 5 s" in warnings[1].problem
-    assert "Permission denied" in warnings[2].problem
+    post = [Hook("post-open", cmd, 5) for cmd in "abcdefg"]
+    outcome = hooks.run_post_hooks(post, post_payload(), gateway=gateway, environ=CALLER_ENV)
+    assert ran(gateway) == list("abcdefg")
+    assert [(w.cmd, w.problem, w.pgid, w.hook_stderr) for w in outcome.warnings] == [
+        ("a", "exited 1", 1, "oops"),
+        ("b", "timed out after 5 s; its process group was killed", 2, ""),
+        ("c", "could not be started: Permission denied", None, ""),
+        ("e", "could not be started: embedded null byte", None, ""),
+        ("f", "timed out after 5 s; its process group could not be stopped", 6, ""),
+        ("g", "killed by signal 15", 7, "bye"),
+    ]
+    assert [(p.cmd, p.pgid) for p in outcome.processes] == [
+        ("a", 1),
+        ("b", 2),
+        ("d", 4),
+        ("f", 6),
+        ("g", 7),
+    ]
     call = gateway.group_calls[3]
     assert call.env["TERMCTL_HOOK"] == "post-open"
     assert call.stdout_limit == 0
 
 
-def test_async_post_hooks_are_spawned_detached() -> None:
+def test_async_post_hooks_are_started_under_a_watchdog() -> None:
     gateway = gateway_for({"bg": group_run(0), "bad": OSError(2, "missing")})
-    post = [Hook("post-open", "bg", 30, async_=True), Hook("post-open", "bad", 30, async_=True)]
-    warnings = hooks.run_post_hooks(post, post_payload(), gateway=gateway, environ=CALLER_ENV)
+    post = [Hook("post-open", "bg", 45, async_=True), Hook("post-open", "bad", 30, async_=True)]
+    outcome = hooks.run_post_hooks(post, post_payload(), gateway=gateway, environ=CALLER_ENV)
     assert [call.spawned for call in gateway.group_calls] == [True, True]
+    assert gateway.group_calls[0].timeout == 45
     assert json.loads(gateway.group_calls[0].stdin) == post_payload()
     assert gateway.group_calls[0].env["TERMCTL_ID"] == ID
-    assert [w.cmd for w in warnings] == ["bad"]
+    assert [w.cmd for w in outcome.warnings] == ["bad"]
+    assert outcome.processes == [HookProcess("post-open", "bg", 4343, watchdog=True)]
 
 
 def test_pre_hooks_are_never_async() -> None:
@@ -651,14 +789,25 @@ def test_real_hooks_run_in_order_and_a_veto_stops_them(tmp_path: Path) -> None:
 
 def test_real_timeout_vetoes_and_kills_the_process_group(tmp_path: Path) -> None:
     marker = tmp_path / "survived"
-    cmd = f"(sleep 2; touch '{marker}') & sleep 30"
+    child = tmp_path / "child"
+    cmd = (
+        f"(sleep 5; touch '{marker}') & echo $! > '{child}.tmp'; "
+        f"mv '{child}.tmp' '{child}'; sleep 10"
+    )
     outcome = real_pre(pre(cmd, timeout=1), pre_open(), dict(os.environ))
     assert outcome.verdict == "vetoed"
     assert outcome.message is not None and "timed out" in outcome.message
-    import time
-
-    time.sleep(2.5)
+    assert wait_gone(int(read_when_ready(child)))
     assert not marker.exists()
+
+
+def test_real_vetoing_hook_vetoes_with_sigchld_ignored() -> None:
+    previous = signal.signal(signal.SIGCHLD, signal.SIG_IGN)
+    try:
+        outcome = real_pre(pre("exit 1"), pre_open(), dict(os.environ))
+    finally:
+        signal.signal(signal.SIGCHLD, previous)
+    assert outcome.verdict == "vetoed"
 
 
 def test_real_hook_does_not_inherit_unrelated_descriptors(tmp_path: Path) -> None:
@@ -666,15 +815,22 @@ def test_real_hook_does_not_inherit_unrelated_descriptors(tmp_path: Path) -> Non
     os.set_inheritable(write_fd, True)
     try:
         out = tmp_path / "fds"
-        outcome = real_pre(
-            pre(f"ls /proc/$$/fd > '{out}' 2>/dev/null || echo none > '{out}'"),
-            pre_open(),
-            dict(os.environ),
+        # The probe runs as a child of the hook's shell, so it sees what the shell inherited;
+        # POSIX sh's own `>&N` takes one digit only, and this descriptor may be larger.
+        probe = (
+            "import os, sys\n"
+            "for fd in map(int, sys.argv[1:]):\n"
+            "    try:\n"
+            "        os.fstat(fd)\n"
+            "        print('open')\n"
+            "    except OSError:\n"
+            "        print('closed')\n"
         )
+        cmd = f"'{sys.executable}' -c \"$PROBE\" 2 {write_fd} > '{out}'"
+        outcome = real_pre(pre(cmd), pre_open(), {**os.environ, "PROBE": probe})
         assert outcome.verdict == "allow"
-        listed = out.read_text().split()
-        if listed != ["none"]:
-            assert str(write_fd) not in listed
+        # fd 2 is the control: the probe sees an open descriptor.
+        assert out.read_text().split() == ["open", "closed"]
     finally:
         os.close(read_fd)
         os.close(write_fd)

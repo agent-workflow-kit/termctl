@@ -1080,6 +1080,15 @@ def test_hook_keys_index_the_merged_list(home: Path, main_file: Path, dropins: P
     assert err.details == {"key": "hooks.pre-open[1].async"}
 
 
+@pytest.mark.parametrize("hook", ["pre-open", "post-close"])
+def test_a_nul_in_a_hook_cmd_is_rejected(home: Path, main_file: Path, hook: str) -> None:
+    # YAML's "\0" escape: a command line cannot hold a NUL, so the hook could never start.
+    write(main_file, f'hooks:\n  {hook}: [{{cmd: ok}}, {{cmd: "a\\0b"}}]\n')
+    err = load_error({"HOME": str(home)})
+    assert err.details == {"key": f"hooks.{hook}[1].cmd"}
+    assert "NUL" in err.message
+
+
 @pytest.mark.parametrize("hook", ["post-open", "post-close"])
 def test_async_on_a_post_hook_is_allowed(home: Path, main_file: Path, hook: str) -> None:
     write(main_file, {"hooks": {hook: [{"cmd": "x", "async": True}]}})

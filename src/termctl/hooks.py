@@ -9,12 +9,14 @@ substitution: nothing from the payload reaches the command line or the environme
 Pre-hooks run in order: exit 0 continues; exit 13 escalates and the remaining hooks still run;
 any other exit, a signal, a timeout or a failure to start vetoes and stops the rest. A run with
 ``--override-escalation`` treats exit 13 as allow; a veto still vetoes. Post-hooks cannot undo
-anything: their failures become warnings, never errors.
+anything: their failures become warnings, never errors. An async post-hook runs under a
+detached watchdog (``hookwatch``) that enforces its timeout.
 
 Hook output is untrusted. termctl keeps at most ``STDOUT_LIMIT`` bytes of a pre-hook's stdout
 (read for ``decision_id``) and ``STDERR_LIMIT`` bytes of its stderr (reported as
 ``hook_stderr``), reads and discards the rest, and validates every decision id against the
-grammar; output is escaped wherever it is printed (``output.escape``).
+grammar. Hook output never enters a message or a warning's ``problem``; ``hook_stderr`` is
+printed on lines of its own (``Output.hook_stderr``), escaped like all human output.
 
 No hook runs while this process holds a server lock (``lock.held()``): hooks may run long, and
 the lock must never wait on them.
@@ -23,6 +25,9 @@ the lock must never wait on them.
 # TODO(#17): open builds its pre-open/post-open payloads here, runs the hooks at steps 4 and 9
 # of the open order, prints and logs the warnings (``HookWarning.log_record``) and audits
 # override runs. TODO(#23): the same for close (pre-close at step 2, post-close).
+# TODO(#17): the open step's log record must include the hook process groups
+# (``PreHookOutcome.processes`` and ``PostHookOutcome.processes``; design guide section 8 says
+# the group is "created and recorded"). TODO(#23): the same for the close step's record.
 
 from __future__ import annotations
 
@@ -35,7 +40,8 @@ from typing import Any, Literal, NoReturn
 from . import jsonlog, lock, validate
 from .config import DEFAULT_HOOK_TIMEOUT_S, Config, PostHook, PreHook
 from .errors import TermctlError, UsageError
-from .gateway import Gateway, GroupRun
+from .gateway import Gateway, GroupNotStopped, GroupRun
+from .ids import is_id
 from .output import to_json
 
 SHELL = "/bin/sh"
@@ -215,12 +221,20 @@ def post_close_payload(*, result: Mapping[str, Any], labels: Sequence[str]) -> d
 
 @dataclass(frozen=True)
 class HookWarning:
-    """A hook problem that is not a verdict: a failed post-hook or an unusable decision id.
-    Callers print ``message`` as a warning and log ``log_record`` (``hook_failed``)."""
+    """A hook problem that is not a verdict: a failed post-hook or unusable decision ids.
+    Callers print ``message`` as a warning, ``hook_stderr`` separately (``Output.hook_stderr``)
+    and log ``log_record`` (``hook_failed``).
+
+    ``problem`` is termctl's own text and never holds hook output; ``hook_stderr`` is the
+    hook's stderr (**untrusted**). ``pgid`` is the process group termctl created for the hook
+    (for an async hook, its watchdog's), None if it could not be started.
+    """
 
     hook: str
     cmd: str
     problem: str
+    pgid: int | None = None
+    hook_stderr: str = ""
 
     @property
     def message(self) -> str:
@@ -229,6 +243,11 @@ class HookWarning:
     def log_record(
         self, ts: datetime, *, id: str | None, socket_path: str | None
     ) -> dict[str, Any]:
+        details: dict[str, Any] = {"hook": self.hook, "cmd": self.cmd, "problem": self.problem}
+        if self.pgid is not None:
+            details["pgid"] = self.pgid
+        if self.hook_stderr:
+            details["hook_stderr"] = self.hook_stderr
         return jsonlog.log_record(
             ts,
             event="hook_failed",
@@ -236,8 +255,19 @@ class HookWarning:
             id=id,
             socket_path=socket_path,
             message=self.message,
-            details={"hook": self.hook, "cmd": self.cmd, "problem": self.problem},
+            details=details,
         )
+
+
+@dataclass(frozen=True)
+class HookProcess:
+    """A hook that was started: ``pgid`` is the process group termctl created for it, or for
+    an async hook (``watchdog``) the watchdog's group, which is also its session."""
+
+    hook: str
+    cmd: str
+    pgid: int
+    watchdog: bool = False
 
 
 # --- untrusted output ---------------------------------------------------------------------------
@@ -276,13 +306,13 @@ def _no_duplicates(pairs: list[tuple[str, Any]]) -> dict[str, Any]:
     result: dict[str, Any] = {}
     for key, value in pairs:
         if key in result:
-            raise _BadJson(f"duplicate key {validate.show(key)}")
+            raise _BadJson("duplicate key")  # the key itself is hook output: not echoed
         result[key] = value
     return result
 
 
 def _no_constant(name: str) -> NoReturn:
-    raise _BadJson(f"{name} is not JSON")
+    raise _BadJson("NaN or Infinity")
 
 
 def _parse_stdout(run: GroupRun) -> tuple[Any, str | None]:
@@ -302,12 +332,24 @@ def _parse_stdout(run: GroupRun) -> tuple[Any, str | None]:
     return data.get("decision_id"), None  # pyright: ignore[reportUnknownMemberType]
 
 
+def _drop_reason(item: Any, ids: list[str]) -> str | None:
+    """Why the decision id ``item`` is dropped, without echoing it; None to keep it."""
+    if not isinstance(item, str):
+        return f"is not a string ({type(item).__name__})"
+    if not validate.is_decision_id(item):
+        return "does not match [A-Za-z0-9._:@/-]{1,128}"
+    if len(ids) >= validate.MAX_DECISION_IDS:
+        return f"is beyond the limit of {validate.MAX_DECISION_IDS} in a list"
+    return None
+
+
 def _collect_ids(hook: Hook, run: GroupRun, ids: list[str], warnings: list[HookWarning]) -> None:
-    """Append the valid decision ids of ``run``'s stdout to ``ids`` (at most 32 in all) and a
-    warning for each one dropped."""
+    """Append the valid decision ids of ``run``'s stdout to ``ids`` (at most 32 in all) and at
+    most one warning for the hook, which counts the ids dropped and names the first problem.
+    No warning echoes hook output."""
 
     def warn(problem: str) -> None:
-        warnings.append(HookWarning(hook.name, hook.cmd, problem))
+        warnings.append(HookWarning(hook.name, hook.cmd, problem, pgid=run.pgid))
 
     value, problem = _parse_stdout(run)
     if problem is not None:
@@ -322,20 +364,19 @@ def _collect_ids(hook: Hook, run: GroupRun, ids: list[str], warnings: list[HookW
     else:
         warn(f"decision_id must be a string or a list, not {type(value).__name__}; ignored")
         return
-    for item in items:
-        if not isinstance(item, str):
-            warn(f"decision id of type {type(item).__name__} dropped")
-        elif not validate.is_decision_id(item):
-            warn(
-                f"decision id {validate.show(item)} dropped: must match [A-Za-z0-9._:@/-]{{1,128}}"
-            )
-        elif len(ids) >= validate.MAX_DECISION_IDS:
-            warn(
-                f"decision id {validate.show(item)} dropped: "
-                f"a list holds at most {validate.MAX_DECISION_IDS}"
-            )
-        else:
+    dropped = 0
+    first = ""
+    for index, item in enumerate(items, start=1):
+        reason = _drop_reason(item, ids)
+        if reason is None:
             ids.append(item)
+            continue
+        dropped += 1
+        if dropped == 1:
+            first = f"decision id #{index} {reason}"
+    if dropped:
+        noun = "decision id" if dropped == 1 else "decision ids"
+        warn(f"dropped {dropped} {noun}; the first: {first}")
 
 
 # --- running hooks ------------------------------------------------------------------------------
@@ -350,6 +391,9 @@ def _check_payload(
     for hook in hooks:
         if hook.name != name:
             raise ValueError(f"{hook.name} hook given a {name} payload")
+    # TERMCTL_ID comes from object_id, so it must be a termctl id and nothing else.
+    if not is_id(payload.get("object_id")):
+        raise ValueError("the payload's object_id is not a termctl id")
     if lock.held():
         raise RuntimeError("hooks never run while the server lock is held")
 
@@ -369,14 +413,23 @@ def _encode(payload: Mapping[str, Any]) -> bytes:
     return to_json(dict(payload), allow_nan=False).encode("ascii")
 
 
+def _start_problem(exc: OSError | ValueError) -> str:
+    """Why a hook could not be started (an ``OSError``, or a ``ValueError`` such as a NUL in
+    the command), in the system's words."""
+    if isinstance(exc, OSError):
+        return exc.strerror or str(exc)
+    return str(exc)
+
+
 @dataclass
 class PreHookOutcome:
     """The verdict of a run of pre-hooks.
 
     ``decision_ids`` is the ``--decision-id`` values followed by the ids hooks returned.
     ``hook`` and ``hook_stderr`` belong to the hook that vetoed, else to the first one that
-    escalated (and was not overridden). ``overridden`` lists the hooks whose escalation an
-    ``--override-escalation`` run treated as allow.
+    escalated (and was not overridden). ``message`` is termctl's own text; it never holds hook
+    output. ``overridden`` lists the hooks whose escalation an ``--override-escalation`` run
+    treated as allow. ``processes`` lists every hook started, with its process group.
     """
 
     verdict: Verdict
@@ -386,6 +439,7 @@ class PreHookOutcome:
     message: str | None = None
     overridden: list[str] = field(default_factory=list[str])
     warnings: list[HookWarning] = field(default_factory=list[HookWarning])
+    processes: list[HookProcess] = field(default_factory=list[HookProcess])
 
     def check(self) -> None:
         """Raise the error of a veto (exit 11) or an escalation (exit 13)."""
@@ -400,10 +454,13 @@ class PreHookOutcome:
             decision_ids=list(self.decision_ids),
         )
 
-
-def _with_stderr(message: str, stderr: str) -> str:
-    stderr = stderr.strip()
-    return f"{message}: {stderr}" if stderr else message
+    def _decide(self, verdict: Verdict, hook: Hook, stderr: str, message: str) -> None:
+        self.verdict, self.hook, self.hook_stderr, self.message = (
+            verdict,
+            hook.cmd,
+            stderr,
+            message,
+        )
 
 
 def run_pre_hooks(
@@ -437,20 +494,26 @@ def run_pre_hooks(
                 stdout_limit=STDOUT_LIMIT,
                 stderr_limit=STDERR_LIMIT,
             )
-        except OSError as exc:
-            reason = exc.strerror or str(exc)
-            outcome.verdict, outcome.hook, outcome.hook_stderr = "vetoed", hook.cmd, ""
-            outcome.message = (
-                f"{name} hook could not be started ({reason}), counted as a veto: {hook.cmd}"
+        except (OSError, ValueError) as exc:
+            message = (
+                f"{name} hook could not be started ({_start_problem(exc)}), "
+                f"counted as a veto: {hook.cmd}"
             )
+            outcome._decide("vetoed", hook, "", message)
             return outcome
+        except GroupNotStopped as exc:
+            outcome.processes.append(HookProcess(hook.name, hook.cmd, exc.pgid))
+            message = (
+                f"{name} hook timed out after {hook.timeout} s and could not be stopped, "
+                f"counted as a veto: {hook.cmd}"
+            )
+            outcome._decide("vetoed", hook, "", message)
+            return outcome
+        outcome.processes.append(HookProcess(hook.name, hook.cmd, run.pgid))
         stderr = cut_stderr(run.stderr)
         if run.returncode is None:
-            outcome.verdict, outcome.hook, outcome.hook_stderr = "vetoed", hook.cmd, stderr
-            outcome.message = _with_stderr(
-                f"{name} hook timed out after {hook.timeout} s, counted as a veto: {hook.cmd}",
-                stderr,
-            )
+            message = f"{name} hook timed out after {hook.timeout} s, counted as a veto: {hook.cmd}"
+            outcome._decide("vetoed", hook, stderr, message)
             return outcome
         _collect_ids(hook, run, outcome.decision_ids, outcome.warnings)
         if run.returncode == 0:
@@ -459,20 +522,26 @@ def run_pre_hooks(
             if override_escalation:
                 outcome.overridden.append(hook.cmd)
             elif outcome.verdict == "allow":
-                outcome.verdict, outcome.hook, outcome.hook_stderr = "escalated", hook.cmd, stderr
-                outcome.message = _with_stderr(
-                    f"{name} hook escalated (exit 13): {hook.cmd}", stderr
-                )
+                message = f"{name} hook escalated (exit 13): {hook.cmd}"
+                outcome._decide("escalated", hook, stderr, message)
             continue
         how = (
             f"killed by signal {-run.returncode}"
             if run.returncode < 0
             else f"exit {run.returncode}"
         )
-        outcome.verdict, outcome.hook, outcome.hook_stderr = "vetoed", hook.cmd, stderr
-        outcome.message = _with_stderr(f"{name} hook vetoed ({how}): {hook.cmd}", stderr)
+        outcome._decide("vetoed", hook, stderr, f"{name} hook vetoed ({how}): {hook.cmd}")
         return outcome
     return outcome
+
+
+@dataclass
+class PostHookOutcome:
+    """A run of post-hooks: a warning for each that failed, and every hook started with its
+    process group (for an async hook, its watchdog's)."""
+
+    warnings: list[HookWarning] = field(default_factory=list[HookWarning])
+    processes: list[HookProcess] = field(default_factory=list[HookProcess])
 
 
 def run_post_hooks(
@@ -481,19 +550,24 @@ def run_post_hooks(
     *,
     gateway: Gateway,
     environ: Mapping[str, str],
-) -> list[HookWarning]:
+) -> PostHookOutcome:
     """Run ``hooks`` (all named ``payload["hook"]``) in order; return a warning for each that
-    failed. An async hook is started detached and not waited for, so its timeout cannot be
-    enforced once termctl has exited. Raises like ``run_pre_hooks``."""
+    failed. An async hook is started detached under a watchdog that enforces its timeout, and
+    is not waited for. Raises like ``run_pre_hooks``."""
     _check_payload(hooks, payload, POST_HOOKS)
     data = _encode(payload)
     env = _environment(environ, payload)
-    warnings: list[HookWarning] = []
+    outcome = PostHookOutcome()
+
+    def warn(hook: Hook, problem: str, pgid: int | None, stderr: str = "") -> None:
+        outcome.warnings.append(HookWarning(hook.name, hook.cmd, problem, pgid, stderr))
+
     for hook in hooks:
         argv = [SHELL, "-c", hook.cmd]
         try:
             if hook.async_:
-                gateway.spawn_group(argv, stdin=data, env=env)
+                pgid = gateway.spawn_watched(argv, stdin=data, env=env, timeout=hook.timeout)
+                outcome.processes.append(HookProcess(hook.name, hook.cmd, pgid, watchdog=True))
                 continue
             run = gateway.run_group(
                 argv,
@@ -503,17 +577,21 @@ def run_post_hooks(
                 stdout_limit=0,
                 stderr_limit=STDERR_LIMIT,
             )
-        except OSError as exc:
-            problem = f"could not be started: {exc.strerror or exc}"
-            warnings.append(HookWarning(hook.name, hook.cmd, problem))
+        except (OSError, ValueError) as exc:
+            warn(hook, f"could not be started: {_start_problem(exc)}", None)
             continue
+        except GroupNotStopped as exc:
+            outcome.processes.append(HookProcess(hook.name, hook.cmd, exc.pgid))
+            problem = f"timed out after {hook.timeout} s; its process group could not be stopped"
+            warn(hook, problem, exc.pgid)
+            continue
+        outcome.processes.append(HookProcess(hook.name, hook.cmd, run.pgid))
+        stderr = cut_stderr(run.stderr)
         if run.returncode is None:
             problem = f"timed out after {hook.timeout} s; its process group was killed"
+            warn(hook, problem, run.pgid, stderr)
         elif run.returncode < 0:
-            problem = _with_stderr(f"killed by signal {-run.returncode}", cut_stderr(run.stderr))
+            warn(hook, f"killed by signal {-run.returncode}", run.pgid, stderr)
         elif run.returncode != 0:
-            problem = _with_stderr(f"exited {run.returncode}", cut_stderr(run.stderr))
-        else:
-            continue
-        warnings.append(HookWarning(hook.name, hook.cmd, problem))
-    return warnings
+            warn(hook, f"exited {run.returncode}", run.pgid, stderr)
+    return outcome

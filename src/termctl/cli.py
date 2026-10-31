@@ -9,6 +9,7 @@ from __future__ import annotations
 import argparse
 import io
 import os
+import signal
 import sys
 from collections.abc import Mapping, Sequence
 from dataclasses import dataclass, field
@@ -19,7 +20,7 @@ from . import config as config_module
 from .argv import Scan, scan
 from .config import Config
 from .errors import TermctlError, UsageError
-from .gateway import Clock, Gateway, SystemClock, SystemGateway
+from .gateway import Clock, Gateway, SystemClock, SystemGateway, Terminated
 from .output import PROG, Output, Result, flush_standard_streams
 
 __all__ = ["Context", "Output", "Result", "main", "parse_args"]
@@ -466,6 +467,13 @@ def main(
             clock=clock or SystemClock(),
             environ=os.environ if environ is None else environ,
         )
+    except KeyboardInterrupt:
+        # A hook that was running has been killed (gateway.run_group).
+        out.interrupted("interrupted")
+        return 128 + signal.SIGINT
+    except Terminated as stop:
+        out.interrupted(f"terminated by signal {stop.signum}")
+        return 128 + stop.signum
     finally:
         if stdout is None or stderr is None:
             flush_standard_streams()

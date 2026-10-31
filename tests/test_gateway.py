@@ -13,9 +13,19 @@ from typing import Any
 
 import pytest
 
-from termctl.gateway import Clock, Gateway, GroupRun, SystemClock, SystemGateway
+from termctl import gateway as gateway_module
+from termctl import hookwatch
+from termctl.gateway import (
+    Clock,
+    Gateway,
+    GroupNotStopped,
+    GroupRun,
+    SystemClock,
+    SystemGateway,
+)
 
 from .fakes import FakeClock, FakeGateway
+from .procs import group_is_gone, is_gone, read_when_ready, reap, wait_gone, wait_until
 
 
 def test_system_gateway_runs_argv_without_a_shell() -> None:
@@ -103,9 +113,13 @@ def test_system_gateway_user_name_none_without_passwd_entry(
     assert SystemGateway().user_name() is None
 
 
-# --- run_group and spawn_group ------------------------------------------------------------------
+# --- run_group ----------------------------------------------------------------------------------
 
 SH = "/bin/sh"
+
+
+def base_env() -> dict[str, str]:
+    return {"PATH": os.environ.get("PATH", "/usr/bin:/bin")}
 
 
 def group(
@@ -120,23 +134,11 @@ def group(
     return SystemGateway().run_group(
         [SH, "-c", script],
         stdin=stdin,
-        env={"PATH": os.environ.get("PATH", "/usr/bin:/bin")} if env is None else env,
+        env=base_env() if env is None else env,
         timeout=timeout,
         stdout_limit=stdout_limit,
         stderr_limit=stderr_limit,
     )
-
-
-def group_is_gone(pgid: int) -> bool:
-    """Whether no process is left in ``pgid``. A killed grandchild is a zombie until init
-    reaps it, so this waits up to 5 seconds."""
-    for _ in range(100):
-        try:
-            os.killpg(pgid, 0)
-        except ProcessLookupError:
-            return True
-        time.sleep(0.05)
-    return False
 
 
 def test_run_group_passes_stdin_and_captures_both_streams() -> None:
@@ -181,28 +183,64 @@ def test_run_group_writes_a_large_payload_to_a_reader() -> None:
 
 def test_run_group_timeout_kills_the_whole_group(tmp_path: Path) -> None:
     marker = tmp_path / "survived"
-    # The grandchild keeps running after sh is killed unless the group is signaled.
-    script = f"(sleep 2; touch '{marker}') & echo started; echo partial >&2; sleep 30"
+    # The background child keeps running after sh is killed unless the group is signaled.
+    script = f"(sleep 5; touch '{marker}') & echo $!; echo partial >&2; sleep 10"
     start = time.monotonic()
     run = group(script, timeout=0.5)
-    assert time.monotonic() - start < 5
+    assert time.monotonic() - start < 3
     assert run.timed_out and run.returncode is None
-    assert run.stdout == b"started\n" and run.stderr == b"partial\n"
+    assert run.stderr == b"partial\n"
+    assert wait_gone(int(run.stdout))
     assert group_is_gone(run.pgid)
-    time.sleep(2.5)
     assert not marker.exists()
 
 
-def test_run_group_timeout_when_a_grandchild_holds_the_pipes(tmp_path: Path) -> None:
-    # sh exits at once, but its background child keeps stdout open.
-    run = group("sleep 30 & exit 0", timeout=0.5)
+def test_run_group_timeout_kills_a_leader_that_left_its_group() -> None:
+    # The leader moves itself into this test's process group, out of reach of the group kill.
+    script = (
+        f"exec '{sys.executable}' -c 'import os, time; "
+        "os.setpgid(0, os.getpgid(os.getppid())); print(os.getpid(), flush=True); time.sleep(10)'"
+    )
+    start = time.monotonic()
+    run = group(script, timeout=1)
+    assert time.monotonic() - start < 4
     assert run.timed_out
-    assert group_is_gone(run.pgid)
+    assert wait_gone(int(run.stdout))
+
+
+@pytest.mark.parametrize(
+    ("leftover", "status"),
+    [
+        ("sleep 6", 0),
+        ("sleep 6", 3),
+        (f"'{sys.executable}' -c 'import os, time; os.setsid(); time.sleep(6)'", 0),
+    ],
+)
+def test_run_group_ends_soon_after_the_leader_exits_leaving_the_pipes_open(
+    leftover: str, status: int
+) -> None:
+    # sh exits at once, but its background child keeps stdout and stderr open. The child is
+    # not killed (it ends by itself).
+    start = time.monotonic()
+    run = group(f"{leftover} & echo $!; exit {status}", timeout=3)
+    elapsed = time.monotonic() - start
+    assert run.returncode == status
+    assert elapsed < 2.5
+    assert not is_gone(int(run.stdout))
 
 
 def test_run_group_reports_a_signal_as_a_negative_returncode() -> None:
     run = group("kill -TERM $$")
     assert run.returncode == -signal.SIGTERM
+
+
+def test_run_group_reports_the_exit_status_with_sigchld_ignored() -> None:
+    previous = signal.signal(signal.SIGCHLD, signal.SIG_IGN)
+    try:
+        run = group("exit 1")
+    finally:
+        signal.signal(signal.SIGCHLD, previous)
+    assert run.returncode == 1
 
 
 def test_run_group_raises_oserror_when_it_cannot_start(tmp_path: Path) -> None:
@@ -232,23 +270,180 @@ def test_run_group_kills_the_group_when_interrupted(monkeypatch: pytest.MonkeyPa
 
     monkeypatch.setattr(subprocess, "Popen", popen)
     with pytest.raises(KeyboardInterrupt):
-        group("sleep 30", timeout=10)
+        group("sleep 10", timeout=10)
     assert group_is_gone(seen[0])
 
 
 @pytest.mark.filterwarnings("ignore::ResourceWarning")
-def test_spawn_group_runs_detached_with_stdin(tmp_path: Path) -> None:
-    out = tmp_path / "out"
-    start = time.monotonic()
-    pgid = SystemGateway().spawn_group(
-        [SH, "-c", f"cat > '{out}.tmp'; echo \"$X\" >> '{out}.tmp'; mv '{out}.tmp' '{out}'"],
-        stdin=b"payload\n",
-        env={"X": "y", "PATH": os.environ.get("PATH", "/usr/bin:/bin")},
+def test_run_group_reports_a_group_it_cannot_stop(monkeypatch: pytest.MonkeyPatch) -> None:
+    def refuse(pid: int, signum: int) -> None:
+        raise PermissionError(1, "Operation not permitted")
+
+    monkeypatch.setattr(os, "killpg", refuse)
+    monkeypatch.setattr(os, "kill", refuse)
+    monkeypatch.setattr(gateway_module, "STOP_WAIT_S", 0.2)
+    with pytest.raises(GroupNotStopped) as info:
+        group("exec sleep 5", timeout=0.3)
+    monkeypatch.undo()
+    # Unreaped, so the group id is still this test's to signal.
+    os.killpg(info.value.pgid, signal.SIGKILL)
+    assert wait_gone(info.value.pgid)
+
+
+def test_run_group_restores_the_signal_handlers() -> None:
+    before = {signum: signal.getsignal(signum) for signum in (signal.SIGTERM, signal.SIGHUP)}
+    group("exit 0")
+    assert {signum: signal.getsignal(signum) for signum in before} == before
+
+
+_TERMINATE_SCRIPT = """
+import signal, sys
+from termctl import cli
+from termctl.gateway import SystemGateway
+
+signal.signal(signal.SIGTERM, signal.SIG_DFL)
+signal.signal(signal.SIGHUP, signal.SIG_DFL)
+marker = sys.argv[1]
+
+def run(*args, **kwargs):
+    script = f"sleep 10 & echo $! > '{marker}.tmp'; mv '{marker}.tmp' '{marker}'; wait"
+    SystemGateway().run_group(
+        ["/bin/sh", "-c", script],
+        stdin=b"",
+        env={"PATH": "/usr/bin:/bin"},
+        timeout=20,
+        stdout_limit=0,
+        stderr_limit=100,
     )
+    return 0
+
+cli._run = run
+sys.exit(cli.main([]))
+"""
+
+
+@pytest.mark.parametrize("signum", [signal.SIGTERM, signal.SIGHUP])
+def test_a_stop_signal_during_a_hook_kills_its_group(tmp_path: Path, signum: int) -> None:
+    marker = tmp_path / "child"
+    proc = subprocess.Popen(
+        [sys.executable, "-c", _TERMINATE_SCRIPT, str(marker)],
+        stdout=subprocess.PIPE,
+        stderr=subprocess.PIPE,
+        text=True,
+    )
+    try:
+        child = int(read_when_ready(marker))
+        proc.send_signal(signum)  # the exact process this test started
+        _, stderr = proc.communicate(timeout=10)
+    finally:
+        if proc.poll() is None:
+            proc.kill()
+            proc.wait()
+    assert proc.returncode == 128 + signum
+    assert stderr == f"termctl: terminated by signal {signum}\n"
+    assert wait_gone(child)
+
+
+# --- spawn_watched ------------------------------------------------------------------------------
+
+
+def watched(script: str, *, timeout: float = 10, stdin: bytes = b"", **env: str) -> int:
+    return SystemGateway().spawn_watched(
+        [SH, "-c", script], stdin=stdin, env={**base_env(), **env}, timeout=timeout
+    )
+
+
+@pytest.mark.filterwarnings("ignore::ResourceWarning")
+def test_spawn_watched_runs_the_hook_detached_with_stdin_and_env(tmp_path: Path) -> None:
+    out = tmp_path / "out"
+    script = (
+        f"{{ cat; echo \"$X\"; echo $$; ps -o pgid= -p $$; ps -o pgid= -p $PPID; }} > '{out}.tmp'; "
+        f"mv '{out}.tmp' '{out}'"
+    )
+    start = time.monotonic()
+    watchdog = watched(script, stdin=b"payload\n", X="y")
     assert time.monotonic() - start < 2
-    assert pgid != os.getpgrp()
-    for _ in range(100):
-        if out.exists():
-            break
-        time.sleep(0.05)
-    assert out.read_bytes() == b"payload\ny\n"
+    lines = read_when_ready(out).split("\n")
+    assert lines[:2] == ["payload", "y"]
+    hook_pid, hook_pgid, watchdog_pgid = (int(field) for field in lines[2:5])
+    assert hook_pgid == hook_pid  # the hook leads a group of its own
+    assert watchdog_pgid == watchdog != os.getpgrp()
+    assert reap(watchdog)
+
+
+@pytest.mark.filterwarnings("ignore::ResourceWarning")
+def test_spawn_watched_kills_the_hook_group_at_its_timeout(tmp_path: Path) -> None:
+    pids = tmp_path / "pids"
+    script = f"sleep 10 & echo $$ $! > '{pids}.tmp'; mv '{pids}.tmp' '{pids}'; sleep 10"
+    start = time.monotonic()
+    watchdog = watched(script, timeout=1)
+    assert time.monotonic() - start < 2  # termctl does not wait
+    assert os.getsid(watchdog) == watchdog  # a session of its own
+    leader, child = (int(pid) for pid in read_when_ready(pids).split())
+    assert wait_gone(leader, child)
+    assert reap(watchdog)
+    assert time.monotonic() - start < 5
+
+
+@pytest.mark.filterwarnings("ignore::ResourceWarning")
+def test_spawn_watched_kills_a_leader_that_left_its_group(tmp_path: Path) -> None:
+    pid_file = tmp_path / "pid"
+    script = (
+        f"exec '{sys.executable}' -c 'import os, sys, time; "
+        "os.setpgid(0, os.getpgid(os.getppid())); "
+        'open(sys.argv[1], "w").write(str(os.getpid())); time.sleep(10)\' '
+        f"'{pid_file}'"
+    )
+    watchdog = watched(script, timeout=1)
+    assert wait_until(lambda: pid_file.exists() and pid_file.read_text() != "")
+    assert wait_gone(int(pid_file.read_text()))
+    assert reap(watchdog)
+
+
+@pytest.mark.filterwarnings("ignore::ResourceWarning")
+def test_spawn_watched_kills_the_hook_group_when_the_watchdog_is_stopped(tmp_path: Path) -> None:
+    pids = tmp_path / "pids"
+    script = f"sleep 10 & echo $$ $! > '{pids}.tmp'; mv '{pids}.tmp' '{pids}'; sleep 10"
+    watchdog = watched(script, timeout=30)
+    leader, child = (int(pid) for pid in read_when_ready(pids).split())
+    assert os.waitpid(watchdog, os.WNOHANG) == (0, 0)  # still this test's running child
+    os.kill(watchdog, signal.SIGTERM)
+    assert wait_gone(leader, child)
+    assert reap(watchdog)
+
+
+@pytest.mark.filterwarnings("ignore::ResourceWarning")
+def test_spawn_watched_ignores_pythonpath_and_the_current_directory(
+    tmp_path: Path, monkeypatch: pytest.MonkeyPatch
+) -> None:
+    # A planted termctl package must not replace the watchdog.
+    planted = tmp_path / "termctl"
+    planted.mkdir()
+    hijacked = tmp_path / "hijacked"
+    (planted / "__init__.py").write_text("")
+    (planted / "hookwatch.py").write_text(f"open({str(hijacked)!r}, 'w').close()\n")
+    monkeypatch.chdir(tmp_path)
+    out = tmp_path / "out"
+    watchdog = watched(f"echo ran > '{out}.tmp'; mv '{out}.tmp' '{out}'", PYTHONPATH=str(tmp_path))
+    assert read_when_ready(out) == "ran\n"
+    assert reap(watchdog)
+    assert not hijacked.exists()
+
+
+@pytest.mark.filterwarnings("ignore::ResourceWarning")
+def test_spawn_watched_resets_an_ignored_sigchld(tmp_path: Path) -> None:
+    out = tmp_path / "out"
+    previous = signal.signal(signal.SIGCHLD, signal.SIG_IGN)
+    try:
+        watchdog = watched(f"echo ran > '{out}.tmp'; mv '{out}.tmp' '{out}'")
+        assert signal.getsignal(signal.SIGCHLD) == signal.SIG_DFL
+    finally:
+        signal.signal(signal.SIGCHLD, previous)
+    assert read_when_ready(out) == "ran\n"
+    assert reap(watchdog)
+
+
+@pytest.mark.parametrize("argv", [[], ["1"], ["0", SH], ["-1", SH], ["x", SH], ["nan", SH]])
+def test_watchdog_rejects_bad_arguments(argv: list[str]) -> None:
+    # Checked before the watchdog touches any signal handler, so this runs in-process.
+    assert hookwatch.main(argv) == 2

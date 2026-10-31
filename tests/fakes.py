@@ -12,7 +12,7 @@ from termctl.gateway import GroupRun
 
 @dataclass
 class GroupCall:
-    """One ``run_group`` or ``spawn_group`` call as the fake saw it."""
+    """One ``run_group`` or ``spawn_watched`` call as the fake saw it."""
 
     argv: list[str]
     stdin: bytes
@@ -24,7 +24,7 @@ class GroupCall:
 
 
 # A scripted group run: a fixed result, an exception to raise, or a function of the call.
-GroupResponse = GroupRun | OSError | Callable[[GroupCall], GroupRun]
+GroupResponse = GroupRun | Exception | Callable[[GroupCall], GroupRun]
 
 
 def group_run(
@@ -58,7 +58,7 @@ class FakeGateway:
         self.tty = tty
         self.user = user
         self.dir_checks: list[str] = []
-        # run_group and spawn_group answers, keyed by argv.
+        # run_group and spawn_watched answers, keyed by argv.
         self.group_responses: dict[tuple[str, ...], GroupResponse] = {}
         self.group_calls: list[GroupCall] = []
 
@@ -89,16 +89,18 @@ class FakeGateway:
         call = GroupCall(list(argv), stdin, dict(env), timeout, stdout_limit, stderr_limit, False)
         self.group_calls.append(call)
         response = self._group_response(argv)
-        if isinstance(response, OSError):
+        if isinstance(response, Exception):
             raise response
         if isinstance(response, GroupRun):
             return response
         return response(call)
 
-    def spawn_group(self, argv: list[str], *, stdin: bytes, env: Mapping[str, str]) -> int:
-        self.group_calls.append(GroupCall(list(argv), stdin, dict(env), None, None, None, True))
+    def spawn_watched(
+        self, argv: list[str], *, stdin: bytes, env: Mapping[str, str], timeout: float
+    ) -> int:
+        self.group_calls.append(GroupCall(list(argv), stdin, dict(env), timeout, None, None, True))
         response = self._group_response(argv)
-        if isinstance(response, OSError):
+        if isinstance(response, Exception):
             raise response
         return 4343
 

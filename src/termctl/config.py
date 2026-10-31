@@ -123,6 +123,16 @@ def _integral(value: Any) -> Any:
 
 
 NonEmpty = Annotated[str, Field(min_length=1)]
+
+
+def _no_nul(value: str) -> str:
+    # A command line cannot hold a NUL, so such a hook could never be started.
+    if "\x00" in value:
+        raise ValueError("must not contain a NUL character")
+    return value
+
+
+HookCmd = Annotated[str, Field(min_length=1), AfterValidator(_no_nul)]
 PositiveInt = Annotated[int, BeforeValidator(_integral), Field(ge=1)]
 # A hook timeout in whole seconds (interface.md "Hooks"): at most 10 minutes, like every other
 # duration termctl accepts, which leaves room for a gate with agent checks (design guide
@@ -179,7 +189,7 @@ class Rule(_Model):
 
 
 class PreHook(_Model):
-    cmd: NonEmpty
+    cmd: HookCmd
     timeout: HookTimeout = DEFAULT_HOOK_TIMEOUT_S
 
 
