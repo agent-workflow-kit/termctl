@@ -18,7 +18,7 @@ from termctl import panes
 from termctl.errors import TermctlError
 from termctl.panes import PaneRead
 
-from .conftest import TMUX_VERSION, TmuxServer, wait_for
+from .conftest import TMUX_PRINTS_RAW, TMUX_VERSION, TmuxServer, wait_for
 from .schemas import validate
 
 pytestmark = pytest.mark.tmux
@@ -159,8 +159,9 @@ def test_tab_and_newline_in_names_become_spaces(tmux_server: TmuxServer) -> None
     renamed = tmux_server.raw("rename-session", "-t", "=base:", "my\twork")
     assert renamed.returncode == 0, renamed.stderr
     (pane,) = read(tmux_server).panes
-    # tmux escapes ESC itself on output; the reader replaces only tab and newline.
-    assert pane.display_name == "a b c\\033d"
+    # tmux 3.3 to 3.5 escape ESC on output, 3.6 prints it raw; the reader replaces only tab
+    # and newline.
+    assert pane.display_name == ("a b c\x1bd" if TMUX_PRINTS_RAW else "a b c\\033d")
     assert "\t" not in pane.session and "\n" not in pane.session
 
 
@@ -203,8 +204,13 @@ def test_invalid_utf8_in_an_option_reads_as_tmux_escapes_it(tmux_server: TmuxSer
     pane_id = tmux_server.start()
     tag(tmux_server, pane_id, **{"@termctl_name": os.fsdecode(b"a\xc3b")})
     result = read(tmux_server)
-    # tmux prints the stray byte as the text \303, a valid name; the read is still safe.
-    assert [p.name for p in result.panes] == ["a\\303b"]
+    if TMUX_PRINTS_RAW:
+        # tmux 3.6 prints the stray byte raw: a lone surrogate, which the name grammar rejects.
+        assert result.panes == ()
+        assert len(result.warnings) == 1 and pane_id in result.warnings[0]
+    else:
+        # tmux prints the stray byte as the text \303, a valid name; the read is still safe.
+        assert [p.name for p in result.panes] == ["a\\303b"]
 
 
 def test_a_c1_control_in_an_option_is_rejected(tmux_server: TmuxServer) -> None:

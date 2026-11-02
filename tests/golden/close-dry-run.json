@@ -1,0 +1,1 @@
+{"dry_run": true, "id": "tc-abcdefgh", "state": "running", "forced": true, "pid": 4242, "pid_mismatch": false, "signals_possible": ["SIGTERM", "SIGKILL"], "grace_ms": 10000, "socket_path": "/tmp/tmux-1000/default", "actor": "human:me", "decision_ids": [], "override_escalation": false}
