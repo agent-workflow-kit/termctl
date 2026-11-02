@@ -589,6 +589,27 @@ def _check_main_directory(path: Path) -> os.stat_result | None:
     return info
 
 
+# The longest symlink chain a config file may be reached through (Linux's own limit).
+MAX_SYMLINK_HOPS = 40
+
+
+def _check_hops(path: Path) -> None:
+    """Follow the symlink chain from ``path`` one link at a time and check the directory each
+    link leads into, and in a shared one the entry there, as ``path``'s own are checked: a
+    link another user could replace would redirect the config."""
+    current = os.path.abspath(path)
+    for _ in range(MAX_SYMLINK_HOPS):
+        if not os.path.islink(current):
+            return
+        current = os.path.join(os.path.dirname(current), os.readlink(current))
+        fd, info = _open_directory(os.path.dirname(current), sticky=True)
+        if fd is not None:
+            os.close(fd)
+        _check_entry(info, Path(current))
+    if os.path.islink(current):
+        raise _cannot_read(path, os.strerror(errno.ELOOP))
+
+
 # The largest config file or drop-in termctl reads.
 MAX_FILE_SIZE = 1024 * 1024
 
@@ -597,11 +618,13 @@ def _read_bytes(path: Path, parent: os.stat_result | None = None) -> bytes:
     """The contents of ``path``, which must be a regular file (after symlinks) of at most
     ``MAX_FILE_SIZE`` bytes that passes the trust checks, as must the directory that holds it
     after symlinks; ``parent`` is the status of ``path``'s own directory, for ``_check_entry``.
-    The directory is checked first; the file is then checked to be regular before it is opened
-    (so a socket or device is never opened), opened without following a symlink, blocking or
-    taking a controlling terminal (so a FIFO is never waited on), and checked again on the
-    descriptor and by name (in case it was replaced). At most one byte past the cap is read."""
+    Every symlink on the way is checked by ``_check_hops``. The directory is checked first;
+    the file is then checked to be regular before it is opened (so a socket or device is never
+    opened), opened without following a symlink, blocking or taking a controlling terminal (so
+    a FIFO is never waited on), and checked again on the descriptor and by name (in case it was
+    replaced). At most one byte past the cap is read."""
     _check_entry(parent, path)
+    _check_hops(path)
     resolved = Path(os.path.realpath(path))
     dir_fd, dir_info = _open_directory(resolved.parent, sticky=True)
     try:

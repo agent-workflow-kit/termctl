@@ -1,5 +1,6 @@
 from __future__ import annotations
 
+import errno
 import io
 import json
 import math
@@ -1672,6 +1673,81 @@ def test_symlink_chain_checks_the_final_target(tmp_path: Path) -> None:
     unsafe_error(home, target)
 
 
+def hop_dir(path: Path, mode: int) -> Path:
+    path.mkdir(mode=0o700)
+    return chmod(path, mode)
+
+
+def test_symlink_hop_in_a_writable_directory_is_refused(tmp_path: Path) -> None:
+    # R2-1: a hop another user could replace would redirect the config.
+    home, main, _ = trusted_home(tmp_path)
+    main.unlink()
+    target = write(tmp_path / "final" / "config.yaml", {})
+    shared = hop_dir(tmp_path / "shared", 0o777)
+    hop = shared / "hop.yaml"
+    hop.symlink_to(target)
+    main.symlink_to(hop)
+    err = unsafe_error(home, shared)
+    assert "writable by group and others" in err.message
+
+
+@pytest.mark.usefixtures("not_root")
+def test_foreign_symlink_hop_in_a_sticky_writable_directory_is_refused(
+    tmp_path: Path, monkeypatch: pytest.MonkeyPatch
+) -> None:
+    home, main, _ = trusted_home(tmp_path)
+    main.unlink()
+    target = write(tmp_path / "final" / "config.yaml", {"tmux_bin": "hopped"})
+    shared = hop_dir(tmp_path / "shared", 0o1777)
+    hop = shared / "hop.yaml"
+    hop.symlink_to(target)
+    main.symlink_to(hop)
+    assert load({"HOME": str(home)}).tmux_bin == "hopped"  # loads while the hop is ours
+    report_entry_owner(monkeypatch, 4242, hop)
+    err = unsafe_error(home, hop)
+    assert "owned by uid 4242" in err.message
+    assert "in a directory other users can write" in err.message
+
+
+def test_symlink_chain_through_private_directories_loads(tmp_path: Path) -> None:
+    home, main, _ = trusted_home(tmp_path)
+    main.unlink()
+    target = write(tmp_path / "c" / "config.yaml", {"tmux_bin": "chained"})
+    second = hop_dir(tmp_path / "b", 0o700) / "hop.yaml"
+    second.symlink_to(target)
+    first = hop_dir(tmp_path / "a", 0o700) / "hop.yaml"
+    first.symlink_to(second)
+    main.symlink_to(first)
+    assert load({"HOME": str(home)}).tmux_bin == "chained"
+
+
+def test_relative_symlink_hops_resolve_from_the_link_directory(tmp_path: Path) -> None:
+    home, main, _ = trusted_home(tmp_path)
+    main.unlink()
+    write(tmp_path / "c" / "config.yaml", {"tmux_bin": "relative"})
+    hop = hop_dir(tmp_path / "b", 0o700) / "hop.yaml"
+    hop.symlink_to(Path("..") / "c" / "config.yaml")
+    main.symlink_to(os.path.relpath(hop, main.parent))
+    assert load({"HOME": str(home)}).tmux_bin == "relative"
+    chmod(hop.parent, 0o777)  # the hop's own directory is the one checked
+    unsafe_error(home, hop.parent)
+
+
+def test_symlink_chain_that_is_too_long_is_refused(tmp_path: Path) -> None:
+    home, main, _ = trusted_home(tmp_path)
+    main.unlink()
+    links = tmp_path / "links"
+    links.mkdir(mode=0o700)
+    previous = write(tmp_path / "c" / "config.yaml", {})
+    for n in range(41):
+        link = links / f"{n}.yaml"
+        link.symlink_to(previous)
+        previous = link
+    main.symlink_to(previous)
+    err = load_error({"HOME": str(home)})
+    assert err.message.startswith(f"cannot read config {main}: ")
+
+
 def test_symlinked_drop_in_target_is_checked(tmp_path: Path) -> None:
     home, _, dropins_dir = trusted_home(tmp_path)
     target = chmod(write(tmp_path / "shared" / "b.yaml", {}), 0o662)
@@ -1930,18 +2006,18 @@ def test_target_swapped_for_a_symlink_fails_safe(
 ) -> None:
     explicit = write(tmp_path / "d" / "c.yaml", {"tmux_bin": "first"})
     other = write(tmp_path / "elsewhere" / "o.yaml", {"tmux_bin": "swapped"})
-    real = os.path.realpath
+    real = os.open
 
-    def swapping_realpath(path: Any, *args: Any, **kwargs: Any) -> str:
-        result = real(path, *args, **kwargs)
-        if result == str(explicit) and explicit.is_file() and not explicit.is_symlink():
+    def swapping_open(path: Any, flags: int, *args: Any, **kwargs: Any) -> int:
+        # R2-2: swapped after every check, right before the file is opened.
+        if not flags & os.O_DIRECTORY and os.fspath(path).endswith("c.yaml"):
             explicit.unlink()
             explicit.symlink_to(other)
-        return result
+        return real(path, flags, *args, **kwargs)
 
-    monkeypatch.setattr(config.os.path, "realpath", swapping_realpath)
+    monkeypatch.setattr(config.os, "open", swapping_open)
     err = load_error({}, str(explicit))
-    assert err.message.startswith(f"cannot read config {explicit}: ")
+    assert err.message == f"cannot read config {explicit}: {os.strerror(errno.ELOOP)}"
 
 
 def test_trust_failure_in_config_d_wins_over_a_yaml_error_in_the_main_file(
