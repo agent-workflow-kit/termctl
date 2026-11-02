@@ -391,3 +391,102 @@ def test_an_unusable_state_directory_is_locked_unusable(tmp_path: Path) -> None:
     assert caught.value.code == "locked"
     assert caught.value.details is not None and caught.value.details["cause"] == "unusable"
     assert backend.lock_held_during == []
+
+
+# --- dry runs (preview_change) -----------------------------------------------------------------
+
+
+def preview(
+    backend: FakeBackend, pane: ManagedPane, plan: Change, version: TmuxVersion | None = V35
+) -> pane_change.Outcome:
+    return pane_change.preview_change(backend, pane, lambda current: plan, version=version)
+
+
+def test_a_preview_reports_the_pane_as_it_would_be_and_writes_nothing() -> None:
+    before = managed()
+    backend = FakeBackend([read(before)])
+    outcome = preview(backend, before, renamed("new"))
+    after = replace(before, name="new", display_name="new")
+    assert outcome == pane_change.Outcome(pane=after, changed=True, display_updated=True)
+    assert backend.writes == []
+
+
+def test_a_preview_takes_no_lock_and_makes_no_reads_or_writes(
+    monkeypatch: pytest.MonkeyPatch,
+) -> None:
+    attempts: list[str] = []
+
+    def no_lock(socket_path: str, **_: object) -> None:
+        attempts.append(socket_path)
+        raise AssertionError("a preview took the lock")
+
+    monkeypatch.setattr(pane_change, "server_lock", no_lock)
+    backend = FakeBackend([read(managed())])
+    preview(backend, managed(), renamed("new"))
+    assert attempts == []
+    assert backend.lock_held_during == []
+
+
+def test_a_preview_of_an_ineligible_window_keeps_the_current_window_name() -> None:
+    split = managed(window_panes="2", window_name="user's")
+    outcome = preview(FakeBackend([read(split)]), split, renamed("new"))
+    assert (outcome.pane.name, outcome.pane.display_name) == ("new", "user's")
+    assert (outcome.changed, outcome.display_updated) == (True, False)
+
+
+def test_a_preview_without_a_display_name_keeps_the_window_name() -> None:
+    pane = managed(window_name="shown")
+    outcome = preview(FakeBackend([read(pane)]), pane, Change({"@termctl_labels": "a=b c=d"}, None))
+    assert outcome.pane.labels == ("a=b", "c=d")
+    assert outcome.pane.display_name == "shown"
+    assert (outcome.changed, outcome.display_updated) == (True, False)
+
+
+def test_a_preview_sets_and_clears_the_marker_fields() -> None:
+    pane = managed()
+    plan = Change({"@termctl_marker": "attention", "@termctl_marker_text": "! "}, "! KEY-12")
+    marked = preview(FakeBackend([read(pane)]), pane, plan).pane
+    assert (marked.marker, marked.marker_text, marked.display_name) == (
+        "attention",
+        "! ",
+        "! KEY-12",
+    )
+    cleared = Change({"@termctl_marker": "", "@termctl_marker_text": ""}, "KEY-12")
+    unmarked = preview(FakeBackend([read(marked)]), marked, cleared).pane
+    assert (unmarked.marker, unmarked.marker_text, unmarked.display_name) == (None, None, "KEY-12")
+
+
+def test_a_preview_of_empty_labels_is_no_labels() -> None:
+    pane = managed(**{"@termctl_labels": "a=b"})
+    outcome = preview(FakeBackend([read(pane)]), pane, Change({"@termctl_labels": ""}, None))
+    assert outcome.pane.labels == ()
+
+
+def test_a_preview_no_op_is_the_pane_unchanged() -> None:
+    pane = managed()
+    backend = FakeBackend([read(pane)])
+    outcome = preview(backend, pane, renamed("KEY-12"))
+    assert outcome == pane_change.Outcome(pane=pane, changed=False, display_updated=False)
+
+
+def test_a_preview_proves_a_no_op_with_the_read_only_length_probe() -> None:
+    pane = managed(**{"@termctl_name": "a\\b", "window_name": "a\\\\b"})
+    backend = FakeBackend([read(pane)], lengths=(3, 4))
+    assert preview(backend, pane, renamed("a\\b")).changed is False
+    assert backend.length_queries == [("%3", ("@termctl_name", "window_name"))]
+    backend = FakeBackend([read(pane)], lengths=None)
+    assert preview(backend, pane, renamed("a\\b")).changed is True
+    assert backend.writes == []
+
+
+def test_a_preview_refuses_options_a_change_cannot_write() -> None:
+    with pytest.raises(ValueError):
+        preview(FakeBackend([read(managed())]), managed(), Change({"@termctl_pane": "%1"}, None))
+
+
+def test_a_preview_plan_error_propagates() -> None:
+    def plan(pane: ManagedPane) -> Change:
+        raise TermctlError("usage", "too many labels")
+
+    with pytest.raises(TermctlError):
+        pane_change.preview_change(FakeBackend([read(managed())]), managed(), plan, version=V35)

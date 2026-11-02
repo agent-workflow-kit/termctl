@@ -21,7 +21,7 @@
       "type": "string",
       "pattern": "^[^\\t\\n]*$",
       "x-untrusted": true,
-      "description": "The tmux window name as tmux reports it, read through tmux's format sanitizer (tab and newline become spaces). Untrusted: anything with access to the socket can rename a window."
+      "description": "The tmux window name as tmux reports it, read through tmux's format sanitizer (tab and newline become spaces). Untrusted: anything with access to the socket can rename a window. In a dry run it is the name termctl computes, which can differ from the escaped form tmux reports after the real run."
     },
     "marker_name": {
       "type": "string",

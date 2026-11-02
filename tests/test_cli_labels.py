@@ -399,16 +399,6 @@ def test_an_unusable_state_directory_exits_12_locked_before_any_write(state: Pat
 # --- dry runs and unexpected failures ---------------------------------------------------------
 
 
-@pytest.mark.parametrize("verb", ["add", "remove"])
-def test_dry_run_is_not_implemented_yet_and_not_logged(state: Path, verb: str) -> None:
-    gateway = labelled("kind=review", "kind=review")
-    result = run(["--json", "label", verb, ID, "x=1", "--dry-run"], gateway, state)
-    assert (result.code, result.json()["error"]["code"]) == (1, "internal")
-    assert writes(gateway) == []
-    assert result.log() == []
-    assert not (state / "termctl" / "locks").exists()
-
-
 def test_an_unexpected_failure_is_logged_as_internal(
     state: Path, monkeypatch: pytest.MonkeyPatch
 ) -> None:
