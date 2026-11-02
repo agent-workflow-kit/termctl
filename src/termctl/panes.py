@@ -7,8 +7,10 @@ commands run by someone with socket access (a hook can see the format, sentinel 
 print a forged record). The free-text fields tmux controls (session and window names) are read
 with tab and newline replaced by spaces in the format string; the ``@termctl_*`` options are read
 as is, so a value holding a tab or newline (one termctl never writes) breaks its record and the
-pane is ignored with a warning instead of being read wrongly. tmux prints the other control
-characters of every field escaped (``\\033``), and with ``-u`` writes UTF-8 whatever the locale.
+pane is ignored with a warning instead of being read wrongly. tmux 3.3 to 3.5 print the other
+control characters of every field escaped (``\\033``); 3.2 and 3.6 and later print them raw, where
+the option rules reject them and termctl escapes them when it prints them. With ``-u`` tmux writes
+UTF-8 whatever the locale.
 
 A pane is managed only if its ``@termctl_pane`` equals its own pane id: a ``#{@...}`` format
 also returns values inherited from the window, session or global scope (spike F4), and such a
@@ -46,6 +48,7 @@ TMUX_FIELDS: tuple[str, ...] = (
     "pane_dead_signal",
     "pane_pid",
     "window_panes",
+    "session_id",
 )
 # Free text tmux reports; read sanitized (tab and newline become spaces).
 TEXT_FIELDS: tuple[str, ...] = ("session_name", "window_name")
@@ -75,6 +78,7 @@ _SENTINEL_PREFIX = "termctl-end-"
 
 _PANE_ID = re.compile(r"%[0-9]+")
 _WINDOW_ID = re.compile(r"@[0-9]+")
+_SESSION_ID = re.compile(r"\$[0-9]+")
 _TERMCTL_ID = re.compile(r"tc-[a-z2-7]{8}")
 _COUNT = re.compile(r"0|[1-9][0-9]{0,9}")
 _POSITIVE = re.compile(r"[1-9][0-9]{0,9}")
@@ -120,6 +124,10 @@ class ManagedPane:
     # The first session tmux lists for the pane's window, and every session it is linked into.
     session: str
     sessions: tuple[str, ...]
+    # tmux's ids of those sessions, in the same order (focus targets and prefers by id, since a
+    # name may be anything a user renamed a session to).
+    session_id: str
+    session_ids: tuple[str, ...]
     display_name: str
     # tmux's #{pane_pid}: close compares it with the recorded pid.
     pane_pid: int | None
@@ -242,6 +250,7 @@ def _managed_pane(pane_id: str, pane_rows: list[list[str]]) -> ManagedPane:
             raise _Ignored("malformed list-panes record (a value holds a tab or newline)")
     first: dict[str, str] = dict(zip(FIELDS, pane_rows[0], strict=True))
     sessions = _sessions(pane_rows)
+    session_ids = _session_ids(pane_rows)
     if first["@termctl_v"] != SCHEMA_VERSION:
         raise _Ignored(f"unknown @termctl_v {show(first['@termctl_v'])}")
     dead = _choice(first, "pane_dead", ("0", "1")) == "1"
@@ -270,6 +279,8 @@ def _managed_pane(pane_id: str, pane_rows: list[list[str]]) -> ManagedPane:
         window_id=_match(first, "window_id", _WINDOW_ID),
         session=sessions[0],
         sessions=sessions,
+        session_id=session_ids[0],
+        session_ids=session_ids,
         display_name=first["window_name"],
         pane_pid=_optional_int(first, "pane_pid", _COUNT),
         window_panes=int(_match(first, "window_panes", _POSITIVE)),
@@ -288,6 +299,17 @@ def _sessions(pane_rows: list[list[str]]) -> tuple[str, ...]:
         if name not in sessions:
             sessions.append(name)
     return tuple(sessions)
+
+
+def _session_ids(pane_rows: list[list[str]]) -> tuple[str, ...]:
+    ids: list[str] = []
+    for parts in pane_rows:
+        session_id = parts[_INDEX["session_id"]]
+        if _SESSION_ID.fullmatch(session_id) is None:
+            raise _Ignored(f"invalid session_id {show(session_id)}")
+        if session_id not in ids:
+            ids.append(session_id)
+    return tuple(ids)
 
 
 def _invalid(values: dict[str, str], field: str) -> _Ignored:

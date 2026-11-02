@@ -14,9 +14,8 @@ import sys
 
 import pytest
 
-from .conftest import TmuxServer, wait_for
+from .conftest import NO_CONFIG, TMUX_PRINTS_RAW, TmuxServer, wait_for
 from .schemas import validate
-from .test_cli_read_integration import NO_CONFIG
 from .test_panes_integration import ID, new_window, tag
 from .test_rename_integration import log, managed, option, option_bytes, termctl, window_name
 
@@ -123,6 +122,9 @@ def test_a_marker_removed_from_config_stays_until_unmark(tmux_server: TmuxServer
     assert option(tmux_server, pane_id, "@termctl_marker") == ""
 
 
+@pytest.mark.skipif(
+    TMUX_PRINTS_RAW, reason="tmux 3.6 prints the control byte raw instead of escaping it"
+)
 def test_a_forged_control_byte_in_the_marker_text_is_rewritten(tmux_server: TmuxServer) -> None:
     pane_id = managed(tmux_server)
     flags = config(tmux_server, "marker_display: option\nmarkers:\n  esc:\n    text: '\\033 '\n")
