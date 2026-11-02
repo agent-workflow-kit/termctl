@@ -1,0 +1,1 @@
+{"error": {"code": "config_invalid", "message": "unsafe config {path}: writable by group (mode 0664); run: chmod go-w '{path}'", "details": {"file": "{path}", "mode": "0664"}}}

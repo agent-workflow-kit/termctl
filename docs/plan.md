@@ -155,7 +155,8 @@ Before the declaring commit also:
 
 - Maintainer: add `tmux (floor)` and `tmux (latest)` to the `main` ruleset's required status checks (currently `ci / ci-ok` and `pr-title / pr-title`); `macos` stays optional.
 - Update `awkit-docs/interface-registry.md` with the declaration (CLAUDE.md rule).
-- Open spec questions to settle or knowingly carry into 1.0 (each is also a candidate for a post-1.0 additive change): config file ownership checks; a `/dev/tty` presence check (deferred post-1.0, #60); `target: pane` placements and markers on shared-window panes (reserved, 1.x: #29, #30).
+- Config file ownership checks: resolved by D36 ([interface.md](interface.md#config), #59).
+- Open spec questions to settle or knowingly carry into 1.0 (each is also a candidate for a post-1.0 additive change): a `/dev/tty` presence check (deferred post-1.0, #60); `target: pane` placements and markers on shared-window panes (reserved, 1.x: #29, #30).
 - Residual risks in [interface.md](interface.md#residual-risks) are accepted as written; re-read them once before declaring.
 
 ## Version roadmap

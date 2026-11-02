@@ -169,6 +169,9 @@ def private_home() -> Iterator[Path]:
     root = Path(tempfile.mkdtemp(prefix="tc-home-"))
     for name in ("home", "config", "tmux"):
         (root / name).mkdir()
+    # termctl refuses config that group or others can write (interface.md "Config"): a developer's
+    # umask 002 would make every config file a test writes unsafe, so the run uses 022.
+    old_umask = os.umask(0o022)
     with pytest.MonkeyPatch.context() as patch:
         patch.setenv("HOME", str(root / "home"))
         patch.setenv("XDG_CONFIG_HOME", str(root / "config"))
@@ -177,6 +180,7 @@ def private_home() -> Iterator[Path]:
         try:
             yield root
         finally:
+            os.umask(old_umask)
             shutil.rmtree(root, ignore_errors=True)
 
 
