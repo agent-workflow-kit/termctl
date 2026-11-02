@@ -52,7 +52,7 @@ Status: planned, 2026-10-30. Implements [interface.md](interface.md) (normative)
 - ids: generation (base32), lower-casing, prefix rules (short → 2, ambiguous → 21 with candidates, duplicate full id → 21).
 - `log.jsonl`/`audit.jsonl` records validate against their schemas; level derived from result.
 - lock: second holder waits, times out at 10 s with exit 12 `locked`; released when the holder dies; never held during hooks.
-- hooks: order, veto stops later hooks (11), escalation lets later hooks run (13), timeout counts as veto, process-group kill on timeout, payload on stdin, `TERMCTL_HOOK`/`TERMCTL_ID`/`TERMCTL_OBJECT_TYPE`, decision ids from stdout validated (bad ones dropped with a warning), `--hook` name and timeout rules, `--override-escalation` gate (TTY or `--actor human:*`) and exit-13-as-allow.
+- hooks: order, veto stops later hooks (11), escalation lets later hooks run (13), timeout counts as veto, process-group kill on timeout, payload on stdin, `TERMCTL_HOOK`/`TERMCTL_ID`/`TERMCTL_OBJECT_TYPE`, decision ids from stdout validated (bad ones dropped with a warning), `--hook` name and timeout rules, `--override-escalation` gate (TTY or `--actor human:*`; explicit `auto:*` refused even on a TTY) and exit-13-as-allow.
 - `placements --label`: rule matching, `origin` values.
 
 **Status**: Complete
@@ -116,7 +116,7 @@ Interim state: the CLI `open` runs every step: pre-open hooks, creation, PID rec
 **Success Criteria**: `close` never kills a running pane without a human `--force`, never signals a process other than the recorded one, and kills only the managed pane in a split window; `focus` never moves a client on another session by default, attaches the current terminal before switching any other client, and gives `--json` callers an attach argv that works when exec'd.
 **Tests**:
 
-- close: running without `--force` → 20 `running`; `--force` gate (TTY or `--actor human:*`); full id required with `--force`; pre-close hooks then re-check; `state_changed` (12) when the state changed; gone at re-check → 0 with post-close hooks; `kill-pane` only (spike D5); kernel SIGHUP then grace, SIGTERM, 5 s, SIGKILL, 1 s (spike F3); PID plus start time check before every signal, `pid_mismatch`; `@termctl_pid` not equal to the same row's `#{pane_pid}` at step 1 or at step-3 re-resolution → `pid_mismatch: true`, no signal ever sent; pane gone at re-check signals only a PID that passed the step-1 check; zombie counts as exited; survives SIGKILL → `exited: false`, exit 0; audit records for forced and override runs; `--dry-run` (`signals_possible`).
+- close: running without `--force` → 20 `running`; `--force` gate (TTY or `--actor human:*`; explicit `auto:*` refused even on a TTY); full id required with `--force`; pre-close hooks then re-check; `state_changed` (12) when the state changed; gone at re-check → 0 with post-close hooks; `kill-pane` only (spike D5); kernel SIGHUP then grace, SIGTERM, 5 s, SIGKILL, 1 s (spike F3); PID plus start time check before every signal, `pid_mismatch`; `@termctl_pid` not equal to the same row's `#{pane_pid}` at step 1 or at step-3 re-resolution → `pid_mismatch: true`, no signal ever sent; pane gone at re-check signals only a PID that passed the step-1 check; zombie counts as exited; survives SIGKILL → `exited: false`, exit 0; audit records for forced and override runs; `--dry-run` (`signals_possible`).
 - focus: step 1 only for clients on the caller's session (the third field of `TMUX`, used only when it holds `$TMUX_PANE`, validated `%N`); step 2 when stdin and stderr are terminals (exec in human mode; `--json` returns the 7-element attach argv with `-E`); step 3 most recent client preferring the pane's session, always `-c`; step 4 `no_client`; `--client` skips steps 1–2; `-E` keeps the session environment unchanged (spike F1); `=$N:@W.%P` targets (spike D2, F7); log written before exec; `--dry-run`.
 
 **Status**: Complete
@@ -156,7 +156,7 @@ Before the declaring commit also:
 - Maintainer: add `tmux (floor)` and `tmux (latest)` to the `main` ruleset's required status checks (currently `ci / ci-ok` and `pr-title / pr-title`); `macos` stays optional.
 - Update `awkit-docs/interface-registry.md` with the declaration (CLAUDE.md rule).
 - Config file ownership checks: resolved by D36 ([interface.md](interface.md#config), #59).
-- Open spec questions to settle or knowingly carry into 1.0 (each is also a candidate for a post-1.0 additive change): `--override-escalation` passing on any TTY even with an `auto:` actor; `target: pane` placements and markers on shared-window panes (reserved, 1.x: #29, #30).
+- Open spec questions to settle or knowingly carry into 1.0 (each is also a candidate for a post-1.0 additive change): a `/dev/tty` presence check (deferred post-1.0, #60); `target: pane` placements and markers on shared-window panes (reserved, 1.x: #29, #30).
 - Residual risks in [interface.md](interface.md#residual-risks) are accepted as written; re-read them once before declaring.
 
 ## Version roadmap
