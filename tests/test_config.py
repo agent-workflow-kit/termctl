@@ -5,6 +5,7 @@ import json
 import math
 import os
 import socket
+import tempfile
 import time
 from collections.abc import Iterator
 from pathlib import Path
@@ -1529,11 +1530,19 @@ def test_unsafe_config_names_no_key(tmp_path: Path) -> None:
     assert "key" not in (unsafe_error(home, main).details or {})
 
 
-def test_sticky_directory_may_be_writable(tmp_path: Path) -> None:
-    home, main, dropins_dir = trusted_home(tmp_path)
-    chmod(dropins_dir, 0o1777)
+def test_sticky_main_directory_may_be_writable(tmp_path: Path) -> None:
+    home, main, _ = trusted_home(tmp_path)
     chmod(main.parent, 0o1777)
     assert load({"HOME": str(home)}).keep_on_exit == "always"
+
+
+@pytest.mark.parametrize("mode", [0o1770, 0o1777])
+def test_sticky_writable_config_d_is_refused(tmp_path: Path, mode: int) -> None:
+    # R1-1: anyone who can write config.d can add a drop-in, sticky bit or not.
+    home, _, dropins_dir = trusted_home(tmp_path)
+    chmod(dropins_dir, mode)
+    err = unsafe_error(home, dropins_dir)
+    assert f"(mode {mode:04o})" in err.message
 
 
 def test_sticky_bit_does_not_excuse_a_writable_file(tmp_path: Path) -> None:
@@ -1613,7 +1622,8 @@ def test_root_owned_writable_file_is_still_refused(
     home, main, _ = trusted_home(tmp_path)
     chmod(main, 0o666)
     report_owner(monkeypatch, 0)
-    unsafe_error(home, main)
+    err = unsafe_error(home, main)
+    assert "chmod" not in err.message  # R1-6: only root could run it
 
 
 @pytest.mark.usefixtures("not_root")
@@ -1750,8 +1760,8 @@ def test_drop_in_replaced_after_the_listing_is_checked_when_opened(
     home, _, dropins_dir = trusted_home(tmp_path)
     real = config._dropins  # pyright: ignore[reportPrivateUsage]
 
-    def swap(main: Path) -> list[Path]:
-        found = real(main)
+    def swap(main: Path, parent: os.stat_result | None = None) -> list[Path]:
+        found = real(main, parent)
         (dropins_dir / "a.yaml").unlink()
         chmod(write(dropins_dir / "a.yaml", {"keep_on_exit": "failed"}), 0o666)
         return found
@@ -1768,3 +1778,244 @@ def test_placements_remerge_is_kept(tmp_path: Path) -> None:
     write(home / ".config" / "termctl" / "config.d" / "a.yaml", {"placements": {"x": {}}})
     cfg = load({"HOME": str(home)})
     assert "default" in cfg.placements
+
+
+# --- trust checks, review round 1 ---------------------------------------------------------------
+
+
+def report_entry_owner(monkeypatch: pytest.MonkeyPatch, owner: int, only: Path) -> None:
+    """Make ``os.lstat`` report ``owner`` for the directory entry ``only``."""
+    real = os.lstat
+    target = real(only)
+
+    def lstat(path: Any, *args: Any, **kwargs: Any) -> os.stat_result:
+        info = real(path, *args, **kwargs)
+        if not os.path.samestat(info, target):
+            return info
+        fields = list(info)
+        fields[4] = owner
+        return os.stat_result(fields)
+
+    monkeypatch.setattr(config.os, "lstat", lstat)
+
+
+@pytest.mark.usefixtures("not_root")
+@pytest.mark.parametrize("entry", ["main", "config.d"])
+def test_foreign_entry_in_a_sticky_writable_main_directory_is_refused(
+    tmp_path: Path, monkeypatch: pytest.MonkeyPatch, entry: str
+) -> None:
+    # R1-1: in a sticky directory others can write, others can add the entries termctl uses.
+    home, main, dropins_dir = trusted_home(tmp_path)
+    chmod(main.parent, 0o1777)
+    path = main if entry == "main" else dropins_dir
+    report_entry_owner(monkeypatch, 4242, path)
+    err = unsafe_error(home, path)
+    assert "owned by uid 4242" in err.message
+    assert "in a directory other users can write" in err.message
+    assert "chmod" not in err.message
+
+
+@pytest.mark.usefixtures("not_root")
+def test_foreign_symlink_entry_in_a_sticky_writable_directory_is_refused(
+    tmp_path: Path, monkeypatch: pytest.MonkeyPatch
+) -> None:
+    # The entry itself is checked, not only what it leads to.
+    explicit_dir = tmp_path / "shared"
+    explicit_dir.mkdir(mode=0o700)
+    target = write(tmp_path / "mine" / "c.yaml", {"tmux_bin": "mine"})
+    link = explicit_dir / "c.yaml"
+    link.symlink_to(target)
+    chmod(explicit_dir, 0o1777)
+    real = os.lstat
+    link_info = real(link)
+
+    def lstat(path: Any, *args: Any, **kwargs: Any) -> os.stat_result:
+        info = real(path, *args, **kwargs)
+        if os.path.samestat(info, link_info):
+            fields = list(info)
+            fields[4] = 4242
+            return os.stat_result(fields)
+        return info
+
+    monkeypatch.setattr(config.os, "lstat", lstat)
+    err = load_error({}, str(link))
+    assert err.message.startswith(f"unsafe config {link}: owned by uid 4242")
+
+
+def test_hard_linked_main_file_in_a_sticky_writable_directory_is_refused(tmp_path: Path) -> None:
+    home, main, _ = trusted_home(tmp_path)
+    os.link(main, tmp_path / "other-name")
+    chmod(main.parent, 0o1777)
+    err = unsafe_error(home, main)
+    assert "2 hard links in a directory other users can write" in err.message
+    assert "chmod" not in err.message
+
+
+def test_hard_linked_main_file_in_a_private_directory_loads(tmp_path: Path) -> None:
+    home, main, _ = trusted_home(tmp_path)
+    os.link(main, tmp_path / "other-name")
+    assert load({"HOME": str(home)}).tmux_bin == "trusted"
+
+
+def test_config_in_a_search_only_directory_loads(tmp_path: Path) -> None:
+    # R1-2: a directory with mode --x (like a root-owned 0711 one) is checked by path.
+    explicit = write(tmp_path / "d" / "c.yaml", {"tmux_bin": "searched"})
+    chmod(explicit.parent, 0o311)
+    try:
+        assert load({}, str(explicit)).tmux_bin == "searched"
+        link = tmp_path / "link.yaml"
+        link.symlink_to(explicit)
+        assert load({}, str(link)).tmux_bin == "searched"
+    finally:
+        chmod(explicit.parent, 0o700)
+
+
+def test_writable_search_only_directory_is_refused(tmp_path: Path) -> None:
+    explicit = write(tmp_path / "d" / "c.yaml", {})
+    chmod(explicit.parent, 0o331)
+    try:
+        err = load_error({}, str(explicit))
+        assert err.message.startswith(f"unsafe config {explicit.parent}: writable by group")
+        link = tmp_path / "link.yaml"
+        link.symlink_to(explicit)
+        err = load_error({}, str(link))
+        assert err.message.startswith(f"unsafe config {explicit.parent}: writable by group")
+    finally:
+        chmod(explicit.parent, 0o700)
+
+
+def test_file_replaced_after_it_was_opened_is_refused(
+    tmp_path: Path, monkeypatch: pytest.MonkeyPatch
+) -> None:
+    explicit = write(tmp_path / "d" / "c.yaml", {"tmux_bin": "first"})
+    real = os.open
+
+    def swapping_open(path: Any, flags: int, *args: Any, **kwargs: Any) -> int:
+        fd = real(path, flags, *args, **kwargs)
+        if not flags & os.O_DIRECTORY and os.fspath(path).endswith("c.yaml"):
+            explicit.unlink()
+            write(explicit, {"tmux_bin": "second"})
+        return fd
+
+    monkeypatch.setattr(config.os, "open", swapping_open)
+    err = load_error({}, str(explicit))
+    assert err.message == f"cannot read config {explicit}: changed while it was being checked"
+
+
+def test_target_file_is_not_opened_before_its_directory_is_checked(
+    tmp_path: Path, monkeypatch: pytest.MonkeyPatch
+) -> None:
+    # R1-3: the directory holding the target is checked before the target is opened.
+    home, main, _ = trusted_home(tmp_path)
+    main.unlink()
+    target = write(tmp_path / "dotfiles" / "linked.yaml", {})
+    chmod(target.parent, 0o777)
+    main.symlink_to(target)
+    opened: list[bool] = []
+    real = os.open
+    target_info = target.stat()
+
+    def spy(path: Any, flags: int, *args: Any, **kwargs: Any) -> int:
+        fd = real(path, flags, *args, **kwargs)
+        opened.append(os.path.samestat(os.fstat(fd), target_info))
+        return fd
+
+    monkeypatch.setattr(config.os, "open", spy)
+    unsafe_error(home, target.parent)
+    assert opened and not any(opened)
+
+
+def test_target_swapped_for_a_symlink_fails_safe(
+    tmp_path: Path, monkeypatch: pytest.MonkeyPatch
+) -> None:
+    explicit = write(tmp_path / "d" / "c.yaml", {"tmux_bin": "first"})
+    other = write(tmp_path / "elsewhere" / "o.yaml", {"tmux_bin": "swapped"})
+    real = os.path.realpath
+
+    def swapping_realpath(path: Any, *args: Any, **kwargs: Any) -> str:
+        result = real(path, *args, **kwargs)
+        if result == str(explicit) and explicit.is_file() and not explicit.is_symlink():
+            explicit.unlink()
+            explicit.symlink_to(other)
+        return result
+
+    monkeypatch.setattr(config.os.path, "realpath", swapping_realpath)
+    err = load_error({}, str(explicit))
+    assert err.message.startswith(f"cannot read config {explicit}: ")
+
+
+def test_trust_failure_in_config_d_wins_over_a_yaml_error_in_the_main_file(
+    tmp_path: Path,
+) -> None:
+    # R1-4: every trust check runs before any config content is parsed.
+    home, main, dropins_dir = trusted_home(tmp_path)
+    write(main, "{ not: [valid")
+    chmod(dropins_dir, 0o777)
+    unsafe_error(home, dropins_dir)
+
+
+def test_trust_failure_in_a_later_drop_in_wins_over_a_yaml_error_in_an_earlier_one(
+    tmp_path: Path,
+) -> None:
+    home, _, dropins_dir = trusted_home(tmp_path)
+    write(dropins_dir / "a.yaml", "{ not: [valid")
+    bad = chmod(write(dropins_dir / "b.yaml", {}), 0o666)
+    unsafe_error(home, bad)
+
+
+def test_symlinked_config_d_is_reported_as_its_target(tmp_path: Path) -> None:
+    # R1-5: directories are reported as the absolute path they resolve to.
+    home, _, dropins_dir = trusted_home(tmp_path)
+    real = tmp_path / "real.d"
+    dropins_dir.rename(real)
+    dropins_dir.symlink_to(real)
+    chmod(real, 0o777)
+    err = unsafe_error(home, real)
+    assert f"run: chmod go-w '{real}'" in err.message
+
+
+def test_symlinked_config_directory_is_reported_as_its_target(tmp_path: Path) -> None:
+    home, main, _ = trusted_home(tmp_path)
+    real = tmp_path / "real-termctl"
+    main.parent.rename(real)
+    main.parent.symlink_to(real)
+    chmod(real, 0o777)
+    unsafe_error(home, real)
+
+
+def test_relative_config_flag_reports_an_absolute_directory(
+    tmp_path: Path, monkeypatch: pytest.MonkeyPatch
+) -> None:
+    explicit = write(tmp_path / "d" / "c.yaml", {})
+    chmod(explicit.parent, 0o777)
+    monkeypatch.chdir(explicit.parent)
+    err = load_error({}, "c.yaml")
+    assert err.details == {"file": str(explicit.parent), "mode": "0777"}
+    assert f"chmod go-w '{explicit.parent}'" in err.message
+
+
+@pytest.mark.usefixtures("not_root")
+def test_group_writable_file_owned_by_root_has_no_hint(
+    tmp_path: Path, monkeypatch: pytest.MonkeyPatch
+) -> None:
+    # R1-6: chmod works only for the owner.
+    explicit = chmod(write(tmp_path / "c.yaml", {}), 0o664)
+    report_owner(monkeypatch, 0, only=explicit)
+    err = load_error({}, str(explicit))
+    assert "writable by group (mode 0664)" in err.message
+    assert "chmod" not in err.message
+
+
+def test_config_file_directly_in_tmp_loads() -> None:
+    # R1-10: a real root-owned sticky directory, not a simulated one.
+    info = os.stat("/tmp")
+    if info.st_uid != 0 or not info.st_mode & 0o1000 or not info.st_mode & 0o002:
+        pytest.skip("/tmp is not a root-owned, world-writable sticky directory")
+    fd, name = tempfile.mkstemp(prefix="termctl-config-", suffix=".yaml", dir="/tmp")
+    try:
+        os.write(fd, b"tmux_bin: in-tmp\n")
+        os.close(fd)
+        os.chmod(name, 0o600)
+        assert load({}, name).tmux_bin == "in-tmp"
+    finally:
+        os.unlink(name)

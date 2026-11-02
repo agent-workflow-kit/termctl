@@ -80,7 +80,7 @@
         },
         "details": {
           "type": "object",
-          "description": "Code-specific context (interface.md Errors). server_unavailable: socket_path, plus path only when a socket safety check failed; not_supported: placement and fields; tmux_missing and tmux_too_old: tmux_bin, and path once it resolved; tmux_too_old adds tmux_version. config_invalid: variable (environment) or key (config), or file (a config file, with line and column where known) and mode (permission bits as four octal digits) when a config trust check failed."
+          "description": "Code-specific context (interface.md Errors). server_unavailable: socket_path, plus path only when a socket safety check failed; not_supported: placement and fields; tmux_missing and tmux_too_old: tmux_bin, and path once it resolved; tmux_too_old adds tmux_version. config_invalid: variable (environment) or key (config), or file (a config file, with line and column where known; when a config trust check failed, the absolute path, symlinks resolved, of the file, directory or entry that failed) and mode (permission bits as four octal digits) when a config trust check failed."
         }
       },
       "additionalProperties": false,
