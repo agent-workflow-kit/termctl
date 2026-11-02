@@ -852,7 +852,7 @@ def test_context_carries_injected_gateway_and_clock(monkeypatch: pytest.MonkeyPa
 # --- unimplemented commands ---------------------------------------------------------------------
 
 
-IMPLEMENTED = {"show", "exists", "list", "placements", "open", "close", "focus"}
+IMPLEMENTED = {"show", "exists", "list", "placements", "open", "close", "focus", "rename"}
 UNIMPLEMENTED = sorted(set(MINIMAL) - IMPLEMENTED)
 
 
@@ -879,7 +879,7 @@ def test_unimplemented_command_golden() -> None:
     expected = json.loads((GOLDEN / "error-not-implemented.json").read_text(encoding="utf-8"))
     validate(expected, "termctl/cli/error.json")
     assert (
-        Run(["--json", "rename", ID, "new-name"], FakeGateway(panes=[pane_row(tc_id=ID)])).json()
+        Run(["--json", "mark", ID, "attention"], FakeGateway(panes=[pane_row(tc_id=ID)])).json()
         == expected
     )
 
