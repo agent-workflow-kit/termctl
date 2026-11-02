@@ -373,7 +373,7 @@ With `--json`, every non-zero exit prints `{"error": {...}}` on stdout (`schemas
 | `candidates` | only with `ambiguous`: the matching panes (`id`, `pane_id`, `session`), sorted by id, then by pane id (tmux's `%N` by number, so `%9` comes before `%10`) |
 | `details` | optional, code-specific context |
 
-`details` of `server_unavailable`: `socket_path`, plus `path` (the file or directory that failed) only when a socket safety check failed ([Server selection](#server-selection)); of `no_server`: `socket_path`; of `not_supported`: `placement` (the placement's name) and `fields` (what it uses that is not supported: `target` for `target: pane`, and each pane-only field it sets); of `config_invalid` from the environment: `variable`, from config: `key`.
+`details` of `server_unavailable`: `socket_path`, plus `path` (the file or directory that failed) only when a socket safety check failed ([Server selection](#server-selection)); of `no_server`: `socket_path`; of `not_supported`: `placement` (the placement's name) and `fields` (what it uses that is not supported: `target` for `target: pane`, and each pane-only field it sets); of `config_invalid` from the environment: `variable`, from config: `key`, from a config file: `file` (with `line` and `column` where known) and, when a trust check failed ([Config](#config)), `mode`.
 
 | Code | Exit | Commands |
 |---|---|---|
@@ -443,7 +443,18 @@ Two further checks apply to the merged config, so their errors name only the key
 
 The main file may be missing (no settings), unless it was given with `--config` or it, or a directory above it, is a dangling symlink (the error names that symlink); any other failure to read it is an error. The main file and the drop-ins must be regular files after following symlinks; anything else (a directory, a FIFO, a device) is an error, and termctl never blocks opening one. The main file and each drop-in may be at most 1 MiB (1048576 bytes); a larger one is an error naming the file (`details.file`), and termctl reads at most one byte past the limit. A missing `config.d/` means no drop-ins; one that cannot be listed (unreadable, not a directory, a dangling symlink) is an error. Drop-ins are the entries whose names end in `.yaml` and do not start with `.`, read in code point order of their names. When neither an absolute `XDG_CONFIG_HOME` nor an absolute `HOME` is set, the home directory comes from the user's passwd entry; without one, or if it is not absolute, termctl exits 2 (`config_invalid`).
 
-With `--config PATH`, termctl also reads the `config.d/` next to PATH. Drop-ins can add hooks, which run commands, so PATH should be a file in a directory only the user can write.
+**Trust checks.** Config can run commands (hooks run through `/bin/sh -c`, `tmux_bin` names any executable) and is loaded before every other safety check, and a pre-hook that exits 0 overrides a veto, so a config another user could have written would defeat the other guards. Before reading any config file termctl therefore checks, on the opened descriptor (`fstat`, so a file swapped after the check is not the one read), that each of these is owned by the effective user or by root and is not writable by group or others (mode `& 0o022` is 0; also for a user-private group, as in [Audit and log](#audit-and-log)):
+
+- the main file;
+- each drop-in;
+- the `config.d/` directory (if it exists);
+- the directory that holds the main file (if it exists).
+
+A directory with the sticky bit (like `/tmp`) may be group- or other-writable, because others cannot replace or remove entries they do not own; this exception is for directories only, never for files. A symlink to a file is allowed (config is often linked from a dotfiles repository), but the file it resolves to is checked, and so is the directory that holds that file; no other ancestor is walked, so `~` and `~/.config` are not checked. A `config.d/` that is a symlink to a directory is checked as what it resolves to. With `--config PATH`, PATH, the directory holding it and the `config.d/` next to it are checked the same way. A missing file or directory is not checked (the existing rules for missing config apply). macOS extended ACLs are not checked.
+
+A failure exits 2 (`config_invalid`), before any config content is read, with `details.file` (the path that failed; for a symlink, the file it resolves to) and `details.mode` (its permission bits as four octal digits), a message that names the path, the problem and the mode, and, where it fixes the problem, the hint `run: chmod go-w '<path>'`. For example: `unsafe config /home/u/.config/termctl/config.yaml: writable by group (mode 0664); run: chmod go-w '/home/u/.config/termctl/config.yaml'`. A foreign owner has no hint: `unsafe config /etc/x/config.yaml: owned by uid 1001, not the current user or root (mode 0644)`. The check is on by default and has no switch to turn it off.
+
+Drop-ins can add hooks, which run commands; keep `--config` files in a directory only you can write. The check cannot stop a process that runs as the same user: it can write the config, and also the hooks, so see [Residual risks](#residual-risks).
 
 | Key | Default | Meaning |
 |---|---|---|
@@ -496,6 +507,7 @@ termctl has no per-repo overrides (it has no notion of a repository).
 - **An attach can start a server.** `tmux attach` starts a server when none runs. If the server exits between `focus`'s decision and its exec (or before a `--json` caller execs the argv), tmux starts a new server with the caller's environment and the user's tmux config. termctl cannot prevent this through the argv.
 - **`--env` values are visible** to local process listings while the tmux client runs.
 - **The command check searches fewer `PATH` entries than `env`.** The command check searches only the absolute entries of the command's `PATH` ([Open order](#open-order) step 2), while `/usr/bin/env` looks the program up on the whole `PATH`. With an empty or relative entry before the matching absolute one, a different executable (for example one in the pane's working directory) can run than the one the check found.
+- **Same-user writes to config.** The [trust checks](#config) refuse config that another user could have modified. A process running as the same user (an agent, a script, a compromised tool) can still write the config, its hooks and `tmux_bin`, and so can run commands as that user and override any veto; termctl does not defend against the user's own account. Root, or anyone who can act as the user or as root, is trusted. Between the check and the read, only the user or root can replace a checked file, so the check-then-use window is not exploitable by other users.
 - **Restored windows.** Tools that recreate windows after a tmux server restart do not restore termctl's options; such windows are unmanaged.
 
 ## Platform notes

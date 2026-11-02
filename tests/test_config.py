@@ -29,15 +29,22 @@ GOLDEN = Path(__file__).parent / "golden"
 
 
 def write(path: Path, data: Any) -> Path:
+    """Write ``data`` to ``path``; directories created on the way are 0700 and the file 0600,
+    whatever the umask, so the config trust checks (interface.md "Config") pass."""
+    missing = [d for d in reversed(path.parents) if not d.exists()]
     path.parent.mkdir(parents=True, exist_ok=True)
+    for directory in missing:
+        directory.chmod(0o700)
     path.write_text(data if isinstance(data, str) else yaml.safe_dump(data), encoding="utf-8")
+    path.chmod(0o600)
     return path
 
 
 @pytest.fixture
 def home(tmp_path: Path) -> Path:
     """A home directory with an empty ``~/.config/termctl``."""
-    (tmp_path / "home" / ".config" / "termctl").mkdir(parents=True)
+    for parts in (("home",), ("home", ".config"), ("home", ".config", "termctl")):
+        (tmp_path.joinpath(*parts)).mkdir(mode=0o700)
     return tmp_path / "home"
 
 
@@ -192,7 +199,7 @@ def test_unreadable_config_directory_is_an_error(
 def test_unreadable_drop_in_directory_is_an_error(
     home: Path, dropins: Path, no_access: list[Path]
 ) -> None:
-    dropins.mkdir()
+    dropins.mkdir(mode=0o700)
     lock(no_access, dropins)
     err = load_error({"HOME": str(home)})
     assert err.details == {"file": str(dropins)}
@@ -270,7 +277,7 @@ def test_dangling_drop_in_directory_symlink_is_an_error(
 
 
 def test_fifo_drop_in_is_not_a_regular_file(home: Path, dropins: Path) -> None:
-    dropins.mkdir()
+    dropins.mkdir(mode=0o700)
     fifo = dropins / "a.yaml"
     os.mkfifo(fifo)
     err = load_error({"HOME": str(home)})
@@ -291,6 +298,7 @@ def test_config_file_at_the_size_cap_is_read(home: Path, main_file: Path) -> Non
 def test_config_file_over_the_size_cap_is_too_large(home: Path, main_file: Path) -> None:
     with main_file.open("wb") as file:
         file.truncate(MAX_SIZE + 1)  # sparse: nothing is written
+    main_file.chmod(0o600)
     err = load_error({"HOME": str(home)})
     assert err.details == {"file": str(main_file)}
     assert "too large" in err.message and str(main_file) in err.message
@@ -301,6 +309,7 @@ def test_huge_config_file_is_read_at_most_one_byte_past_the_cap(
 ) -> None:
     with main_file.open("wb") as file:
         file.truncate(1024**3)  # sparse 1 GiB: nothing is written
+    main_file.chmod(0o600)
     sizes: list[int] = []
 
     class Recording(io.BufferedReader):
@@ -320,10 +329,11 @@ def test_huge_config_file_is_read_at_most_one_byte_past_the_cap(
 
 
 def test_drop_in_over_the_size_cap_is_too_large(home: Path, dropins: Path) -> None:
-    dropins.mkdir()
+    dropins.mkdir(mode=0o700)
     big = dropins / "a.yaml"
     with big.open("wb") as file:
         file.truncate(MAX_SIZE + 1)
+    big.chmod(0o600)
     err = load_error({"HOME": str(home)})
     assert err.details == {"file": str(big)}
     assert "too large" in err.message
@@ -1422,3 +1432,339 @@ def test_scalar_default_replaced_by_a_dropin_map_keeps_built_in_fields(
     default = cfg.placements["default"]
     assert (default.session, default.target) == ("termctl", "window")
     assert cfg.configured_default_fields == frozenset({"target"})
+
+
+# --- trust checks (interface.md "Config", #59) --------------------------------------------------
+
+
+def chmod(path: Path, mode: int) -> Path:
+    path.chmod(mode)
+    return path
+
+
+def trusted_home(tmp_path: Path) -> tuple[Path, Path, Path]:
+    """``(home, main file, config.d)`` with every directory 0700 and the file 0600."""
+    home = tmp_path / "home"
+    directory = home / ".config" / "termctl"
+    main = write(directory / "config.yaml", {"tmux_bin": "trusted"})
+    write(directory / "config.d" / "a.yaml", {"keep_on_exit": "always"})
+    return home, main, directory / "config.d"
+
+
+def unsafe_error(home: Path, path: Path, explicit: str | None = None) -> ConfigError:
+    err = load_error({"HOME": str(home)}, explicit)
+    assert err.message.startswith(f"unsafe config {path}: ")
+    assert err.details is not None
+    assert err.details["file"] == str(path)
+    return err
+
+
+def test_trusted_config_loads(tmp_path: Path) -> None:
+    home, _, _ = trusted_home(tmp_path)
+    cfg = load({"HOME": str(home)})
+    assert (cfg.tmux_bin, cfg.keep_on_exit) == ("trusted", "always")
+
+
+@pytest.mark.parametrize(
+    ("mode", "who"),
+    [(0o620, "group"), (0o602, "others"), (0o666, "group and others"), (0o777, "group and others")],
+)
+def test_writable_main_file_is_refused(tmp_path: Path, mode: int, who: str) -> None:
+    home, main, _ = trusted_home(tmp_path)
+    chmod(main, mode)
+    err = unsafe_error(home, main)
+    assert f"writable by {who} (mode {mode:04o})" in err.message
+    assert f"run: chmod go-w '{main}'" in err.message
+    assert err.details == {"file": str(main), "mode": f"{mode:04o}"}
+
+
+def test_group_readable_files_and_directories_are_fine(tmp_path: Path) -> None:
+    home, main, dropins_dir = trusted_home(tmp_path)
+    chmod(main, 0o644)
+    chmod(dropins_dir, 0o755)
+    chmod(main.parent, 0o755)
+    assert load({"HOME": str(home)}).tmux_bin == "trusted"
+
+
+def test_other_writable_directory_of_the_main_file_is_refused(tmp_path: Path) -> None:
+    home, main, _ = trusted_home(tmp_path)
+    chmod(main.parent, 0o707)
+    err = unsafe_error(home, main.parent)
+    assert "writable by others (mode 0707)" in err.message
+
+
+def test_group_writable_directory_of_the_main_file_is_refused_without_a_main_file(
+    tmp_path: Path,
+) -> None:
+    home = tmp_path / "home"
+    directory = write(home / ".config" / "termctl" / "config.d" / "a.yaml", {}).parent.parent
+    chmod(directory, 0o770)
+    unsafe_error(home, directory)
+
+
+def test_writable_config_d_is_refused(tmp_path: Path) -> None:
+    home, _, dropins_dir = trusted_home(tmp_path)
+    chmod(dropins_dir, 0o775)
+    err = unsafe_error(home, dropins_dir)
+    assert f"run: chmod go-w '{dropins_dir}'" in err.message
+
+
+def test_writable_drop_in_is_refused(tmp_path: Path) -> None:
+    home, _, dropins_dir = trusted_home(tmp_path)
+    chmod(dropins_dir / "a.yaml", 0o664)
+    unsafe_error(home, dropins_dir / "a.yaml")
+
+
+def test_unsafe_config_is_refused_before_its_content_is_read(tmp_path: Path) -> None:
+    home, main, _ = trusted_home(tmp_path)
+    chmod(write(main, "{ not: [valid"), 0o666)
+    err = unsafe_error(home, main)  # not a YAML error
+    assert "mode 0666" in err.message
+
+
+def test_unsafe_config_names_no_key(tmp_path: Path) -> None:
+    home, main, _ = trusted_home(tmp_path)
+    chmod(main, 0o666)
+    assert unsafe_error(home, main).details is not None
+    assert "key" not in (unsafe_error(home, main).details or {})
+
+
+def test_sticky_directory_may_be_writable(tmp_path: Path) -> None:
+    home, main, dropins_dir = trusted_home(tmp_path)
+    chmod(dropins_dir, 0o1777)
+    chmod(main.parent, 0o1777)
+    assert load({"HOME": str(home)}).keep_on_exit == "always"
+
+
+def test_sticky_bit_does_not_excuse_a_writable_file(tmp_path: Path) -> None:
+    home, main, _ = trusted_home(tmp_path)
+    chmod(main, 0o1666)
+    unsafe_error(home, main)
+
+
+def test_writable_directory_without_sticky_bit_is_refused_even_with_other_bits(
+    tmp_path: Path,
+) -> None:
+    home, main, _ = trusted_home(tmp_path)
+    chmod(main.parent, 0o2777)  # setgid is not sticky
+    unsafe_error(home, main.parent)
+
+
+@pytest.fixture
+def not_root() -> None:
+    if os.geteuid() == 0:
+        pytest.skip("root owns everything it checks")
+
+
+def fake_euid(monkeypatch: pytest.MonkeyPatch, uid: int) -> None:
+    monkeypatch.setattr(os, "geteuid", lambda: uid)
+
+
+def report_owner(monkeypatch: pytest.MonkeyPatch, owner: int, only: Path | None = None) -> None:
+    """Make ``os.fstat`` in the config module report ``owner`` for ``only`` (else every file)."""
+    real = os.fstat
+
+    def fstat(fd: int) -> os.stat_result:
+        info = real(fd)
+        if only is not None and not os.path.samestat(info, only.stat()):
+            return info
+        fields = list(info)
+        fields[4] = owner
+        return os.stat_result(fields)
+
+    monkeypatch.setattr(config.os, "fstat", fstat)
+
+
+@pytest.mark.usefixtures("not_root")
+@pytest.mark.parametrize("which", ["main", "dropin", "config.d", "directory"])
+def test_foreign_owner_is_refused(
+    tmp_path: Path, monkeypatch: pytest.MonkeyPatch, which: str
+) -> None:
+    home, main, dropins_dir = trusted_home(tmp_path)
+    path = {
+        "main": main,
+        "dropin": dropins_dir / "a.yaml",
+        "config.d": dropins_dir,
+        "directory": main.parent,
+    }[which]
+    report_owner(monkeypatch, 4242, only=path)
+    err = unsafe_error(home, path)
+    assert "owned by uid 4242, not the current user or root" in err.message
+    assert "chmod" not in err.message
+    assert (err.details or {})["mode"] == f"{stat_mode(path):04o}"
+
+
+def stat_mode(path: Path) -> int:
+    return path.stat().st_mode & 0o7777
+
+
+@pytest.mark.usefixtures("not_root")
+def test_root_owned_config_is_fine(tmp_path: Path, monkeypatch: pytest.MonkeyPatch) -> None:
+    home, _, _ = trusted_home(tmp_path)
+    fake_euid(monkeypatch, os.geteuid() + 1)  # the files are not ours...
+    report_owner(monkeypatch, 0)  # ...but root's
+    assert load({"HOME": str(home)}).keep_on_exit == "always"
+
+
+@pytest.mark.usefixtures("not_root")
+def test_root_owned_writable_file_is_still_refused(
+    tmp_path: Path, monkeypatch: pytest.MonkeyPatch
+) -> None:
+    home, main, _ = trusted_home(tmp_path)
+    chmod(main, 0o666)
+    report_owner(monkeypatch, 0)
+    unsafe_error(home, main)
+
+
+@pytest.mark.usefixtures("not_root")
+def test_another_user_who_is_not_root_is_refused_when_we_are_someone_else(
+    tmp_path: Path, monkeypatch: pytest.MonkeyPatch
+) -> None:
+    home, main, _ = trusted_home(tmp_path)
+    fake_euid(monkeypatch, os.geteuid() + 1)  # files owned by the real uid are now foreign
+    err = unsafe_error(home, main.parent)  # the first thing checked
+    assert "owned by uid" in err.message
+
+
+def test_symlinked_file_is_followed_and_its_target_checked(tmp_path: Path) -> None:
+    home, main, _ = trusted_home(tmp_path)
+    main.unlink()
+    target = write(tmp_path / "dotfiles" / "config.yaml", {"tmux_bin": "linked"})
+    main.symlink_to(target)
+    assert load({"HOME": str(home)}).tmux_bin == "linked"
+
+
+def test_symlink_to_a_writable_target_is_refused_naming_the_target(tmp_path: Path) -> None:
+    home, main, _ = trusted_home(tmp_path)
+    main.unlink()
+    target = chmod(write(tmp_path / "dotfiles" / "config.yaml", {}), 0o666)
+    main.symlink_to(target)
+    err = unsafe_error(home, target)
+    assert "mode 0666" in err.message
+
+
+def test_symlink_to_a_file_in_a_writable_directory_is_refused(tmp_path: Path) -> None:
+    home, main, _ = trusted_home(tmp_path)
+    main.unlink()
+    target = write(tmp_path / "dotfiles" / "config.yaml", {})
+    chmod(target.parent, 0o777)
+    main.symlink_to(target)
+    unsafe_error(home, target.parent)
+
+
+def test_symlink_chain_checks_the_final_target(tmp_path: Path) -> None:
+    home, main, _ = trusted_home(tmp_path)
+    main.unlink()
+    target = chmod(write(tmp_path / "final" / "config.yaml", {}), 0o666)
+    hop = tmp_path / "hop.yaml"
+    hop.symlink_to(target)
+    main.symlink_to(hop)
+    unsafe_error(home, target)
+
+
+def test_symlinked_drop_in_target_is_checked(tmp_path: Path) -> None:
+    home, _, dropins_dir = trusted_home(tmp_path)
+    target = chmod(write(tmp_path / "shared" / "b.yaml", {}), 0o662)
+    (dropins_dir / "b.yaml").symlink_to(target)
+    unsafe_error(home, target)
+
+
+def test_symlinked_drop_in_to_a_good_target_is_read(tmp_path: Path) -> None:
+    home, _, dropins_dir = trusted_home(tmp_path)
+    target = write(tmp_path / "shared" / "b.yaml", {"close_grace": "7s"})
+    (dropins_dir / "b.yaml").symlink_to(target)
+    assert load({"HOME": str(home)}).close_grace == "7s"
+
+
+def test_symlinked_config_d_is_checked_as_what_it_resolves_to(tmp_path: Path) -> None:
+    home, main, dropins_dir = trusted_home(tmp_path)
+    real = tmp_path / "real.d"
+    dropins_dir.rename(real)
+    dropins_dir.symlink_to(real)
+    assert load({"HOME": str(home)}).keep_on_exit == "always"
+    chmod(real, 0o777)
+    err = load_error({"HOME": str(home)})
+    assert "mode 0777" in err.message
+
+
+def test_config_flag_checks_the_file_its_directory_and_config_d(tmp_path: Path) -> None:
+    explicit = write(tmp_path / "elsewhere" / "my.yaml", {"tmux_bin": "flag"})
+    dropin = write(tmp_path / "elsewhere" / "config.d" / "a.yaml", {"close_grace": "8s"})
+    assert load({}, str(explicit)).close_grace == "8s"
+    for path in (explicit, dropin, dropin.parent, explicit.parent):
+        original = stat_mode(path)
+        chmod(path, original | 0o020)
+        err = load_error({}, str(explicit))
+        assert err.message.startswith(f"unsafe config {path}: ")
+        chmod(path, original)
+    assert load({}, str(explicit)).tmux_bin == "flag"
+
+
+def test_config_flag_in_a_writable_directory_is_refused(tmp_path: Path) -> None:
+    explicit = write(tmp_path / "d" / "my.yaml", {})
+    chmod(explicit.parent, 0o757)
+    err = load_error({}, str(explicit))
+    assert f"unsafe config {explicit.parent}: writable by others" in err.message
+
+
+def test_refusal_applies_to_the_config_flag_through_the_cli(tmp_path: Path) -> None:
+    explicit = chmod(write(tmp_path / "c.yaml", {}), 0o666)
+    gateway = FakeGateway()
+    code, stdout, stderr = run(["--json", "--config", str(explicit), "placements"], {}, gateway)
+    assert code == 2
+    assert gateway.calls == []
+    envelope = json.loads(stdout)
+    validate(envelope, "termctl/cli/error.json")
+    assert envelope["error"]["code"] == "config_invalid"
+    assert envelope["error"]["details"] == {"file": str(explicit), "mode": "0666"}
+    assert "chmod go-w" in stderr
+
+
+def test_config_invalid_unsafe_golden(tmp_path: Path) -> None:
+    explicit = chmod(write(tmp_path / "c.yaml", {}), 0o664)
+    text = (GOLDEN / "error-config-invalid-unsafe-file.json").read_text(encoding="utf-8")
+    expected = json.loads(text.replace("{path}", str(explicit)))
+    validate(expected, "termctl/cli/error.json")
+    code, stdout, _ = run(["--json", "--config", str(explicit), "placements"], {})
+    assert code == 2
+    assert json.loads(stdout) == expected
+
+
+def test_hostile_path_is_quoted_in_the_hint(tmp_path: Path) -> None:
+    explicit = chmod(write(tmp_path / "it's $(x) c.yaml", {}), 0o666)
+    err = load_error({}, str(explicit))
+    assert "chmod go-w '" + str(explicit).replace("'", "'\\''") + "'" in err.message
+
+
+def test_missing_files_are_not_checked_or_refused(tmp_path: Path) -> None:
+    home = tmp_path / "home"
+    home.mkdir(mode=0o700)
+    chmod(home, 0o777)  # not the main file's directory, which does not exist
+    assert load({"HOME": str(home)}).tmux_bin == "tmux"
+
+
+def test_drop_in_replaced_after_the_listing_is_checked_when_opened(
+    tmp_path: Path, monkeypatch: pytest.MonkeyPatch
+) -> None:
+    # A file replaced after the directory listing is checked when it is opened, not before.
+    home, _, dropins_dir = trusted_home(tmp_path)
+    real = config._dropins  # pyright: ignore[reportPrivateUsage]
+
+    def swap(main: Path) -> list[Path]:
+        found = real(main)
+        (dropins_dir / "a.yaml").unlink()
+        chmod(write(dropins_dir / "a.yaml", {"keep_on_exit": "failed"}), 0o666)
+        return found
+
+    monkeypatch.setattr(config, "_dropins", swap)
+    unsafe_error(home, dropins_dir / "a.yaml")
+
+
+def test_placements_remerge_is_kept(tmp_path: Path) -> None:
+    # #3: a scalar `placements` in the main file, replaced by a map in a drop-in, keeps the
+    # built-in default.
+    home = tmp_path / "home"
+    write(home / ".config" / "termctl" / "config.yaml", {"placements": None})
+    write(home / ".config" / "termctl" / "config.d" / "a.yaml", {"placements": {"x": {}}})
+    cfg = load({"HOME": str(home)})
+    assert "default" in cfg.placements

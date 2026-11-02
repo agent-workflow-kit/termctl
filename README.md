@@ -112,6 +112,7 @@ termctl keeps no database: what it knows about a pane is stored on the pane itse
 
 - **Ids, not targets.** Callers address panes by the `tc-...` id; termctl never lists, renames, signals or closes a pane it did not open.
 - **Server and state checks.** The tmux socket path, state directory, log, audit file and lock files are checked for ownership and permissions before use.
+- **Config trust.** Config can run commands (hooks, `tmux_bin`), so termctl refuses a config file, drop-in, `config.d/` or config directory that is not owned by you or root, or that is writable by group or others, with exit 2 and a `chmod go-w` hint ([Config](docs/interface.md#config)). A process running as you can still edit your config.
 - **Filtered environment.** tmux gets an allow-listed environment (`server_env_allow`), so credentials in your shell are not added to a server termctl starts.
 - **Human gates.** `close --force` and `--override-escalation` need a terminal or `--actor human:<user>`; a pre-hook veto always holds.
 - **Audit.** Mutating runs are logged; every `close --force` that saw a running pane and every `--override-escalation` run are also audited, whatever the outcome, once the id is generated (`open`) or resolved (`close`) ([Audit and log](docs/interface.md#audit-and-log)).

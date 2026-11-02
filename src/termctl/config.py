@@ -493,21 +493,104 @@ def _cannot_read(path: Path, reason: str) -> ConfigError:
     return ConfigError(f"cannot read config {path}: {reason}", file=str(path))
 
 
+# --- trust checks (interface.md "Config") -------------------------------------------------------
+# Config can run commands, so it must not have been modifiable by another user. Every check is
+# made on the opened descriptor (as statedir.py does), so a file swapped after the check is not the
+# one read.
+
+_DIR_FLAGS = os.O_RDONLY | os.O_DIRECTORY | os.O_CLOEXEC
+
+
+def _shell_quote(path: str) -> str:
+    return "'" + path.replace("'", "'\\''") + "'"
+
+
+def _unsafe(path: str, info: os.stat_result, problem: str, *, hint: bool = False) -> ConfigError:
+    mode = f"{stat.S_IMODE(info.st_mode):04o}"
+    message = f"unsafe config {path}: {problem} (mode {mode})"
+    if hint:
+        message += f"; run: chmod go-w {_shell_quote(path)}"
+    return ConfigError(message, file=path, mode=mode)
+
+
+def _check_trust(info: os.stat_result, path: str) -> None:
+    """Raise unless ``info`` (of the opened ``path``) is owned by the effective user or root and
+    is not writable by group or others; a directory with the sticky bit may be writable."""
+    if info.st_uid not in (os.geteuid(), 0):
+        raise _unsafe(path, info, f"owned by uid {info.st_uid}, not the current user or root")
+    writable = info.st_mode & 0o022
+    if writable and not (stat.S_ISDIR(info.st_mode) and info.st_mode & stat.S_ISVTX):
+        who = {0o020: "group", 0o002: "others", 0o022: "group and others"}[writable]
+        raise _unsafe(path, info, f"writable by {who}", hint=True)
+
+
+def _open_directory(path: Path) -> int | None:
+    """A checked descriptor for the directory ``path`` (symlinks followed; the caller closes
+    it), or None when it cannot be opened: the read that follows reports why."""
+    try:
+        fd = os.open(path, _DIR_FLAGS)
+    except PermissionError:
+        # Searchable but not readable (mode --x): checkable by path only.
+        try:
+            _check_trust(os.stat(path), str(path))
+        except OSError:
+            pass
+        return None
+    except OSError:
+        return None
+    try:
+        _check_trust(os.fstat(fd), str(path))
+    except BaseException:
+        os.close(fd)
+        raise
+    return fd
+
+
+def _check_directory(path: Path) -> None:
+    """Check the directory ``path`` if it exists."""
+    fd = _open_directory(path)
+    if fd is not None:
+        os.close(fd)
+
+
+def _check_resolved_directory(path: Path, resolved: Path, info: os.stat_result) -> None:
+    """Check the directory that holds ``resolved``, the file ``path`` leads to (``info`` is its
+    status, from the descriptor it was opened on), and that the name there is still that file."""
+    fd = _open_directory(resolved.parent)
+    if fd is None:
+        raise _cannot_read(path, "cannot check its directory")
+    try:
+        try:
+            there = os.stat(resolved.name, dir_fd=fd, follow_symlinks=False)
+        except OSError:
+            there = None
+        if there is None or not os.path.samestat(there, info):
+            raise _cannot_read(path, "changed while it was being checked")
+    finally:
+        os.close(fd)
+
+
 # The largest config file or drop-in termctl reads.
 MAX_FILE_SIZE = 1024 * 1024
 
 
 def _read_bytes(path: Path) -> bytes:
     """The contents of ``path``, which must be a regular file (after symlinks) of at most
-    ``MAX_FILE_SIZE`` bytes. Checked before opening (so a socket or device is never opened) and
-    again after (in case it was replaced); opened without blocking or taking a controlling
-    terminal, so a FIFO is never waited on. At most one byte past the cap is read."""
+    ``MAX_FILE_SIZE`` bytes that passes the trust checks, as must the directory that holds it
+    after symlinks. Checked before opening (so a socket or device is never opened) and again
+    after (in case it was replaced); opened without blocking or taking a controlling terminal, so
+    a FIFO is never waited on. The file is checked before it is read, and at most one byte past
+    the cap is read."""
     if not stat.S_ISREG(os.stat(path).st_mode):
         raise _cannot_read(path, "not a regular file")
     fd = os.open(path, os.O_RDONLY | os.O_NONBLOCK | os.O_NOCTTY | os.O_CLOEXEC)
     try:
-        if not stat.S_ISREG(os.fstat(fd).st_mode):
+        info = os.fstat(fd)
+        if not stat.S_ISREG(info.st_mode):
             raise _cannot_read(path, "not a regular file")
+        resolved = Path(os.path.realpath(path))  # a symlink is reported as what it leads to
+        _check_trust(info, str(resolved))
+        _check_resolved_directory(path, resolved, info)
         with open(fd, "rb", closefd=False) as file:
             data = file.read(MAX_FILE_SIZE + 1)
     finally:
@@ -556,14 +639,21 @@ def _dropins(main: Path) -> list[Path]:
     listed (a dangling symlink included) is a ``ConfigError``."""
     directory = main.parent / "config.d"
     try:
-        with os.scandir(directory) as entries:
-            names = [e.name for e in entries if e.name.endswith(".yaml")]
+        fd = os.open(directory, _DIR_FLAGS)
     except FileNotFoundError:
         if dangling := _dangling(directory):
             raise _cannot_read(dangling, "dangling symlink") from None
         return []
     except OSError as exc:
         raise _cannot_read(directory, exc.strerror or str(exc)) from None
+    try:
+        _check_trust(os.fstat(fd), str(directory))
+        with os.scandir(fd) as entries:
+            names = [e.name for e in entries if e.name.endswith(".yaml")]
+    except OSError as exc:
+        raise _cannot_read(directory, exc.strerror or str(exc)) from None
+    finally:
+        os.close(fd)
     return [directory / name for name in sorted(names) if not name.startswith(".")]
 
 
@@ -672,8 +762,10 @@ def _configured_default_fields(files: Mapping[str, Any]) -> frozenset[str]:
 def load(environ: Mapping[str, str], explicit: str | None = None) -> Config:
     """Load the effective config: built-in defaults, the main file, the drop-ins in code point
     order, then ``TERMCTL_<KEY>`` scalars. Raises ``ConfigError`` naming the key, variable or
-    file. A missing main file is an error only when given with ``--config``."""
+    file. A missing main file is an error only when given with ``--config``. Files and
+    directories another user could have modified are refused first (``_check_trust``)."""
     main = config_path(environ, explicit)
+    _check_directory(main.parent)
     files = _read(main, optional=explicit is None)
     data = merge(copy.deepcopy(DEFAULTS), files)
     for path in _dropins(main):
