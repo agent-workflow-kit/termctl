@@ -145,6 +145,7 @@ class Backend(Protocol):
         ``pane`` (its pane id, window id, ``@termctl_pane`` and ``@termctl_id``), or when
         ``window_name`` is among the names and holds a tab or newline. The probe is read-only:
         a mismatch can only turn a no-op into a guarded rewrite."""
+        ...
 
     def list_clients(self, termctl_id: str) -> tuple[tb.ClientInfo, ...]:
         """Every client attached to a session that termctl can name (``parse_clients``).

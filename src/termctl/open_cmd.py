@@ -255,10 +255,9 @@ def dry_run_commands(
     ``has-session`` found: an existing session gets ``new-window``, any other state
     ``new-session``, prefixed with ``exit-unattached off`` when no server runs; ``env`` is the
     filtered environment its ``set-environment`` values come from. The read-only probes and
-    confirmations a real run makes around them, and the PID recording of step 7 (which
-    depends on the process), are not listed (interface.md ``open``)."""
-    # TODO(#24): list the step-8 focus invocation when --focus is given, or document its
-    # omission in interface.md.
+    confirmations a real run makes around them, the PID recording of step 7 (which depends
+    on the process) and the focus of step 8 (whose client is chosen only once the pane
+    exists) are not listed (interface.md ``open``)."""
     if state is SessionState.EXISTS:
         create = tb.new_window(session, plan.window)
     else:

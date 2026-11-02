@@ -249,7 +249,7 @@ class FakeGateway:
         processes: Sequence[FakeProcess] = (),
         clock: FakeClock | None = None,
         stderr_tty: bool | None = None,
-        exec_error: OSError | None = None,
+        exec_error: Exception | None = None,
     ) -> None:
         # ``stderr_isatty`` answers ``stderr_tty`` (``tty`` when not given). ``exec_replace``
         # records the call in ``execs`` and raises ``Execed`` (the process would be gone), or
