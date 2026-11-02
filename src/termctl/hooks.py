@@ -123,8 +123,16 @@ def hooks_for(config: Config, name: str, flag_hooks: Sequence[Hook]) -> list[Hoo
 
 def check_override_gate(override: bool, *, actor: str | None, stdin_is_tty: bool) -> None:
     """``--override-escalation`` is accepted only when stdin is a TTY or with ``--actor
-    human:<user>`` (exit 2 otherwise). Advisory: see interface.md "Residual risks"."""
-    if not override or stdin_is_tty:
+    human:<user>``, and never with an explicit ``auto:`` actor (exit 2 otherwise). Advisory: see
+    interface.md "Residual risks"."""
+    if not override:
+        return
+    if actor is not None and actor.startswith("auto:"):
+        raise UsageError(
+            "--override-escalation is refused for an auto: actor, whatever the terminal; "
+            "automation never overrides an escalation"
+        )
+    if stdin_is_tty:
         return
     if actor is not None and actor.startswith("human:"):
         return

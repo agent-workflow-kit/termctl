@@ -40,10 +40,17 @@ SIGNALS = ["SIGTERM", "SIGKILL"]
 
 
 def check_force_gate(force: bool, *, actor: str | None, stdin_is_tty: bool) -> None:
-    """``--force`` is accepted only when stdin is a TTY or with ``--actor human:<user>``
-    (exit 2 otherwise). Advisory, like ``--override-escalation`` (interface.md "Residual
-    risks")."""
-    if not force or stdin_is_tty:
+    """``--force`` is accepted only when stdin is a TTY or with ``--actor human:<user>``, and
+    never with an explicit ``auto:`` actor (exit 2 otherwise). Advisory, like
+    ``--override-escalation`` (interface.md "Residual risks")."""
+    if not force:
+        return
+    if actor is not None and actor.startswith("auto:"):
+        raise UsageError(
+            "close --force is refused for an auto: actor, whatever the terminal; "
+            "automation never forces a close"
+        )
+    if stdin_is_tty:
         return
     if actor is not None and actor.startswith("human:"):
         return
