@@ -212,6 +212,18 @@ def test_force_needs_a_terminal_or_a_human_actor(argv: list[str], private_state_
     assert records(private_state_home) == []
 
 
+@pytest.mark.parametrize("extra", [[], ["--dry-run"]])
+def test_force_refuses_an_explicit_auto_actor_even_with_a_terminal(
+    extra: list[str], private_state_home: Path
+) -> None:
+    gateway, clock = gateway_for(tty=True)
+    result = close([ID, "--force", "--actor", "auto:policy", *extra], gateway, clock)
+    error = result.error("usage", 2)
+    assert "--force" in error["message"] and "auto: actor" in error["message"]
+    assert gateway.calls == []
+    assert records(private_state_home) == []
+
+
 def test_force_with_a_terminal_on_stdin_is_accepted() -> None:
     gateway, clock = gateway_for(process=FakeProcess(hup_on_kill=True), tty=True)
     result = close([ID, "--force"], gateway, clock)

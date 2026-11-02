@@ -181,7 +181,7 @@ def test_hooks_for_runs_configured_hooks_then_flag_hooks(tmp_path: Path) -> None
 
 @pytest.mark.parametrize(
     ("actor", "tty"),
-    [(None, True), ("human:alice", False), ("human:alice", True), ("auto:policy", True)],
+    [(None, True), ("human:alice", False), ("human:alice", True)],
 )
 def test_override_gate_accepts_a_tty_or_a_human_actor(actor: str | None, tty: bool) -> None:
     hooks.check_override_gate(True, actor=actor, stdin_is_tty=tty)
@@ -193,8 +193,16 @@ def test_override_gate_refuses_automation(actor: str | None) -> None:
         hooks.check_override_gate(True, actor=actor, stdin_is_tty=False)
 
 
+@pytest.mark.parametrize("tty", [True, False])
+@pytest.mark.parametrize("actor", ["auto:policy", "auto:human", "auto:unknown"])
+def test_override_gate_refuses_an_explicit_auto_actor_even_on_a_tty(actor: str, tty: bool) -> None:
+    with pytest.raises(UsageError, match="auto: actor"):
+        hooks.check_override_gate(True, actor=actor, stdin_is_tty=tty)
+
+
 def test_override_gate_does_nothing_without_the_flag() -> None:
     hooks.check_override_gate(False, actor=None, stdin_is_tty=False)
+    hooks.check_override_gate(False, actor="auto:policy", stdin_is_tty=True)
 
 
 # --- payloads -----------------------------------------------------------------------------------

@@ -196,6 +196,43 @@ def test_valid_input_passes_to_the_later_steps(argv: list[str], later_steps: lis
     assert "run_command" in later_steps
 
 
+AUTO_ON_TTY: list[list[str]] = [
+    ["open", "--override-escalation", "--actor", "auto:policy"],
+    ["close", ID, "--override-escalation", "--actor", "auto:human"],
+    ["close", ID, "--force", "--actor", "auto:human"],
+    ["close", ID, "--force", "--override-escalation", "--actor", "auto:x", "--dry-run"],
+]
+
+
+@pytest.mark.parametrize("argv", AUTO_ON_TTY)
+def test_explicit_auto_actor_is_refused_even_on_a_tty(
+    argv: list[str], later_steps: list[str]
+) -> None:
+    code, stdout, _ = run(["--json", *argv], FakeGateway(dirs=DIRS, tty=True))
+    assert code == 2
+    envelope = json.loads(stdout)
+    validate(envelope, "termctl/cli/error.json")
+    assert envelope["error"]["code"] == "usage"
+    assert "auto: actor" in envelope["error"]["message"]
+    assert later_steps == []
+
+
+@pytest.mark.parametrize(
+    "argv",
+    [
+        ["open", "--override-escalation"],
+        ["open", "--override-escalation", "--actor", "human:me"],
+        ["close", ID, "--force"],
+        ["close", ID, "--force", "--actor", "human:me"],
+        ["close", ID, "--actor", "auto:x"],
+    ],
+)
+def test_tty_and_human_actors_still_pass_the_gates(argv: list[str], later_steps: list[str]) -> None:
+    code, _, stderr = run(argv, FakeGateway(dirs=DIRS, tty=True))
+    assert (code, stderr) == (0, "")
+    assert "run_command" in later_steps
+
+
 def test_invalid_id_golden() -> None:
     code, stdout, _ = run(["--json", "show", "tc-abc"])
     expected = json.loads((GOLDEN / "error-invalid-id.json").read_text(encoding="utf-8"))
