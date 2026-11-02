@@ -8,9 +8,9 @@ has exactly one pane (``may_rename_window``); otherwise the pane-changing comman
 
 The "nothing changed" rules compare the window name tmux reports with the recomputed one
 (``shows``). tmux does not always report a window name as it was given: ``rename-window``
-stores it escaped, so a ``\\`` reads back as ``\\\\`` (3.5a), and before 3.3 a ``$`` reads back
-as ``\\$`` (3.2a); ``new-window -n`` keeps the name as given (design.md spikes A and E). Every
-form tmux may produce from the recomputed name counts as showing it.
+stores it escaped, so a ``\\`` reads back as ``\\\\`` (3.2a and 3.5a), and before 3.3 a ``$``
+followed by an ASCII letter, ``_`` or ``{`` reads back as ``\\$`` (3.2a); ``new-window -n`` keeps
+the name as given (design.md spikes A and E). Exactly those two forms count as showing it.
 
 A marker with ``bell: true`` writes one BEL to the terminal of a running pane when ``mark``
 changed something (``ring_bell``); a failure is only a warning (interface.md "Markers").
@@ -30,6 +30,8 @@ MARKER_DISPLAYS = ("name", "option")
 
 # The first tmux version whose rename-window leaves "$" unescaped (design.md spike A).
 _DOLLAR_KEPT = (3, 3)
+# The "$" that tmux before 3.3 stores escaped: one followed by an ASCII letter, "_" or "{".
+_DOLLAR_ESCAPED = re.compile(r"\$(?=[A-Za-z_{])")
 
 
 def displayed_name(name: str, marker_text: str | None, marker_display: str) -> str:
@@ -62,11 +64,14 @@ def may_rename_window(pane: _Placed) -> bool:
 
 
 def _tmux_forms(name: str, version: TmuxVersion | None) -> set[str]:
-    """``name`` and each form tmux may report it in after ``rename-window``."""
-    forms = {name, name.replace("\\", "\\\\")}
+    """``name`` (as ``new-window -n`` keeps it) and the one form ``rename-window`` stores it in:
+    tmux vis-escapes the name in a single pass, doubling every backslash and, before 3.3, writing
+    a ``$`` followed by an ASCII letter, ``_`` or ``{`` as ``\\$`` (checked on 3.2a and 3.5a,
+    #25). Doubling inserts only after a backslash, so it never changes what follows a ``$``."""
+    stored = name.replace("\\", "\\\\")
     if version is not None and (version.major, version.minor) < _DOLLAR_KEPT:
-        forms |= {form.replace("$", "\\$") for form in forms}
-    return forms
+        stored = _DOLLAR_ESCAPED.sub(r"\\$", stored)
+    return {name, stored}
 
 
 def shows(reported: str, computed: str, version: TmuxVersion | None) -> bool:

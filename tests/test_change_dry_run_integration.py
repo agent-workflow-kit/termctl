@@ -5,7 +5,7 @@ option, no window name, no bell, no lock file and no log record (interface.md "D
 The one exception is ``display_name`` of a renamed window: the dry run reports the name termctl
 computes, the real run the form tmux reads back, which can be escaped (interface.md "Names").
 
-The CI ``tmux`` job runs these on the runner's tmux; tmux 3.2 runs are TODO(#25).
+The CI ``tmux`` jobs run these on tmux 3.2a (the floor) and on the runner image's tmux.
 """
 
 from __future__ import annotations

@@ -1,8 +1,10 @@
 name: ci
 
-# Thin caller for agent-workflow-kit/awkit-ci, plus a `tmux` job that runs the real-tmux tests.
-# Status checks: `ci / ci-ok` (required) and `tmux`. `tmux` is not part of `ci / ci-ok`; it
-# gates merges only once it is added as a required check in branch protection (maintainer).
+# Thin caller for agent-workflow-kit/awkit-ci, plus a `tmux` matrix that runs the real-tmux tests
+# on the tmux 3.2 floor and on the runner image's current tmux.
+# Status checks: `ci / ci-ok` (required), `tmux (floor)` and `tmux (latest)`. The tmux checks are
+# not part of `ci / ci-ok`; they gate merges only once they are added as required checks in
+# branch protection (maintainer).
 # Source: https://github.com/agent-workflow-kit/awkit-ci/tree/main/templates
 
 on:
@@ -22,17 +24,32 @@ jobs:
     uses: agent-workflow-kit/awkit-ci/.github/workflows/python-ci.yml@v0.1.0
 
   # The shared verify job cannot install packages, so it runs the real-tmux tests only when the
-  # runner image ships tmux; this job installs tmux and runs make verify with
-  # TERMCTL_REQUIRE_TMUX set, so a missing tmux fails.
+  # runner image ships tmux. This matrix installs tmux from apt and sets TERMCTL_REQUIRE_TMUX, so
+  # a missing tmux fails instead of skipping:
+  # - floor: ubuntu-22.04 ships tmux 3.2a, the oldest supported version (design.md D16);
+  #   `make verify-floor` checks that `tmux -V` reports 3.2 before running the tests. If GitHub
+  #   retires that image, build tmux 3.2a from source here instead.
+  # - latest: the current runner image's tmux, with the whole of `make verify`.
   tmux:
-    name: tmux
-    runs-on: ubuntu-latest
+    name: tmux (${{ matrix.name }})
+    runs-on: ${{ matrix.os }}
     timeout-minutes: 20
     permissions:
       contents: read
+    strategy:
+      fail-fast: false
+      matrix:
+        include:
+          - name: floor
+            os: ubuntu-22.04
+            target: verify-floor
+          - name: latest
+            os: ubuntu-latest
+            target: verify
     env:
       TERMCTL_REQUIRE_TMUX: "1"
       UV_PYTHON: "3.12"
+      MAKE_TARGET: ${{ matrix.target }}
     steps:
       - uses: actions/checkout@3d3c42e5aac5ba805825da76410c181273ba90b1 # v7.0.1
         with:
@@ -45,8 +62,8 @@ jobs:
           tmux -V
       - name: uv sync
         run: uv sync --python "$UV_PYTHON"
-      - name: make verify
-        run: make verify
+      - name: make ${{ matrix.target }}
+        run: make "$MAKE_TARGET"
 
   release:
     needs: [ci, tmux]

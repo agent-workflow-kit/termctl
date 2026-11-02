@@ -30,21 +30,12 @@ import pytest
 from termctl.cli import main
 from termctl.gateway import SystemGateway
 
-from .conftest import NO_CONFIG, TMUX_VERSION, TmuxServer, wait_for
+from .conftest import NO_CONFIG, TmuxServer, tmux_stored_name, wait_for
 from .schemas import validate
 
 pytestmark = pytest.mark.tmux
 
 AGENT = "/tmp/termctl-test-agent.sock"
-
-# TODO(#25): tmux 3.2 differs from 3.3+ where these tests expect 3.5a's behaviour: it reports a
-# "$" in a session name as "\\$" (as for window names, test_tmux_integration.py). #25 covers
-# tmux 3.2.
-XFAIL_3_2_DOLLAR = pytest.mark.xfail(
-    TMUX_VERSION is not None and TMUX_VERSION < (3, 3),
-    reason="#25: tmux 3.2 reports '$' as '\\$' in session_name",
-    strict=True,
-)
 
 
 @dataclass
@@ -210,7 +201,7 @@ def test_switches_the_client_to_the_pane(tmux_server: TmuxServer, terminals: Ter
     assert client_view(tmux_server, client) == (session_id, pane["window_id"], pane["pane_id"])
 
 
-@pytest.mark.parametrize("name", ["my work", pytest.param("my $work", marks=XFAIL_3_2_DOLLAR)])
+@pytest.mark.parametrize("name", ["my work", "my $work", "a\\b"])
 def test_a_session_the_user_renamed_is_focused(
     name: str, tmux_server: TmuxServer, terminals: Terminals
 ) -> None:
@@ -220,7 +211,8 @@ def test_a_session_the_user_renamed_is_focused(
     assert tmux_server.raw("rename-session", "-t", "=work", name).returncode == 0
     client = terminals.client("=base:")
     out = focused(tmux_server, pane["id"], "--no-attach")
-    assert out["session"] == name
+    # rename-session stores the name escaped: "my $work" reads back as "my \$work" on tmux 3.2.
+    assert out["session"] == tmux_stored_name(name)
     assert client_view(tmux_server, client)[2] == pane["pane_id"]
 
 

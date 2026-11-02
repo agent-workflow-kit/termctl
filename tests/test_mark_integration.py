@@ -3,7 +3,7 @@ on a private server (``tmux_server`` in conftest.py): both marker options writte
 the displayed name, the no-op rules under supervise-style polling, the bell, dead panes and
 forged control bytes (interface.md "Markers", `mark`, `unmark`, "Names").
 
-The CI ``tmux`` job runs these on the runner's tmux; tmux 3.2 runs are TODO(#25).
+The CI ``tmux`` jobs run these on tmux 3.2a (the floor) and on the runner image's tmux.
 """
 
 from __future__ import annotations
@@ -123,7 +123,7 @@ def test_a_marker_removed_from_config_stays_until_unmark(tmux_server: TmuxServer
 
 
 @pytest.mark.skipif(
-    TMUX_PRINTS_RAW, reason="tmux 3.6 prints the control byte raw instead of escaping it"
+    TMUX_PRINTS_RAW, reason="tmux 3.2 and 3.6+ print the control byte raw instead of escaping it"
 )
 def test_a_forged_control_byte_in_the_marker_text_is_rewritten(tmux_server: TmuxServer) -> None:
     pane_id = managed(tmux_server)
@@ -137,6 +137,25 @@ def test_a_forged_control_byte_in_the_marker_text_is_rewritten(tmux_server: Tmux
     assert option_bytes(tmux_server, pane_id, "@termctl_marker_text") == 5
     again = termctl(tmux_server, *flags, "--json", "mark", ID, "esc")
     assert again.json()["changed"] is False
+
+
+@pytest.mark.skipif(
+    not TMUX_PRINTS_RAW, reason="tmux 3.3 to 3.5 print the byte escaped: the previous test"
+)
+def test_a_forged_control_byte_in_the_marker_text_makes_the_pane_ignored_on_tmux_3_2(
+    tmux_server: TmuxServer,
+) -> None:
+    # tmux 3.2 prints the raw ESC as it is: the marker text breaks its grammar, so the pane is
+    # ignored with a warning instead (interface.md "Residual risks", forged control bytes).
+    pane_id = managed(tmux_server)
+    flags = config(tmux_server, "marker_display: option\nmarkers:\n  esc:\n    text: '\\033 '\n")
+    tmux_server.raw("set", "-p", "-t", pane_id, "@termctl_marker", "esc")
+    tmux_server.raw("set", "-p", "-t", pane_id, "@termctl_marker_text", "\x1b ")
+    assert option(tmux_server, pane_id, "@termctl_marker_text") == "\x1b "
+    result = termctl(tmux_server, *flags, "--json", "mark", ID, "esc")
+    assert result.code == 10
+    assert f"ignoring managed pane {pane_id}" in result.stderr and "\x1b" not in result.stderr
+    assert option_bytes(tmux_server, pane_id, "@termctl_marker_text") == 2  # never rewritten
 
 
 # --- the bell -------------------------------------------------------------------------------------
