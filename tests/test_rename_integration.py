@@ -22,7 +22,9 @@ from termctl.gateway import SystemGateway
 
 from .conftest import (
     NO_CONFIG,
+    STRICT_NAMES_REASON,
     TMUX_PRINTS_RAW,
+    TMUX_STRICT_NAMES,
     TmuxServer,
     tmux_stored_name,
     wait_for,
@@ -159,12 +161,13 @@ def test_names_round_trip_and_renaming_again_is_a_no_op(tmux_server: TmuxServer,
 
 
 def test_a_window_named_with_new_window_n_is_a_no_op_too(tmux_server: TmuxServer) -> None:
-    # open (#14) names the window with -n, which keeps a backslash as given.
+    # open (#14) names the window with -n, which keeps a backslash as given before tmux 3.7 and
+    # doubles it from 3.7 on, like rename-window.
     tmux_server.start()
     pane_id = new_window(tmux_server, "-n", "a\\b")
     tag(tmux_server, pane_id, **{"@termctl_name": "a\\b"})
     tmux_server.raw("new-session", "-d", "-s", "keep", "--", "/usr/bin/env", "--", "sleep", "600")
-    assert window_name(tmux_server, pane_id) == "a\\b"
+    assert window_name(tmux_server, pane_id) == ("a\\\\b" if TMUX_STRICT_NAMES else "a\\b")
     result = termctl(tmux_server, "--json", "rename", ID, "a\\b")
     assert (result.code, result.json()["changed"]) == (0, False)
 
@@ -337,6 +340,7 @@ def test_a_forged_control_byte_makes_the_pane_ignored_when_tmux_prints_it_raw(
     assert option_bytes(tmux_server, pane_id) == 3  # never rewritten
 
 
+@pytest.mark.skipif(TMUX_STRICT_NAMES, reason=STRICT_NAMES_REASON)
 def test_a_forged_control_byte_in_the_window_name_is_replaced(tmux_server: TmuxServer) -> None:
     # new-window -n keeps a raw ESC, which tmux 3.3+ prints as the text \033: the window name
     # reads like the recomputed name but is not it. tmux 3.2 prints it raw.
@@ -352,6 +356,7 @@ def test_a_forged_control_byte_in_the_window_name_is_replaced(tmux_server: TmuxS
     assert termctl(tmux_server, "--json", "rename", ID, "n\\033x").json()["changed"] is False
 
 
+@pytest.mark.skipif(TMUX_STRICT_NAMES, reason=STRICT_NAMES_REASON)
 @pytest.mark.parametrize("separator", ["\t", "\n"], ids=["tab", "newline"])
 def test_a_tab_or_newline_in_the_window_name_is_not_taken_for_a_space(
     tmux_server: TmuxServer, separator: str

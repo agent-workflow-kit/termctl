@@ -40,6 +40,9 @@ select = ["E", "F", "I", "UP", "B"]
 [tool.pyright]
 include = ["src", "tests"]
 pythonVersion = "3.12"
+# Linux on every platform: the Linux-only calls (pidfd, waitid) are guarded at
+# run time, and the stubs omit them on macOS (the macos CI job, the checklist).
+pythonPlatform = "Linux"
 
 [tool.pytest.ini_options]
 testpaths = ["tests"]

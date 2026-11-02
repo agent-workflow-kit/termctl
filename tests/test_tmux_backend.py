@@ -1777,6 +1777,8 @@ def test_tagged_query_requires_the_confirmation_as_the_last_line(
     [
         ("4242 0 77\n", tb.ProcessQuery(4242, False, 77)),
         ("4242 1 77", tb.ProcessQuery(4242, True, 77)),
+        (" 1 77\n", tb.ProcessQuery(0, True, 77)),  # tmux 3.8: no pane_pid for a dead pane
+        (" 0 77\n", None),
         ("9999999999 0 1\n", tb.ProcessQuery(9999999999, False, 1)),
         ("", None),
         ("\n", None),

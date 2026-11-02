@@ -1164,7 +1164,7 @@ def tagged_query(stdout: str) -> str | None:
 # The query of step 7: the pane's process, whether the pane is dead, and the server's PID.
 PROCESS_QUERY = fields("pane_pid", "pane_dead", "pid")
 # What PROCESS_QUERY prints: PIDs in the @termctl_pid grammar (interface.md "Pane options").
-_PROCESS_QUERY = re.compile(r"([1-9][0-9]{0,9}) ([01]) ([1-9][0-9]{0,9})\n?")
+_PROCESS_QUERY = re.compile(r"([1-9][0-9]{0,9})? ([01]) ([1-9][0-9]{0,9})\n?")
 _PID = re.compile(r"[1-9][0-9]{0,9}")
 _PID_START = re.compile(r"[0-9]{1,20}")
 
@@ -1189,7 +1189,11 @@ def parse_process_query(stdout: str) -> ProcessQuery | None:
     match = _PROCESS_QUERY.fullmatch(stdout)
     if match is None:
         return None
-    return ProcessQuery(int(match.group(1)), match.group(2) == "1", int(match.group(3)))
+    dead = match.group(2) == "1"
+    if match.group(1) is None:
+        # tmux 3.8 prints no #{pane_pid} for a dead pane: 0, which no process has.
+        return ProcessQuery(0, True, int(match.group(3))) if dead else None
+    return ProcessQuery(int(match.group(1)), dead, int(match.group(3)))
 
 
 def owned_process(termctl_id: str, pid: str) -> Format:

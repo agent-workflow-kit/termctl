@@ -69,8 +69,12 @@ def refuse_running(pane: ManagedPane) -> TermctlError:
 
 def row_mismatch(pane: ManagedPane) -> bool:
     """A recorded PID that does not equal ``#{pane_pid}`` in the same ``list-panes`` row: it
-    never counts (interface.md "Liveness"). No recorded PID is no mismatch."""
-    return pane.pid is not None and pane.pid != pane.pane_pid
+    never counts (interface.md "Liveness"). No recorded PID is no mismatch, and neither is a dead
+    pane without a ``#{pane_pid}``: tmux 3.8 prints none once the pane's process has exited
+    (earlier versions keep the old PID), and a dead pane has nothing to signal."""
+    if pane.pid is None or (pane.dead and pane.pane_pid is None):
+        return False
+    return pane.pid != pane.pane_pid
 
 
 @dataclass(frozen=True)
@@ -240,10 +244,9 @@ def close(
 
 def gone_at_probe(gateway: Gateway, pid: int, warn: Warn) -> bool:
     """For a pane gone at step 1's probe, which therefore proved nothing: whether its recorded
-    process has exited (no such process, or a zombie, as its handle shows; only a handle that
-    cannot tell, on macOS, falls back to reading the process). Otherwise, or
-    when that cannot be told, a warning: the process cannot be checked and is not signaled
-    (``pid_mismatch``)."""
+    process has exited (no such process, or a zombie, as its handle shows; on macOS reading
+    the process is a second source). Otherwise, or when that cannot be told, a warning: the
+    process cannot be checked and is not signaled (``pid_mismatch``)."""
     try:
         handle = gateway.open_process(pid)
     except OSError:
@@ -253,7 +256,10 @@ def gone_at_probe(gateway: Gateway, pid: int, warn: Warn) -> bool:
     if handle is not None:
         try:
             # On Linux the pidfd alone tells; /proc may show another PID namespace, which
-            # this path never checked. Only a handle that cannot tell (macOS) reads it.
+            # this path never checked. On macOS the kqueue watch tells too, and ps is read as
+            # well: a second source, kept until the macOS checklist has confirmed the real
+            # kernel's answers. It can only turn "not exited" into "exited", which signals
+            # nothing here.
             exited = handle.exited() or (gateway.platform() == "darwin" and _exited(gateway, pid))
         finally:
             handle.close()
@@ -267,7 +273,8 @@ def _warn_unproven(pid: int, warn: Warn, consequence: str) -> None:
 
 
 def _exited(gateway: Gateway, pid: int) -> bool:
-    """Whether reading ``pid`` shows it gone or a zombie (for a handle that cannot tell)."""
+    """Whether reading ``pid`` shows it gone or a zombie (macOS: the second source beside
+    the kqueue watch)."""
     try:
         process = procs.read(gateway, pid)
     except procs.ProcessError:

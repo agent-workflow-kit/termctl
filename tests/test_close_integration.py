@@ -28,10 +28,8 @@ from .procs import is_gone, wait_gone
 from .schemas import validate
 from .test_cli_open_integration import NO_CONFIG, fmt, opened, pane_exists, termctl
 
-pytestmark = [
-    pytest.mark.tmux,
-    pytest.mark.skipif(not Path("/proc/self/stat").exists(), reason="reads /proc (Linux)"),
-]
+# procs.read and tests/procs.is_gone read /proc on Linux and ps on macOS, so these run on both.
+pytestmark = pytest.mark.tmux
 
 HUMAN = ("--actor", "human:tester")
 

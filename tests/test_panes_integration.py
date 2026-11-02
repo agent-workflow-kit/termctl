@@ -18,7 +18,14 @@ from termctl import panes
 from termctl.errors import TermctlError
 from termctl.panes import PaneRead
 
-from .conftest import TMUX_3_2, TMUX_PRINTS_RAW, TmuxServer, wait_for
+from .conftest import (
+    STRICT_NAMES_REASON,
+    TMUX_3_2,
+    TMUX_PRINTS_RAW,
+    TMUX_STRICT_NAMES,
+    TmuxServer,
+    wait_for,
+)
 from .schemas import validate
 
 pytestmark = pytest.mark.tmux
@@ -152,6 +159,7 @@ def test_a_linked_window_gives_one_pane_with_every_session(tmux_server: TmuxServ
 # --- free text, records and decoding ------------------------------------------------------------
 
 
+@pytest.mark.skipif(TMUX_STRICT_NAMES, reason=STRICT_NAMES_REASON)
 def test_tab_and_newline_in_names_become_spaces(tmux_server: TmuxServer) -> None:
     tmux_server.start()
     pane_id = new_window(tmux_server, "-n", "a\tb\nc\x1bd")

@@ -37,6 +37,7 @@ from typing import Any
 import pytest
 
 from .conftest import TmuxServer, wait_for
+from .procs import is_gone
 from .schemas import validate
 
 pytestmark = pytest.mark.tmux
@@ -416,7 +417,9 @@ def test_agent_spawn_flow(caller: Caller) -> None:
     (work / "finish").touch()
 
     def dead() -> bool:
-        return caller.ok(*sock("show", agent_id), schema="show")["state"] == "dead"
+        shown = caller.ok(*sock("show", agent_id), schema="show")
+        # tmux 3.2 reports the exit status a moment after the pane is dead.
+        return shown["state"] == "dead" and shown["exit_status"] == 3
 
     assert wait_for(dead, timeout=15)
     final = caller.ok(*sock("show", agent_id), schema="show")
@@ -425,6 +428,10 @@ def test_agent_spawn_flow(caller: Caller) -> None:
     dead_panes = caller.ok(*sock("list", "--dead"), schema="list")["panes"]
     assert [pane["id"] for pane in dead_panes] == [agent_id]
 
+    rows = server.raw(
+        "list-panes", "-a", "-F",
+        "#{pane_id} pid=#{pane_pid} rec=#{@termctl_pid} dead=#{pane_dead}",
+    ).stdout  # fmt: skip
     closed = caller.ok(
         *sock(
             "close", agent_id, "--actor", "auto:agent-spawn", "--decision-id", "teardown-1",
@@ -434,7 +441,7 @@ def test_agent_spawn_flow(caller: Caller) -> None:
     )  # fmt: skip
     assert closed["id"] == agent_id and closed["socket_path"] == socket_path
     assert (closed["pane_closed"], closed["was_running"], closed["forced"]) == (True, False, False)
-    assert (closed["signals_sent"], closed["pid_mismatch"]) == ([], False)
+    assert (closed["signals_sent"], closed["pid_mismatch"]) == ([], False), rows
     assert closed["decision_ids"] == ["teardown-1", "gate-pre-close"]
     pre_close = caller.hook_payload("pre-close", "pre-close")
     assert (pre_close["object_id"], pre_close["pane"]["state"]) == (agent_id, "dead")
@@ -509,7 +516,6 @@ def test_an_agent_whose_window_closed_is_already_closed(caller: Caller) -> None:
     assert error["code"] == "not_found"
 
 
-@pytest.mark.skipif(not Path("/proc/self/stat").exists(), reason="reads /proc (Linux)")
 def test_a_human_teardown_forces_a_running_agent(caller: Caller) -> None:
     """A human may force what automation never does: the pane is killed, the recorded process
     ends, and the forced close is audited."""
@@ -532,7 +538,7 @@ def test_a_human_teardown_forces_a_running_agent(caller: Caller) -> None:
     )  # fmt: skip
     assert (closed["pane_closed"], closed["was_running"], closed["forced"]) == (True, True, True)
     assert (closed["pid_mismatch"], closed["exited"]) == (False, True)
-    assert not Path(f"/proc/{pid}").exists() or "Z" in _proc_state(pid)
+    assert is_gone(pid)  # no such process, or a zombie (/proc on Linux, ps on macOS)
     assert caller.failed(10, "--socket", socket_path, "show", opened["id"])["code"] == "not_found"
 
     [audit] = caller.audit()
@@ -546,11 +552,3 @@ def test_a_human_teardown_forces_a_running_agent(caller: Caller) -> None:
     closes = [r for r in caller.log() if r["event"] == "close"]
     # The refused --force was a usage error (check order step 1), which is never logged.
     assert [(r["result"], r.get("exit_code"), r["force"]) for r in closes] == [("ok", 0, True)]
-
-
-def _proc_state(pid: int) -> str:
-    try:
-        stat = Path(f"/proc/{pid}/stat").read_text(encoding="utf-8")
-    except OSError:
-        return "Z"
-    return stat.rsplit(")", 1)[1].split()[0]
