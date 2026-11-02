@@ -273,6 +273,12 @@ def test_list_filters(flags: list[str], ids: list[str]) -> None:
     assert [pane["id"] for pane in result.json()["panes"]] == ids
 
 
+def test_list_takes_more_than_32_label_filters() -> None:
+    flags = [arg for index in range(33) for arg in ("--label", f"k{index:02d}=v")]
+    result = run(["--json", "list", *flags], LISTED)
+    assert (result.code, result.json()["panes"]) == (0, [])
+
+
 def test_list_session_filter_takes_any_text_and_matches_exactly() -> None:
     rows = [pane_row(overrides={"session_name": "a b\\033"})]
     assert [

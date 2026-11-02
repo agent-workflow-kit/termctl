@@ -12,8 +12,8 @@ implements it:
 - ``tag_pane`` and ``cleanup_pane``: ``open``'s pane (Open order step 6, ``open_cmd.tag``).
 - ``record_process``: ``open``'s PID recording (Open order step 7, ``open_cmd.record``).
 - ``write_pane`` and ``byte_lengths``: the guarded read-modify-write of a managed pane's
-  options and window name (``pane_change.py``); ``rename`` uses them, and TODO(#20) ``mark``
-  and ``unmark`` and TODO(#21) label changes reuse them.
+  options and window name (``pane_change.py``); ``rename`` and the label commands use them,
+  and TODO(#20) ``mark`` and ``unmark`` reuse them.
 - ``list_clients``, ``session_has_pane`` and ``switch_client``: ``focus`` and ``open --focus``
   (``focus_cmd``); its attach is an exec, not a backend call (``gateway.exec_replace``).
 - ``query_process`` and ``kill_pane``: ``close`` (``close_cmd``).
