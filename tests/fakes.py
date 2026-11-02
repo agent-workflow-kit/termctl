@@ -14,24 +14,6 @@ from typing import Any, NoReturn
 from termctl import panes as panes_module
 from termctl.gateway import BoundedOutput, FileInfo, GroupRun
 
-# The tmux binary the fakes know about by default, found on ``PATH=/usr/bin``.
-TMUX = "/usr/bin/tmux"
-
-# A scripted result: text for ``run``; text or bytes for ``run_bounded``.
-Response = subprocess.CompletedProcess[Any] | BaseException
-
-
-def completed(
-    stdout: str | bytes = "", *, stderr: str | bytes = "", returncode: int = 0
-) -> subprocess.CompletedProcess[Any]:
-    """A scripted result of one ``run`` or ``run_bounded`` call."""
-    return subprocess.CompletedProcess([], returncode, stdout, stderr)
-
-
-def _as_bytes(output: str | bytes) -> bytes:
-    return output.encode() if isinstance(output, str) else output
-
-
 UID = 1000
 
 # One managed pane as ``list-panes`` prints it for the pane reader's format (``panes.FIELDS``):
@@ -120,6 +102,24 @@ def safe_default_server(uid: int = UID, tmpdir: str = "/tmp") -> dict[str, FileI
 
 # procs' macOS ps call, before ``-p <pid>``.
 _PS_ARGV = ("/bin/ps", "-o", "ppid=", "-o", "stat=", "-o", "lstart=")
+
+# The tmux binary the fakes know about by default, found on ``PATH=/usr/bin``.
+TMUX = "/usr/bin/tmux"
+
+# A scripted result: text for ``run``; text or bytes for ``run_bounded``.
+Response = subprocess.CompletedProcess[Any] | BaseException
+
+
+def completed(
+    stdout: str | bytes = "", *, stderr: str | bytes = "", returncode: int = 0
+) -> subprocess.CompletedProcess[Any]:
+    """A scripted result of one ``run`` or ``run_bounded`` call."""
+    return subprocess.CompletedProcess([], returncode, stdout, stderr)
+
+
+def _as_bytes(output: str | bytes) -> bytes:
+    return output.encode() if isinstance(output, str) else output
+
 
 # The fields of /proc/<pid>/stat between the parent PID (field 4) and the start time (22).
 _STAT_MIDDLE = " ".join(["0"] * 17)
@@ -248,10 +248,10 @@ class FakeGateway:
         dirs: set[str] | None = None,
         tty: bool = False,
         user: str | None = "user",
+        executables: set[str] | None = None,
         uid: int = UID,
         files: Mapping[str, FileInfo] | None = None,
         links: Mapping[str, str] | None = None,
-        executables: set[str] | None = None,
         panes: Sequence[Mapping[str, str]] | None = None,
         list_panes: Response | None = None,
         mkdir_error: OSError | None = None,
@@ -264,6 +264,12 @@ class FakeGateway:
         stderr_tty: bool | None = None,
         exec_error: Exception | None = None,
     ) -> None:
+        # ``stderr_isatty`` answers ``stderr_tty`` (``tty`` when not given). ``exec_replace``
+        # records the call in ``execs`` and raises ``Execed`` (the process would be gone), or
+        # ``exec_error`` when given.
+        self.stderr_tty = tty if stderr_tty is None else stderr_tty
+        self.exec_error = exec_error
+        self.execs: list[tuple[list[str], dict[str, str]]] = []
         # ``open_process`` and ``read_proc_stat`` answer from ``processes`` (by PID; a later
         # one replaces an earlier one, as a reused PID would), whose timed exits follow
         # ``clock``. ``pidfd_error`` makes ``open_process`` raise. ``handles`` lists every
@@ -275,12 +281,6 @@ class FakeGateway:
         self.pidfd_error: OSError | None = None
         self.handles: list[FakeHandle] = []
         self.signals: list[tuple[int, int]] = []
-        # ``stderr_isatty`` answers ``stderr_tty`` (``tty`` when not given). ``exec_replace``
-        # records the call in ``execs`` and raises ``Execed`` (the process would be gone), or
-        # ``exec_error`` when given.
-        self.stderr_tty = tty if stderr_tty is None else stderr_tty
-        self.exec_error = exec_error
-        self.execs: list[tuple[list[str], dict[str, str]]] = []
         # ``platform`` answers ``system``; ``read_proc_stat`` answers from ``proc_stats``
         # (text, None for no such process, or an exception to raise), and an unscripted PID
         # fails the test.
@@ -307,7 +307,14 @@ class FakeGateway:
         self.executable_checks: list[str] = []
         self.calls: list[list[str]] = []
         # The ``env`` argument of each call, in the order of ``calls``.
-        self.envs: list[Mapping[str, str] | None] = []
+        self.envs: list[dict[str, str] | None] = []
+        self.uid = uid
+        # A fake filesystem for lstat and real_path: absolute normalized paths to their
+        # FileInfo, and symlinks to their targets (a link's owner is the uid unless ``files``
+        # has a ``symlink`` entry for it). By default a safe default server exists.
+        self.files = dict(safe_default_server(uid) if files is None else files)
+        self.links = dict(links or {})
+        self.lstats: list[str] = []
         self.cwd = cwd
         # By default only the caller's current directory exists.
         if dirs is None:
@@ -316,13 +323,6 @@ class FakeGateway:
         self.tty = tty
         self.user = user
         self.dir_checks: list[str] = []
-        self.uid = uid
-        # A fake filesystem for lstat and real_path: absolute normalized paths to their
-        # FileInfo, and symlinks to their targets (a link's owner is the uid unless ``files``
-        # has a ``symlink`` entry for it). By default a safe default server exists.
-        self.files = dict(safe_default_server(uid) if files is None else files)
-        self.links = dict(links or {})
-        self.lstats: list[str] = []
         # ``make_dir`` calls as (path, mode); ``mkdir_error`` is raised by the next one, and
         # ``appears`` (paths with their lstat) is added to ``files`` just before it, as another
         # process creating them meanwhile would.
@@ -476,21 +476,6 @@ class FakeGateway:
         self.executable_checks.append(path)
         return path in self.executables
 
-    def stdin_isatty(self) -> bool:
-        return self.tty
-
-    def stderr_isatty(self) -> bool:
-        return self.stderr_tty
-
-    def exec_replace(self, argv: list[str], env: Mapping[str, str]) -> NoReturn:
-        self.execs.append((list(argv), dict(env)))
-        if self.exec_error is not None:
-            raise self.exec_error
-        raise Execed(argv)
-
-    def user_name(self) -> str | None:
-        return self.user
-
     def real_uid(self) -> int:
         return self.uid
 
@@ -581,6 +566,21 @@ class FakeGateway:
             elif current not in self.files:
                 raise FileNotFoundError(errno.ENOENT, os.strerror(errno.ENOENT), current)
         return current
+
+    def stdin_isatty(self) -> bool:
+        return self.tty
+
+    def stderr_isatty(self) -> bool:
+        return self.stderr_tty
+
+    def exec_replace(self, argv: list[str], env: Mapping[str, str]) -> NoReturn:
+        self.execs.append((list(argv), dict(env)))
+        if self.exec_error is not None:
+            raise self.exec_error
+        raise Execed(argv)
+
+    def user_name(self) -> str | None:
+        return self.user
 
 
 class FakeClock:

@@ -3,14 +3,16 @@
 Each test gets its own server, started with ``tmux -f /dev/null -S <tmp path>``, so it never
 loads a user's config or touches a user's server; teardown stops exactly that server with
 ``kill-server`` on its socket. Tests using it are marked ``tmux``. They are not ``live``: a
-missing tmux skips them, but fails them when ``TERMCTL_REQUIRE_TMUX`` is set, so the CI job
-that installs tmux (``tmux`` in .github/workflows/ci.yml) cannot pass by skipping them all.
-The shared CI's ``verify`` job cannot install packages: they run there only when the runner
-image ships tmux (ubuntu-26.04 ships 3.6a) and skip otherwise.
+missing tmux skips them, but fails them when ``TERMCTL_REQUIRE_TMUX`` is set, so the CI jobs
+that install tmux (the ``tmux`` matrix in .github/workflows/ci.yml: tmux 3.2a, the floor, and the
+runner image's tmux) and ``make verify-floor`` cannot pass by skipping them all. The shared CI's
+``verify`` job cannot install packages: they run there only when the runner image ships tmux and
+skip otherwise.
 """
 
 from __future__ import annotations
 
+import atexit
 import os
 import pwd
 import re
@@ -42,6 +44,29 @@ def tmux_version(tmux_bin: str | None = TMUX_BIN) -> tuple[int, int] | None:
 
 
 TMUX_VERSION = tmux_version()
+# tmux before 3.3: the 3.2 floor (``make verify-floor``, the CI ``tmux (floor)`` job). Where it
+# differs from 3.3+, the integration tests assert each version's own behaviour (#25).
+TMUX_3_2 = TMUX_VERSION is not None and TMUX_VERSION < (3, 3)
+
+
+def tmux_stored_name(name: str) -> str:
+    """How tmux reports a window or session name that ``rename-window``, ``rename-session`` or
+    ``new-session -s`` stored: vis-escaped, so a backslash reads back doubled and, before 3.3, a
+    ``$`` followed by an ASCII letter, ``_`` or ``{`` as ``\\$`` (checked on 3.2a and 3.5a).
+    ``new-window -n`` keeps a name as given. Written out here rather than taken from
+    ``termctl.display`` so the integration tests check that model against tmux."""
+    stored = name.replace("\\", "\\\\")
+    return re.sub(r"\$(?=[A-Za-z_{])", r"\\$", stored) if TMUX_3_2 else stored
+
+
+# tmux 3.3 to 3.5 escape control characters and bad UTF-8 in printed output; 3.2 and 3.6+ print
+# them raw.
+TMUX_PRINTS_RAW = TMUX_VERSION is not None and (TMUX_VERSION < (3, 3) or TMUX_VERSION >= (3, 6))
+
+# An empty config home for the CLI tests that start tmux. It is outside the checkout: the tmux
+# home guard refuses a config home under a real home, as the checkout is on CI runners.
+NO_CONFIG = tempfile.mkdtemp(prefix="tc-no-config-")
+atexit.register(shutil.rmtree, NO_CONFIG, ignore_errors=True)
 
 
 # --- the guard against tmux reading the real user's config (review round 1, R1-11) -------------

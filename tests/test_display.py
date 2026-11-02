@@ -109,9 +109,48 @@ def test_tmux_3_2_escapes_dollar() -> None:
     assert display.shows("a$b", "a$b", V32)
 
 
+@pytest.mark.parametrize(
+    ("computed", "reported"),
+    [
+        # #25, checked on tmux 3.2a: rename-window escapes "$" only before an ASCII letter,
+        # "_" or "{" (vis VIS_DQ), in the same pass that doubles backslashes.
+        ("$HOME", "\\$HOME"),
+        ("${x}", "\\${x}"),
+        ("$_a", "\\$_a"),
+        ("a$b c$", "a\\$b c$"),
+        ("a\\$b", "a\\\\\\$b"),
+        ("a\\b$c", "a\\\\b\\$c"),
+        ("$\\a", "$\\\\a"),
+    ],
+)
+def test_tmux_3_2_reports_its_dollar_escaping(computed: str, reported: str) -> None:
+    assert display.shows(reported, computed, V32)
+
+
+@pytest.mark.parametrize("name", ["$", "a$", "a$ b", "$$", "$1", "$-", "$é", "a$#b"])
+def test_tmux_3_2_keeps_a_dollar_not_before_a_letter_underscore_or_brace(name: str) -> None:
+    # tmux 3.2a reports these as given; an escaped "$" here is a form tmux never produces.
+    assert display.shows(name, name, V32)
+    escaped = name.replace("$", "\\$")
+    assert not display.shows(escaped, name, V32)
+
+
+def test_tmux_3_2_escapes_every_dollar_or_none() -> None:
+    # rename-window escapes every such "$"; new-window -n keeps them all. A mix is neither.
+    assert not display.shows("\\$a $b", "$a $b", V32)
+    assert not display.shows("$a \\$b", "$a $b", V32)
+    assert display.shows("\\$a \\$b", "$a $b", V32)
+
+
+def test_tmux_3_2_never_escapes_dollar_without_doubling_backslashes() -> None:
+    # One vis pass does both, so "$" escaped with a backslash left single is not tmux's form.
+    assert not display.shows("a\\b\\$c", "a\\b$c", V32)
+
+
 @pytest.mark.parametrize("version", [V35, V33, None])
 def test_tmux_3_3_and_newer_never_escape_dollar(version: TmuxVersion | None) -> None:
     assert not display.shows("a\\$b", "a$b", version)
+    assert not display.shows("\\$HOME", "$HOME", version)
 
 
 def test_other_characters_are_compared_exactly() -> None:

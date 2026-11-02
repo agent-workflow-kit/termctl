@@ -1125,8 +1125,6 @@ def _done(
 
 
 class RecordingGateway(FakeGateway):
-    """Also records each call's timeout (``FakeGateway`` records the env)."""
-
     def __init__(self, *args: object, **kwargs: object) -> None:
         super().__init__(*args, **kwargs)  # type: ignore[arg-type]
         self.timeouts: list[float | None] = []
@@ -1275,7 +1273,7 @@ def test_command_is_immutable() -> None:
     [
         ({}, "skip"),
         # The shared CI's verify job cannot install packages, so tmux there depends on the
-        # runner image; termctl's own tmux job installs it and sets TERMCTL_REQUIRE_TMUX.
+        # runner image; termctl's own tmux jobs install it and set TERMCTL_REQUIRE_TMUX.
         ({"CI": "true"}, "skip"),
         ({"TERMCTL_REQUIRE_TMUX": "1"}, "fail"),
         ({"CI": "true", "TERMCTL_REQUIRE_TMUX": "1"}, "fail"),
