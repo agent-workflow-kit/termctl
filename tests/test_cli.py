@@ -861,6 +861,8 @@ IMPLEMENTED = {
     "close",
     "focus",
     "rename",
+    "mark",
+    "unmark",
     "label add",
     "label remove",
 }
@@ -886,13 +888,12 @@ def test_unimplemented_command_is_internal_error(command: str) -> None:
         assert calls[0] == [TMUX, "-V"] and len(calls) == 2 and is_list_panes(calls[1])
 
 
-def test_unimplemented_command_golden() -> None:
+def test_unimplemented_command_golden(monkeypatch: pytest.MonkeyPatch) -> None:
+    # Every command is implemented now: take one out of the dispatch table.
+    monkeypatch.delitem(cli.COMMAND_STEPS, "close")
     expected = json.loads((GOLDEN / "error-not-implemented.json").read_text(encoding="utf-8"))
     validate(expected, "termctl/cli/error.json")
-    assert (
-        Run(["--json", "mark", ID, "attention"], FakeGateway(panes=[pane_row(tc_id=ID)])).json()
-        == expected
-    )
+    assert Run(["--json", "close", ID], FakeGateway(panes=[pane_row(tc_id=ID)])).json() == expected
 
 
 # --- broken output streams ----------------------------------------------------------------------

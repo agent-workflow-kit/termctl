@@ -12,8 +12,9 @@ implements it:
 - ``tag_pane`` and ``cleanup_pane``: ``open``'s pane (Open order step 6, ``open_cmd.tag``).
 - ``record_process``: ``open``'s PID recording (Open order step 7, ``open_cmd.record``).
 - ``write_pane`` and ``byte_lengths``: the guarded read-modify-write of a managed pane's
-  options and window name (``pane_change.py``); ``rename`` and the label commands use them,
-  and TODO(#20) ``mark`` and ``unmark`` reuse them.
+  options and window name (``pane_change.py``); ``rename``, ``mark``, ``unmark`` and the label
+  commands use them.
+- ``pane_tty``: the terminal a ``bell`` marker writes BEL to (``display.ring_bell``).
 - ``list_clients``, ``session_has_pane`` and ``switch_client``: ``focus`` and ``open --focus``
   (``focus_cmd``); its attach is an exec, not a backend call (``gateway.exec_replace``).
 - ``query_process`` and ``kill_pane``: ``close`` (``close_cmd``).
@@ -175,6 +176,12 @@ class Backend(Protocol):
         """``kill-pane`` of the pane, guarded by its being managed as ``termctl_id``; with
         ``query``, the same invocation first reads the pane's process as ``query_process``
         does. Raises only when tmux cannot be run."""
+        ...
+
+    def pane_tty(self, pane: ManagedPane) -> str | None:
+        """The terminal device path of ``pane`` while it is still the managed pane resolved
+        and running (read-only), or None otherwise or when it cannot be read. Any path is
+        reported; ``display.ring_bell`` writes only to a pseudo-terminal."""
         ...
 
 
@@ -386,3 +393,12 @@ class TmuxBackend:
         if not all(_LENGTH.fullmatch(v) for v in lengths):
             return None
         return tuple(int(v) for v in lengths)
+
+    def pane_tty(self, pane: ManagedPane) -> str | None:
+        try:
+            result = self.tmux.run(tb.tty_query(pane.pane_id), utf8=True)
+        except TermctlError:
+            return None
+        if result.returncode != 0:
+            return None
+        return tb.parse_tty_query(result.stdout, pane.pane_id, pane.id)

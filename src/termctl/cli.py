@@ -528,8 +528,13 @@ def check_args(args: argparse.Namespace, ctx: Context) -> None:
 
 
 def load_config(args: argparse.Namespace, ctx: Context) -> None:
-    """Step 1 (rest): the config file, drop-ins and ``TERMCTL_*`` variables (exit 2)."""
+    """Step 1 (rest): the config file, drop-ins and ``TERMCTL_*`` variables, then the
+    arguments that need config: ``mark``'s marker must be defined (exit 2)."""
     ctx.config = config_module.load(ctx.environ, args.config)
+    if args.command == "mark" and args.marker not in ctx.config.markers:
+        raise UsageError(
+            f"unknown marker {validate.show(args.marker)}: not defined in config (markers)"
+        )
 
 
 def resolve_server(args: argparse.Namespace, ctx: Context) -> None:
@@ -1407,6 +1412,60 @@ def rename(args: argparse.Namespace, ctx: Context) -> Result:
     return Result(data, outcome.pane.display_name)
 
 
+def mark(args: argparse.Namespace, ctx: Context) -> Result:
+    """Set the marker, with its text from the current config, in one write with the
+    recomputed displayed name; a ``bell`` marker rings when something changed on a running
+    pane (interface.md "Markers", `mark`). ``load_config`` checked that it is defined."""
+    if args.dry_run:
+        # TODO(#22): mark --dry-run prints the pane as it would be (interface.md "Dry runs").
+        raise TermctlError("internal", f"{PROG} mark --dry-run is not implemented yet")
+    marker = ctx.config.markers[args.marker]
+
+    def plan(pane: ManagedPane) -> Change:
+        shown = display.displayed_name(pane.name, marker.text, ctx.config.marker_display)
+        options = {"@termctl_marker": args.marker, "@termctl_marker_text": marker.text}
+        return Change(options=options, display_name=shown)
+
+    data, outcome = _apply_change(ctx, plan)
+    if outcome.changed and marker.bell:
+        _ring_bell(ctx, outcome.pane)
+    return Result(data, outcome.pane.display_name)
+
+
+def _ring_bell(ctx: Context, pane: ManagedPane) -> None:
+    """The bell of a changed ``mark``; a failure is a warning only (interface.md "Markers")."""
+    if pane.dead:
+        return
+    try:
+        backend = connect(ctx)
+        warning = (
+            f"bell not written: no tmux server is running for managed pane {pane.id}"
+            if backend is None
+            else display.ring_bell(backend, ctx.gateway, pane)
+        )
+    except TermctlError as exc:
+        # The socket checks run again before connecting; the change is already made.
+        warning = f"bell not written: {exc.message}"
+    if warning is not None:
+        ctx.warn(warning)
+
+
+def unmark(args: argparse.Namespace, ctx: Context) -> Result:
+    """Clear the marker, whether or not config still defines it; the displayed name becomes
+    the name (interface.md `unmark`)."""
+    if args.dry_run:
+        # TODO(#22): unmark --dry-run prints the pane as it would be (interface.md "Dry runs").
+        raise TermctlError("internal", f"{PROG} unmark --dry-run is not implemented yet")
+
+    def plan(pane: ManagedPane) -> Change:
+        shown = display.displayed_name(pane.name, None, ctx.config.marker_display)
+        options = {"@termctl_marker": "", "@termctl_marker_text": ""}
+        return Change(options=options, display_name=shown)
+
+    data, outcome = _apply_change(ctx, plan)
+    return Result(data, outcome.pane.display_name)
+
+
 def label_change(args: argparse.Namespace, ctx: Context) -> Result:
     """``label add`` and ``label remove``: the pane's labels are a set of pairs, so adding a
     present pair or removing an absent one changes nothing; they are written in canonical
@@ -1527,6 +1586,8 @@ COMMAND_STEPS = {
     "close": close_pane,
     "focus": focus,
     "rename": rename,
+    "mark": mark,
+    "unmark": unmark,
     "label add": label_change,
     "label remove": label_change,
 }
@@ -1540,7 +1601,6 @@ def run_command(args: argparse.Namespace, ctx: Context) -> Result:
     step = COMMAND_STEPS.get(args.command)
     if step is not None:
         return step(args, ctx)
-    # TODO(#20): mark, unmark.
     raise TermctlError("internal", f"{PROG} {args.command} is not implemented yet")
 
 
@@ -1605,9 +1665,10 @@ def _logged_open(args: argparse.Namespace, ctx: Context) -> Result:
 
 
 # The pane-change commands, by their log.jsonl event (interface.md "Audit and log").
-# TODO(#20): mark, unmark.
 CHANGE_EVENTS = {
     "rename": "rename",
+    "mark": "mark",
+    "unmark": "unmark",
     "label add": "label_add",
     "label remove": "label_remove",
 }

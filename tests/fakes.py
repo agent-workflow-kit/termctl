@@ -245,6 +245,7 @@ class FakeGateway:
         system: str = "linux",
         proc_stats: Mapping[int, str | None | BaseException] | None = None,
         peer_pids: Mapping[str, int | BaseException] | None = None,
+        ttys: Mapping[str, OSError | None] | None = None,
         processes: Sequence[FakeProcess] = (),
         clock: FakeClock | None = None,
         stderr_tty: bool | None = None,
@@ -277,6 +278,10 @@ class FakeGateway:
         # exception to raise); an unscripted path fails the test.
         self.peer_pids: dict[str, int | BaseException] = dict(peer_pids or {})
         self.peer_checks: list[str] = []
+        # ``write_tty`` answers from ``ttys`` (None: written, or an exception to raise) and
+        # records each write in ``tty_writes``; an unscripted path fails the test.
+        self.ttys: dict[str, OSError | None] = dict(ttys or {})
+        self.tty_writes: list[tuple[str, bytes]] = []
         # ``proc_is_own_namespace`` answers ``own_namespace`` (or raises it).
         self.own_namespace: bool | OSError = True
         self.panes = None if panes is None else [dict(row) for row in panes]
@@ -505,6 +510,14 @@ class FakeGateway:
         if isinstance(answer, BaseException):
             raise answer
         return answer
+
+    def write_tty(self, path: str, data: bytes) -> None:
+        if path not in self.ttys:
+            raise AssertionError(f"unexpected tty write: {path}")
+        error = self.ttys[path]
+        if error is not None:
+            raise error
+        self.tty_writes.append((path, data))
 
     def proc_is_own_namespace(self) -> bool:
         if isinstance(self.own_namespace, OSError):

@@ -17,6 +17,7 @@ import select
 import selectors
 import signal
 import socket
+import stat
 import struct
 import subprocess
 import sys
@@ -130,7 +131,7 @@ class ProcessHandle(Protocol):
 
 
 class Gateway(Protocol):
-    """External effects termctl needs. Later stages add tty writes here."""
+    """External effects termctl needs."""
 
     def run(
         self,
@@ -258,6 +259,14 @@ class Gateway(Protocol):
         """Linux: connect to the Unix socket ``path`` and return the listener's PID from
         ``SO_PEERCRED``, as the kernel translates it into termctl's PID namespace (0 when the
         listener is not visible there). Sends nothing. Raises ``OSError`` if it cannot."""
+        ...
+
+    def write_tty(self, path: str, data: bytes) -> None:
+        """Write ``data`` to the terminal device ``path`` (the bell, interface.md "Markers"):
+        opened with ``O_WRONLY|O_NOCTTY|O_NONBLOCK`` (never creating, truncating or following a
+        final symlink) and written only if it is a character device, with SIGTTOU blocked so a
+        write to termctl's own terminal from a background group never stops it. Raises
+        ``OSError`` for anything else, a write that would block or a short write."""
         ...
 
     def stdin_isatty(self) -> bool:
@@ -508,6 +517,24 @@ class SystemGateway:
             creds = sock.getsockopt(socket.SOL_SOCKET, socket.SO_PEERCRED, struct.calcsize("3i"))
         pid, _uid, _gid = struct.unpack("3i", creds)
         return pid
+
+    def write_tty(self, path: str, data: bytes) -> None:
+        # SIGTTOU is blocked around the open and write: when ``path`` is termctl's own
+        # controlling terminal, termctl is in a background process group and ``tostop`` is
+        # set, the write would otherwise stop termctl (the kernel lets it through instead).
+        flags = os.O_WRONLY | os.O_NOCTTY | os.O_NONBLOCK | os.O_CLOEXEC | os.O_NOFOLLOW
+        previous = signal.pthread_sigmask(signal.SIG_BLOCK, {signal.SIGTTOU})
+        try:
+            fd = os.open(path, flags)
+            try:
+                if not stat.S_ISCHR(os.fstat(fd).st_mode):
+                    raise OSError(errno.ENOTTY, "not a character device", path)
+                if os.write(fd, data) != len(data):
+                    raise OSError(errno.EIO, "short write", path)
+            finally:
+                os.close(fd)
+        finally:
+            signal.pthread_sigmask(signal.SIG_SETMASK, previous)
 
     def stdin_isatty(self) -> bool:
         return os.isatty(0)
