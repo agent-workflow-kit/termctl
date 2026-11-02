@@ -7,8 +7,10 @@ commands run by someone with socket access (a hook can see the format, sentinel 
 print a forged record). The free-text fields tmux controls (session and window names) are read
 with tab and newline replaced by spaces in the format string; the ``@termctl_*`` options are read
 as is, so a value holding a tab or newline (one termctl never writes) breaks its record and the
-pane is ignored with a warning instead of being read wrongly. tmux prints the other control
-characters of every field escaped (``\\033``), and with ``-u`` writes UTF-8 whatever the locale.
+pane is ignored with a warning instead of being read wrongly. tmux 3.3 to 3.5 print the other
+control characters of every field escaped (``\\033``); 3.2 and 3.6 and later print them raw, where
+the option rules reject them and termctl escapes them when it prints them. With ``-u`` tmux writes
+UTF-8 whatever the locale.
 
 A pane is managed only if its ``@termctl_pane`` equals its own pane id: a ``#{@...}`` format
 also returns values inherited from the window, session or global scope (spike F4), and such a
