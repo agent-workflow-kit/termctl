@@ -21,12 +21,11 @@ import pytest
 
 from termctl.cli import main
 
-from .conftest import TmuxServer, wait_for
+from .conftest import NO_CONFIG, TmuxServer, wait_for
 from .schemas import validate
 
 pytestmark = pytest.mark.tmux
 
-NO_CONFIG = str(Path(__file__).parent / "no-config")
 PROC = Path("/proc/self/environ").exists()
 needs_proc = pytest.mark.skipif(not PROC, reason="reads /proc/<pid>/environ")
 SESSION = "termctl"
@@ -96,7 +95,8 @@ def test_c1_e5_a_fast_exiting_command_is_tagged_and_no_placeholder_is_left(
     out = opened(tmux_server, "--keep-on-exit", "always", "--", command)
     pane = out["pane_id"]
     assert wait_for(lambda: fmt(tmux_server, pane, "#{pane_dead}") == "1")
-    assert fmt(tmux_server, pane, "#{pane_dead_status}") == str(status)
+    # tmux 3.2 reports the status a moment after the pane is dead.
+    assert wait_for(lambda: fmt(tmux_server, pane, "#{pane_dead_status}") == str(status))
     # The options were set before the command ran, so its dead pane is managed.
     assert fmt(tmux_server, pane, "#{@termctl_pane} #{@termctl_id}") == f"{pane} {out['id']}"
     # The placeholder was replaced, not left beside the command.

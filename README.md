@@ -128,7 +128,7 @@ Residual risks are real and documented, not hidden. The main ones: anyone who ca
 
 - **Linux and WSL:** supported. CI runs the whole suite on tmux 3.2a (the floor, `make verify-floor`) and on the runner image's current tmux.
 - **tmux:** 3.2 is the minimum. Some fields differ on 3.2 (for example `exit_signal` needs 3.3); see [Platform notes](docs/interface.md#platform-notes).
-- **macOS:** best-effort. CI runs the suite in a `macos` job that is not a required check, and a manual checklist ([macOS checklist](docs/design.md#macos-checklist)) covers what only a real Mac shows. The checklist has not been run on a Mac yet; its results table is empty.
+- **macOS:** best-effort. CI runs the suite on a macOS runner in a `macos` job that is not a required check (it passes), and a manual checklist ([macOS checklist](docs/design.md#macos-checklist)) covers what only a real Mac shows. The checklist has not been run on a Mac yet; its results table is empty.
 - **Windows:** not supported (use WSL).
 
 ## Development

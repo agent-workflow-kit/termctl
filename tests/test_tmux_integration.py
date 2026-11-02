@@ -18,7 +18,7 @@ import pytest
 from termctl import tmux_backend as tb
 from termctl.tmux_backend import Command, GuardOutcome, Invocation, command
 
-from .conftest import TmuxServer, tmux_stored_name, wait_for
+from .conftest import TMUX_STRICT_NAMES, TmuxServer, tmux_stored_name, wait_for
 
 pytestmark = pytest.mark.tmux
 
@@ -323,8 +323,10 @@ def test_e4_names_round_trip_in_new_window_and_rename_window(
         .build()
     )
     pane_id, window_id = _new_window(tmux_server, cmd)
-    # new-window -n keeps a backslash as given; rename-window doubles it (_as_window_name).
-    assert _display(tmux_server, pane_id, "#{window_name}") == name
+    # new-window -n keeps a backslash as given before tmux 3.7; rename-window doubles it
+    # (_as_window_name), and from 3.7 so does new-window -n.
+    stored = tmux_stored_name(name) if TMUX_STRICT_NAMES else name
+    assert _display(tmux_server, pane_id, "#{window_name}") == stored
     rc, _, err = _run(
         tmux_server, command("rename-window").target(tb.window(window_id)).name(name + "2").build()
     )

@@ -634,7 +634,7 @@ class RealFs(SystemGateway):
 def base() -> Iterator[Path]:
     """A short directory under /tmp (a sticky, root-owned ancestor), so socket paths fit in
     100 bytes; pytest's tmp_path can be longer."""
-    path = Path(tempfile.mkdtemp(prefix="tc-", dir="/tmp"))
+    path = Path(os.path.realpath(tempfile.mkdtemp(prefix="tc-", dir="/tmp")))
     try:
         yield path
     finally:

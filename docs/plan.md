@@ -139,22 +139,21 @@ Criteria from the version roadmap below, with their state. This list is the reco
 
 | # | Criterion | State |
 |---|---|---|
-| 1 | Stage 1 to 4 features implemented (every command in [interface.md](interface.md#commands)) | Not met: implemented in PRs #31-#56, none merged yet |
-| 2 | `make verify-floor` passes on tmux 3.2a, and `make verify` on the CI tmux | Not met: the `tmux (floor)` and `tmux (latest)` jobs exist (#25) but are red; the test-suite real-home guard in `tests/conftest.py` trips on runner checkouts under the runner's home (run 41221629827) |
-| 3 | The agent-spawn flow runs end to end against real tmux using only the CLI | Not met until merged and green: `tests/test_agent_spawn_flow_integration.py` (#27) is in the unmerged stack, whose CI is red for the reason in row 2 |
+| 1 | Stage 1 to 4 features implemented (every command in [interface.md](interface.md#commands)) | Met: implemented in PRs #31-#56, merged to `main` |
+| 2 | `make verify-floor` passes on tmux 3.2a, and `make verify` on the CI tmux | Met: the `tmux (floor)` (tmux 3.2a) and `tmux (latest)` jobs (#25) are green on the CI run that merged #55 |
+| 3 | The agent-spawn flow runs end to end against real tmux using only the CLI | Met: `tests/test_agent_spawn_flow_integration.py` (#27) is merged and green in the `verify`, `tmux` and `macos` jobs |
 | 4 | macOS checklist run on a Mac and recorded in [design.md](design.md#macos-checklist) | **Blocked:** needs a human run on a Mac; the results table is empty (#26) |
-| 5 | README matches the implemented behavior | Not met until merged: README rewritten and its examples checked against the CLI on a private server (#28) |
+| 5 | README matches the implemented behavior | Met: README rewritten and its examples checked against the CLI on a private server (#28) |
 | 6 | agent-spawn has used termctl for its v1 ticket slice without interface changes | **Blocked:** outside this repository; needs agent-spawn's v1 slice to ship on termctl |
 | 7 | The interface is declared stable by a deliberate breaking-change commit (architecture section 18.3) | **Blocked** on 4 and 6; `docs/interface.md` still says `0.1.0-design` and the version is not hand-edited |
 
 A row is met only when its evidence is on `main` and green.
 
-Not a gate: the `macos` CI job is informational and does not gate 1.0 ([design.md](design.md#macos-checklist)); it is currently red for the same real-home guard reason as row 2 (run 41219430832). The manual macOS checklist (row 4) is the macOS gate.
+Not a gate: the `macos` CI job is informational and does not gate 1.0 ([design.md](design.md#macos-checklist)); it runs the suite on a GitHub-hosted macOS runner (Homebrew tmux 3.8) and is green as of #55. It cannot show what only a real Mac does, so the manual macOS checklist (row 4) is the macOS gate.
 
 Before the declaring commit also:
 
 - Maintainer: add `tmux (floor)` and `tmux (latest)` to the `main` ruleset's required status checks (currently `ci / ci-ok` and `pr-title / pr-title`); `macos` stays optional.
-- Maintainer: merge the stacked implementation PRs in order; the release job owns the changelog and version.
 - Update `awkit-docs/interface-registry.md` with the declaration (CLAUDE.md rule).
 - Open spec questions to settle or knowingly carry into 1.0 (each is also a candidate for a post-1.0 additive change): config file ownership checks; `--override-escalation` passing on any TTY even with an `auto:` actor; `target: pane` placements and markers on shared-window panes (reserved, 1.x: #29, #30).
 - Residual risks in [interface.md](interface.md#residual-risks) are accepted as written; re-read them once before declaring.

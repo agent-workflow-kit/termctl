@@ -12,6 +12,7 @@ skip otherwise.
 
 from __future__ import annotations
 
+import atexit
 import os
 import pwd
 import re
@@ -56,6 +57,26 @@ def tmux_stored_name(name: str) -> str:
     ``termctl.display`` so the integration tests check that model against tmux."""
     stored = name.replace("\\", "\\\\")
     return re.sub(r"\$(?=[A-Za-z_{])", r"\\$", stored) if TMUX_3_2 else stored
+
+
+# tmux 3.3 to 3.5 escape control characters and bad UTF-8 in printed output; 3.2 and 3.6+ print
+# them raw.
+TMUX_PRINTS_RAW = TMUX_VERSION is not None and (TMUX_VERSION < (3, 3) or TMUX_VERSION >= (3, 6))
+
+# tmux 3.7 and later check and vis-escape every window name, new-window -n included: a name with a
+# control character (tab and newline too) is refused, and a backslash is stored doubled, as
+# rename-window always has.
+TMUX_STRICT_NAMES = TMUX_VERSION is not None and TMUX_VERSION >= (3, 7)
+STRICT_NAMES_REASON = "tmux 3.7+ refuses a control character in a window name, so none can exist"
+
+# Resolved, so a path a test builds under the temporary directory equals the one termctl reports
+# (macOS: /var and /tmp are links into /private).
+tempfile.tempdir = os.path.realpath(tempfile.gettempdir())
+
+# An empty config home for the CLI tests that start tmux. It is outside the checkout: the tmux
+# home guard refuses a config home under a real home, as the checkout is on CI runners.
+NO_CONFIG = tempfile.mkdtemp(prefix="tc-no-config-")
+atexit.register(shutil.rmtree, NO_CONFIG, ignore_errors=True)
 
 
 # --- the guard against tmux reading the real user's config (review round 1, R1-11) -------------

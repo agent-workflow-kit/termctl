@@ -417,7 +417,9 @@ def test_agent_spawn_flow(caller: Caller) -> None:
     (work / "finish").touch()
 
     def dead() -> bool:
-        return caller.ok(*sock("show", agent_id), schema="show")["state"] == "dead"
+        shown = caller.ok(*sock("show", agent_id), schema="show")
+        # tmux 3.2 reports the exit status a moment after the pane is dead.
+        return shown["state"] == "dead" and shown["exit_status"] == 3
 
     assert wait_for(dead, timeout=15)
     final = caller.ok(*sock("show", agent_id), schema="show")
@@ -426,6 +428,10 @@ def test_agent_spawn_flow(caller: Caller) -> None:
     dead_panes = caller.ok(*sock("list", "--dead"), schema="list")["panes"]
     assert [pane["id"] for pane in dead_panes] == [agent_id]
 
+    rows = server.raw(
+        "list-panes", "-a", "-F",
+        "#{pane_id} pid=#{pane_pid} rec=#{@termctl_pid} dead=#{pane_dead}",
+    ).stdout  # fmt: skip
     closed = caller.ok(
         *sock(
             "close", agent_id, "--actor", "auto:agent-spawn", "--decision-id", "teardown-1",
@@ -435,7 +441,7 @@ def test_agent_spawn_flow(caller: Caller) -> None:
     )  # fmt: skip
     assert closed["id"] == agent_id and closed["socket_path"] == socket_path
     assert (closed["pane_closed"], closed["was_running"], closed["forced"]) == (True, False, False)
-    assert (closed["signals_sent"], closed["pid_mismatch"]) == ([], False)
+    assert (closed["signals_sent"], closed["pid_mismatch"]) == ([], False), rows
     assert closed["decision_ids"] == ["teardown-1", "gate-pre-close"]
     pre_close = caller.hook_payload("pre-close", "pre-close")
     assert (pre_close["object_id"], pre_close["pane"]["state"]) == (agent_id, "dead")

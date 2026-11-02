@@ -243,7 +243,7 @@ def test_macos_handle_sees_a_zombie_as_exited(kqueue: Any) -> None:
 @pytest.mark.parametrize("pid", ["reaped", 0, -1, 2**31])
 def test_macos_handle_of_no_process_is_none(kqueue: Any, pid: int | str) -> None:
     if pid == "reaped":
-        proc = child("/bin/true")
+        proc = child(shutil.which("true") or "/usr/bin/true")
         proc.wait()
         pid = proc.pid
     assert isinstance(pid, int)

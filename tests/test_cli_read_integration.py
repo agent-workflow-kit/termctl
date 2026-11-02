@@ -12,20 +12,25 @@ import json
 import os
 import socket
 from dataclasses import dataclass
-from pathlib import Path
 from typing import Any
 
 import pytest
 
 from termctl.cli import main
 
-from .conftest import TMUX_3_2, TmuxServer, wait_for
+from .conftest import (
+    NO_CONFIG,
+    STRICT_NAMES_REASON,
+    TMUX_3_2,
+    TMUX_PRINTS_RAW,
+    TMUX_STRICT_NAMES,
+    TmuxServer,
+    wait_for,
+)
 from .schemas import validate
 from .test_panes_integration import ID, OTHER_ID, new_window, tag
 
 pytestmark = pytest.mark.tmux
-
-NO_CONFIG = str(Path(__file__).parent / "no-config")
 
 
 @dataclass
@@ -132,6 +137,7 @@ def test_a_forged_but_valid_option_is_reported_as_read(tmux_server: TmuxServer) 
     assert (obj["name"], obj["labels"]) == ("trusted-by-nobody", ["a=b"])
 
 
+@pytest.mark.skipif(TMUX_STRICT_NAMES, reason=STRICT_NAMES_REASON)
 def test_tmux_text_is_escaped_in_human_output(tmux_server: TmuxServer) -> None:
     pane_id = started(tmux_server)
     assert tmux_server.raw("rename-window", "-t", pane_id, "w\x1b[2J\x07\u009b").returncode == 0
@@ -155,7 +161,9 @@ def test_a_forged_invalid_pane_is_ignored_with_an_escaped_warning(tmux_server: T
     )
 
 
-@pytest.mark.skipif(TMUX_3_2, reason="tmux 3.3+ prints the byte escaped; 3.2: the next test")
+@pytest.mark.skipif(
+    TMUX_PRINTS_RAW, reason="tmux 3.2 and 3.6+ print the byte raw instead of escaping it"
+)
 def test_a_raw_control_byte_in_an_option_is_read_as_tmux_escape_text(
     tmux_server: TmuxServer,
 ) -> None:
@@ -174,7 +182,9 @@ def test_a_raw_control_byte_in_an_option_is_read_as_tmux_escape_text(
     assert raw == []
 
 
-@pytest.mark.skipif(not TMUX_3_2, reason="tmux 3.2 prints the byte raw; 3.3+: the previous test")
+@pytest.mark.skipif(
+    not TMUX_PRINTS_RAW, reason="tmux 3.3 to 3.5 print the byte escaped: the previous test"
+)
 def test_a_raw_control_byte_in_an_option_makes_the_pane_ignored_on_tmux_3_2(
     tmux_server: TmuxServer,
 ) -> None:

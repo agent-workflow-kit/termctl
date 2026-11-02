@@ -274,6 +274,14 @@ def test_a_dead_pane_with_a_mismatched_pid_reports_pid_mismatch() -> None:
     assert (data["pid_mismatch"], data["exited"], data["signals_sent"]) == (True, None, [])
 
 
+def test_a_dead_pane_without_a_pane_pid_is_no_mismatch() -> None:
+    # tmux 3.8 prints no #{pane_pid} for a dead pane.
+    row = pane_row(tc_id=ID, overrides={**DEAD, "pane_pid": ""})
+    gateway, clock = gateway_for([row])
+    data = close([ID], gateway, clock).output()
+    assert (data["pid_mismatch"], data["exited"], data["signals_sent"]) == (False, True, [])
+
+
 def test_a_dead_pane_gone_at_the_kill_counts_as_closed() -> None:
     gateway, clock = gateway_for([pane_row(tc_id=ID, overrides=DEAD)], responses={KILL: NOMATCH})
     assert close([ID], gateway, clock).output()["pane_closed"] is True

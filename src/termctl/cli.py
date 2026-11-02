@@ -67,6 +67,8 @@ class Context:
     # Set by step 2 (the resolved server) and step 3 (False when there is no server).
     server: tmux_socket.Server | None = None
     socket_present: bool | None = None
+    # `open`'s resolved placement (Open order step 2); None for other commands.
+    selection: placement.Selection | None = None
     # `tmux_bin` resolved to an absolute path, once: by `open`'s resolve step or the tmux checks.
     tmux_path: str | None = None
     # The resolved tmux binary and version, set by the tmux checks (step 3) after `tmux -V`.
@@ -1038,133 +1040,81 @@ def _opened(
     return Result(data, ctx.open_id), pane
 
 
-# --- pane changes -------------------------------------------------------------------------------
+def _focus_opened(ctx: Context, backend: Backend, pane: ManagedPane) -> bool:
+    """Open order step 8: switch a client by the rules of `focus`, never attaching. Whether a
+    client was switched; a failure (no client, a tmux error) is a warning and leaves the open
+    in place (interface.md "Open order")."""
+    assert ctx.tmux is not None
+    try:
+        where = focus_cmd.caller(ctx.environ, _socket_path(ctx), ctx.gateway)
+        decision = focus_cmd.decide(
+            backend, pane, where, client=None, attach_ok=False, tmux_bin=ctx.tmux.path
+        )
+        assert decision.client is not None
+        focus_cmd.switch(backend, pane, decision.client, named=False)
+    except TermctlError as err:
+        ctx.warn(f"could not focus pane {pane.id}: {err.message}")
+        return False
+    return True
 
 
-def _change_backend(ctx: Context) -> Backend:
-    """The backend for a pane change. The server may have gone since step 4: the pane went
-    with it (interface.md "Panes that vanish")."""
+def focus(args: argparse.Namespace, ctx: Context) -> Result:
+    """`focus` after id resolution: decide (steps 1 to 4), then switch the client or attach.
+    A real run records its success in ``ctx`` (and the argv to exec, when it attaches without
+    --json); ``_logged_focus`` writes every record and runs the exec."""
+    assert ctx.pane is not None and ctx.tmux is not None
+    pane, socket_path = ctx.pane, _socket_path(ctx)
     backend = connect(ctx)
     if backend is None:
-        assert ctx.pane is not None
-        raise TermctlError(
-            "not_found", f"managed pane {ctx.pane.id} is gone (no tmux server is running)"
-        )
-    return backend
+        raise TermctlError("not_found", f"managed pane {pane.id} is gone (no server running)")
+    attach_ok = (
+        args.client is None
+        and not args.no_attach
+        and ctx.gateway.stdin_isatty()
+        and ctx.gateway.stderr_isatty()
+    )
+    decision = focus_cmd.decide(
+        backend,
+        pane,
+        focus_cmd.caller(ctx.environ, socket_path, ctx.gateway),
+        client=args.client,
+        attach_ok=attach_ok,
+        tmux_bin=ctx.tmux.path,
+    )
+    ctx.focus_action = decision.action
+    data = focus_cmd.output(pane, decision, socket_path, dry_run=bool(args.dry_run))
+    if decision.argv is None:
+        assert decision.client is not None
+        if not args.dry_run:
+            focus_cmd.switch(backend, pane, decision.client, named=args.client is not None)
+            ctx.focus_ok = True
+        return Result(data, decision.client)
+    if args.dry_run:
+        return Result(data, shlex.join(decision.argv))
+    # An attach is logged before the exec (interface.md "Audit and log"); with --json the
+    # caller execs the argv itself, with its own environment, and termctl exits 0. Without
+    # --json ``_logged_focus`` execs it once the stop-signal handlers are restored.
+    ctx.focus_ok = True
+    if not ctx.out.json:
+        ctx.focus_exec = decision.argv
+    return Result(data, "")
 
 
-def _apply_change(
-    ctx: Context, plan: Callable[[ManagedPane], Change], *, dry_run: bool
-) -> tuple[dict[str, Any], Outcome]:
-    """Apply ``plan`` to the resolved pane under the lock; a change that changes nothing is a
-    no-op. A dry run decides the same on the pane step 4 read, without the lock or a write
-    (interface.md "Dry runs"). Returns the pane-change ``--json`` object and the outcome."""
-    assert ctx.pane is not None and ctx.tmux is not None
-    if dry_run:
-        outcome = preview_change(_change_backend(ctx), ctx.pane, plan, version=ctx.tmux.version)
-    else:
-        outcome = change_pane(
-            _change_backend(ctx),
-            ctx.pane.id,
-            plan,
-            version=ctx.tmux.version,
-            environ=ctx.environ,
-            clock=ctx.clock,
-            warn=ctx.warn,
-            seen=() if ctx.pane_read is None else ctx.pane_read.warnings,
-        )
-    ctx.no_op = not outcome.changed
-    data = {
-        **outcome.pane.pane_object(_socket_path(ctx)),
-        "changed": outcome.changed,
-        "display_updated": outcome.display_updated,
-        "dry_run": dry_run,
-    }
-    return data, outcome
-
-
-def rename(args: argparse.Namespace, ctx: Context) -> Result:
-    """Set ``@termctl_name`` and recompute the displayed name, keeping a set marker; the
-    window is renamed only while termctl may (interface.md `rename`, "Names")."""
-
-    def plan(pane: ManagedPane) -> Change:
-        shown = display.displayed_name(args.name, pane.marker_text, ctx.config.marker_display)
-        return Change(options={"@termctl_name": args.name}, display_name=shown)
-
-    data, outcome = _apply_change(ctx, plan, dry_run=args.dry_run)
-    return Result(data, outcome.pane.display_name)
-
-
-def mark(args: argparse.Namespace, ctx: Context) -> Result:
-    """Set the marker, with its text from the current config, in one write with the
-    recomputed displayed name; a ``bell`` marker rings when something changed on a running
-    pane (interface.md "Markers", `mark`). ``load_config`` checked that it is defined."""
-    marker = ctx.config.markers[args.marker]
-
-    def plan(pane: ManagedPane) -> Change:
-        shown = display.displayed_name(pane.name, marker.text, ctx.config.marker_display)
-        options = {"@termctl_marker": args.marker, "@termctl_marker_text": marker.text}
-        return Change(options=options, display_name=shown)
-
-    data, outcome = _apply_change(ctx, plan, dry_run=args.dry_run)
-    if outcome.changed and marker.bell and not args.dry_run:
-        _ring_bell(ctx, outcome.pane)
-    return Result(data, outcome.pane.display_name)
-
-
-def _ring_bell(ctx: Context, pane: ManagedPane) -> None:
-    """The bell of a changed ``mark``; a failure is a warning only (interface.md "Markers")."""
-    if pane.dead:
-        return
+def _focus_attach(ctx: Context, argv: list[str]) -> NoReturn:
+    """Exec the attach argv (``focus`` step 2), after its log record and with the run's
+    stop-signal handlers gone, so the tmux client starts with the caller's dispositions."""
+    ctx.out.flush()
     try:
-        backend = connect(ctx)
-        warning = (
-            f"bell not written: no tmux server is running for managed pane {pane.id}"
-            if backend is None
-            else display.ring_bell(backend, ctx.gateway, pane)
-        )
-    except TermctlError as exc:
-        # The socket checks run again before connecting; the change is already made.
-        warning = f"bell not written: {exc.message}"
-    if warning is not None:
-        ctx.warn(warning)
-
-
-def unmark(args: argparse.Namespace, ctx: Context) -> Result:
-    """Clear the marker, whether or not config still defines it; the displayed name becomes
-    the name (interface.md `unmark`)."""
-
-    def plan(pane: ManagedPane) -> Change:
-        shown = display.displayed_name(pane.name, None, ctx.config.marker_display)
-        options = {"@termctl_marker": "", "@termctl_marker_text": ""}
-        return Change(options=options, display_name=shown)
-
-    data, outcome = _apply_change(ctx, plan, dry_run=args.dry_run)
-    return Result(data, outcome.pane.display_name)
-
-
-def label_change(args: argparse.Namespace, ctx: Context) -> Result:
-    """``label add`` and ``label remove``: the pane's labels are a set of pairs, so adding a
-    present pair or removing an absent one changes nothing; they are written in canonical
-    form (sorted by code point, unique, single spaces) and the window is never renamed
-    (interface.md `label add` / `label remove`, "Labels")."""
-    pairs = set(validate.parse_labels(args.pairs))
-    adding = args.command == "label add"
-
-    def plan(pane: ManagedPane) -> Change:
-        current = set(pane.labels)
-        labels = sorted(current | pairs if adding else current - pairs)
-        # The limit applies to the labels read under the lock, after id resolution, so the
-        # failure is logged; a removal never grows the set.
-        if len(labels) > validate.MAX_LABELS:
-            raise UsageError(
-                f"managed pane {pane.id} would carry {len(labels)} labels "
-                f"(at most {validate.MAX_LABELS})"
-            )
-        return Change(options={"@termctl_labels": " ".join(labels)}, display_name=None)
-
-    data, outcome = _apply_change(ctx, plan, dry_run=args.dry_run)
-    return Result(data, " ".join(outcome.pane.labels))
+        # The caller's unfiltered environment: it is the user's own terminal, and -E keeps
+        # that environment out of the session.
+        ctx.gateway.exec_replace(argv, ctx.environ)
+    except (OSError, ValueError) as exc:
+        reason = exc.strerror if isinstance(exc, OSError) and exc.strerror else str(exc)
+        raise TermctlError(
+            "attach_failed",
+            f"cannot run {validate.show(argv[0], 200)}: {reason}",
+            details={"socket_path": _socket_path(ctx)},
+        ) from None
 
 
 # --- close --------------------------------------------------------------------------------------
@@ -1417,6 +1367,135 @@ def _close_failed(args: argparse.Namespace, ctx: Context, err: TermctlError) -> 
     _audit_close(args, ctx, err.envelope())
 
 
+# --- pane changes -------------------------------------------------------------------------------
+
+
+def _change_backend(ctx: Context) -> Backend:
+    """The backend for a pane change. The server may have gone since step 4: the pane went
+    with it (interface.md "Panes that vanish")."""
+    backend = connect(ctx)
+    if backend is None:
+        assert ctx.pane is not None
+        raise TermctlError(
+            "not_found", f"managed pane {ctx.pane.id} is gone (no tmux server is running)"
+        )
+    return backend
+
+
+def _apply_change(
+    ctx: Context, plan: Callable[[ManagedPane], Change], *, dry_run: bool
+) -> tuple[dict[str, Any], Outcome]:
+    """Apply ``plan`` to the resolved pane under the lock; a change that changes nothing is a
+    no-op. A dry run decides the same on the pane step 4 read, without the lock or a write
+    (interface.md "Dry runs"). Returns the pane-change ``--json`` object and the outcome."""
+    assert ctx.pane is not None and ctx.tmux is not None
+    if dry_run:
+        outcome = preview_change(_change_backend(ctx), ctx.pane, plan, version=ctx.tmux.version)
+    else:
+        outcome = change_pane(
+            _change_backend(ctx),
+            ctx.pane.id,
+            plan,
+            version=ctx.tmux.version,
+            environ=ctx.environ,
+            clock=ctx.clock,
+            warn=ctx.warn,
+            seen=() if ctx.pane_read is None else ctx.pane_read.warnings,
+        )
+    ctx.no_op = not outcome.changed
+    data = {
+        **outcome.pane.pane_object(_socket_path(ctx)),
+        "changed": outcome.changed,
+        "display_updated": outcome.display_updated,
+        "dry_run": dry_run,
+    }
+    return data, outcome
+
+
+def rename(args: argparse.Namespace, ctx: Context) -> Result:
+    """Set ``@termctl_name`` and recompute the displayed name, keeping a set marker; the
+    window is renamed only while termctl may (interface.md `rename`, "Names")."""
+
+    def plan(pane: ManagedPane) -> Change:
+        shown = display.displayed_name(args.name, pane.marker_text, ctx.config.marker_display)
+        return Change(options={"@termctl_name": args.name}, display_name=shown)
+
+    data, outcome = _apply_change(ctx, plan, dry_run=args.dry_run)
+    return Result(data, outcome.pane.display_name)
+
+
+def mark(args: argparse.Namespace, ctx: Context) -> Result:
+    """Set the marker, with its text from the current config, in one write with the
+    recomputed displayed name; a ``bell`` marker rings when something changed on a running
+    pane (interface.md "Markers", `mark`). ``load_config`` checked that it is defined."""
+    marker = ctx.config.markers[args.marker]
+
+    def plan(pane: ManagedPane) -> Change:
+        shown = display.displayed_name(pane.name, marker.text, ctx.config.marker_display)
+        options = {"@termctl_marker": args.marker, "@termctl_marker_text": marker.text}
+        return Change(options=options, display_name=shown)
+
+    data, outcome = _apply_change(ctx, plan, dry_run=args.dry_run)
+    if outcome.changed and marker.bell and not args.dry_run:
+        _ring_bell(ctx, outcome.pane)
+    return Result(data, outcome.pane.display_name)
+
+
+def _ring_bell(ctx: Context, pane: ManagedPane) -> None:
+    """The bell of a changed ``mark``; a failure is a warning only (interface.md "Markers")."""
+    if pane.dead:
+        return
+    try:
+        backend = connect(ctx)
+        warning = (
+            f"bell not written: no tmux server is running for managed pane {pane.id}"
+            if backend is None
+            else display.ring_bell(backend, ctx.gateway, pane)
+        )
+    except TermctlError as exc:
+        # The socket checks run again before connecting; the change is already made.
+        warning = f"bell not written: {exc.message}"
+    if warning is not None:
+        ctx.warn(warning)
+
+
+def unmark(args: argparse.Namespace, ctx: Context) -> Result:
+    """Clear the marker, whether or not config still defines it; the displayed name becomes
+    the name (interface.md `unmark`)."""
+
+    def plan(pane: ManagedPane) -> Change:
+        shown = display.displayed_name(pane.name, None, ctx.config.marker_display)
+        options = {"@termctl_marker": "", "@termctl_marker_text": ""}
+        return Change(options=options, display_name=shown)
+
+    data, outcome = _apply_change(ctx, plan, dry_run=args.dry_run)
+    return Result(data, outcome.pane.display_name)
+
+
+def label_change(args: argparse.Namespace, ctx: Context) -> Result:
+    """``label add`` and ``label remove``: the pane's labels are a set of pairs, so adding a
+    present pair or removing an absent one changes nothing; they are written in canonical
+    form (sorted by code point, unique, single spaces) and the window is never renamed
+    (interface.md `label add` / `label remove`, "Labels")."""
+    pairs = set(validate.parse_labels(args.pairs))
+    adding = args.command == "label add"
+
+    def plan(pane: ManagedPane) -> Change:
+        current = set(pane.labels)
+        labels = sorted(current | pairs if adding else current - pairs)
+        # The limit applies to the labels read under the lock, after id resolution, so the
+        # failure is logged; a removal never grows the set.
+        if len(labels) > validate.MAX_LABELS:
+            raise UsageError(
+                f"managed pane {pane.id} would carry {len(labels)} labels "
+                f"(at most {validate.MAX_LABELS})"
+            )
+        return Change(options={"@termctl_labels": " ".join(labels)}, display_name=None)
+
+    data, outcome = _apply_change(ctx, plan, dry_run=args.dry_run)
+    return Result(data, " ".join(outcome.pane.labels))
+
+
 def _close_stopped(args: argparse.Namespace, ctx: Context, stop: BaseException) -> None:
     """Log a ``close`` stopped by a signal (exit 128 plus its number). Its audit record, if
     any, was written once the output existed (``close_pane``); a run stopped before step 3
@@ -1453,83 +1532,6 @@ def _logged_close(args: argparse.Namespace, ctx: Context) -> Result:
             err = internal_error(exc)
             _close_failed(args, ctx, err)
             raise err from exc
-
-
-def _focus_opened(ctx: Context, backend: Backend, pane: ManagedPane) -> bool:
-    """Open order step 8: switch a client by the rules of `focus`, never attaching. Whether a
-    client was switched; a failure (no client, a tmux error) is a warning and leaves the open
-    in place (interface.md "Open order")."""
-    assert ctx.tmux is not None
-    try:
-        where = focus_cmd.caller(ctx.environ, _socket_path(ctx), ctx.gateway)
-        decision = focus_cmd.decide(
-            backend, pane, where, client=None, attach_ok=False, tmux_bin=ctx.tmux.path
-        )
-        assert decision.client is not None
-        focus_cmd.switch(backend, pane, decision.client, named=False)
-    except TermctlError as err:
-        ctx.warn(f"could not focus pane {pane.id}: {err.message}")
-        return False
-    return True
-
-
-def focus(args: argparse.Namespace, ctx: Context) -> Result:
-    """`focus` after id resolution: decide (steps 1 to 4), then switch the client or attach.
-    A real run records its success in ``ctx`` (and the argv to exec, when it attaches without
-    --json); ``_logged_focus`` writes every record and runs the exec."""
-    assert ctx.pane is not None and ctx.tmux is not None
-    pane, socket_path = ctx.pane, _socket_path(ctx)
-    backend = connect(ctx)
-    if backend is None:
-        raise TermctlError("not_found", f"managed pane {pane.id} is gone (no server running)")
-    attach_ok = (
-        args.client is None
-        and not args.no_attach
-        and ctx.gateway.stdin_isatty()
-        and ctx.gateway.stderr_isatty()
-    )
-    decision = focus_cmd.decide(
-        backend,
-        pane,
-        focus_cmd.caller(ctx.environ, socket_path, ctx.gateway),
-        client=args.client,
-        attach_ok=attach_ok,
-        tmux_bin=ctx.tmux.path,
-    )
-    ctx.focus_action = decision.action
-    data = focus_cmd.output(pane, decision, socket_path, dry_run=bool(args.dry_run))
-    if decision.argv is None:
-        assert decision.client is not None
-        if not args.dry_run:
-            focus_cmd.switch(backend, pane, decision.client, named=args.client is not None)
-            ctx.focus_ok = True
-        return Result(data, decision.client)
-    if args.dry_run:
-        return Result(data, shlex.join(decision.argv))
-    # An attach is logged before the exec (interface.md "Audit and log"); with --json the
-    # caller execs the argv itself, with its own environment, and termctl exits 0. Without
-    # --json ``_logged_focus`` execs it once the stop-signal handlers are restored.
-    ctx.focus_ok = True
-    if not ctx.out.json:
-        ctx.focus_exec = decision.argv
-    return Result(data, "")
-
-
-def _focus_attach(ctx: Context, argv: list[str]) -> NoReturn:
-    """Exec the attach argv (``focus`` step 2), after its log record and with the run's
-    stop-signal handlers gone, so the tmux client starts with the caller's dispositions."""
-    ctx.out.flush()
-    try:
-        # The caller's unfiltered environment: it is the user's own terminal, and -E keeps
-        # that environment out of the session.
-        ctx.gateway.exec_replace(argv, ctx.environ)
-    except (OSError, ValueError) as exc:
-        reason = exc.strerror if isinstance(exc, OSError) and exc.strerror else str(exc)
-        raise TermctlError(
-            "attach_failed",
-            f"cannot run {validate.show(argv[0], 200)}: {reason}",
-            details={"socket_path": _socket_path(ctx)},
-        ) from None
 
 
 def _focus_record(
@@ -1610,24 +1612,24 @@ COMMAND_STEPS = {
     "exists": exists,
     "list": list_panes,
     "open": open_pane,
+    "close": close_pane,
+    "focus": focus,
     "rename": rename,
     "mark": mark,
     "unmark": unmark,
     "label add": label_change,
     "label remove": label_change,
-    "close": close_pane,
-    "focus": focus,
 }
 
 
 def run_command(args: argparse.Namespace, ctx: Context) -> Result:
     """Step 5: the command's own steps."""
-    step = COMMAND_STEPS.get(args.command)
-    if step is not None:
-        return step(args, ctx)
     if args.command == "placements":
         labels = validate.parse_labels(args.labels) if args.labels else None
         return placement.report(ctx.config, labels)
+    step = COMMAND_STEPS.get(args.command)
+    if step is not None:
+        return step(args, ctx)
     raise TermctlError("internal", f"{PROG} {args.command} is not implemented yet")
 
 
@@ -1637,12 +1639,12 @@ def dispatch(args: argparse.Namespace, ctx: Context) -> Result:
     load_config(args, ctx)
     if args.command == "open" and not args.dry_run:
         return _logged_open(args, ctx)
-    if args.command in CHANGE_EVENTS and not args.dry_run:
-        return _logged_change(args, ctx)
     if args.command == "close" and not args.dry_run:
         return _logged_close(args, ctx)
     if args.command == "focus" and not args.dry_run:
         return _logged_focus(args, ctx)
+    if args.command in CHANGE_EVENTS and not args.dry_run:
+        return _logged_change(args, ctx)
     return _resolve_and_run(args, ctx)
 
 

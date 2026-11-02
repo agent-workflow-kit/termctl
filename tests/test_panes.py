@@ -616,3 +616,17 @@ def test_read_generates_a_fresh_sentinel_each_time(monkeypatch: pytest.MonkeyPat
     panes.read(tmux)
     panes.read(tmux)
     assert len(set(seen)) == 2
+
+
+@pytest.mark.parametrize(
+    ("raw", "expected"), [("", None), ("9", 9), ("kill", 9), ("term", 15), ("HUP", 1)]
+)
+def test_the_dead_signal_is_a_number_or_a_macos_signal_name(raw: str, expected: int | None) -> None:
+    # tmux prints sys_signame (lowercase) where the system has it, as on macOS.
+    assert panes._optional_signal({"pane_dead_signal": raw}, "pane_dead_signal") == expected
+
+
+@pytest.mark.parametrize("raw", ["nosuch", "9x", "-1", "kïll"])
+def test_an_unknown_dead_signal_ignores_the_pane(raw: str) -> None:
+    with pytest.raises(panes._Ignored):
+        panes._optional_signal({"pane_dead_signal": raw}, "pane_dead_signal")

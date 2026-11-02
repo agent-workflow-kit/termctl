@@ -30,12 +30,11 @@ import pytest
 from termctl.cli import main
 from termctl.gateway import SystemGateway
 
-from .conftest import TmuxServer, tmux_stored_name, wait_for
+from .conftest import NO_CONFIG, TmuxServer, tmux_stored_name, wait_for
 from .schemas import validate
 
 pytestmark = pytest.mark.tmux
 
-NO_CONFIG = str(Path(__file__).parent / "no-config")
 AGENT = "/tmp/termctl-test-agent.sock"
 
 

@@ -14,9 +14,8 @@ import sys
 
 import pytest
 
-from .conftest import TMUX_3_2, TmuxServer, wait_for
+from .conftest import NO_CONFIG, TMUX_PRINTS_RAW, TmuxServer, wait_for
 from .schemas import validate
-from .test_cli_read_integration import NO_CONFIG
 from .test_panes_integration import ID, new_window, tag
 from .test_rename_integration import log, managed, option, option_bytes, termctl, window_name
 
@@ -123,7 +122,9 @@ def test_a_marker_removed_from_config_stays_until_unmark(tmux_server: TmuxServer
     assert option(tmux_server, pane_id, "@termctl_marker") == ""
 
 
-@pytest.mark.skipif(TMUX_3_2, reason="tmux 3.3+ prints the byte escaped; 3.2: the next test")
+@pytest.mark.skipif(
+    TMUX_PRINTS_RAW, reason="tmux 3.2 and 3.6+ print the control byte raw instead of escaping it"
+)
 def test_a_forged_control_byte_in_the_marker_text_is_rewritten(tmux_server: TmuxServer) -> None:
     pane_id = managed(tmux_server)
     flags = config(tmux_server, "marker_display: option\nmarkers:\n  esc:\n    text: '\\033 '\n")
@@ -138,7 +139,9 @@ def test_a_forged_control_byte_in_the_marker_text_is_rewritten(tmux_server: Tmux
     assert again.json()["changed"] is False
 
 
-@pytest.mark.skipif(not TMUX_3_2, reason="tmux 3.2 prints the byte raw; 3.3+: the previous test")
+@pytest.mark.skipif(
+    not TMUX_PRINTS_RAW, reason="tmux 3.3 to 3.5 print the byte escaped: the previous test"
+)
 def test_a_forged_control_byte_in_the_marker_text_makes_the_pane_ignored_on_tmux_3_2(
     tmux_server: TmuxServer,
 ) -> None:

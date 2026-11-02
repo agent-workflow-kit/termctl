@@ -3,10 +3,10 @@ name: ci
 # Thin caller for agent-workflow-kit/awkit-ci, plus a `tmux` matrix that runs the real-tmux tests
 # on the tmux 3.2 floor and on the runner image's current tmux, and a `macos` job that runs the
 # whole suite on macOS.
-# Status checks: `ci / ci-ok` (required), `tmux (floor)`, `tmux (latest)` and `macos`. None of
-# them is part of `ci / ci-ok`; the tmux checks gate merges only once they are added as required
-# checks in branch protection (maintainer). `macos` is not required (macOS is best-effort, and the
-# manual checklist in docs/design.md remains) and does not gate the release.
+# Status checks: `ci / ci-ok` (required), `tmux (floor)` and `tmux (latest)` (required), and
+# `macos`. None of the tmux checks and not `macos` is part of `ci / ci-ok`. `macos` is not
+# required (macOS is best-effort, and the manual checklist in docs/design.md remains) and does
+# not gate the release.
 # Source: https://github.com/agent-workflow-kit/awkit-ci/tree/main/templates
 
 on:
