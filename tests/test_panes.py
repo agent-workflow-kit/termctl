@@ -28,6 +28,7 @@ TMUX_VALUES = {
     "pane_dead_signal": "",
     "pane_pid": "4242",
     "window_panes": "1",
+    "session_id": "$1",
     "session_name": "termctl",
     "window_name": "KEY-12",
 }
@@ -127,6 +128,8 @@ def test_parses_a_running_managed_pane() -> None:
         window_id="@2",
         session="termctl",
         sessions=("termctl",),
+        session_id="$1",
+        session_ids=("$1",),
         display_name="KEY-12",
         pane_pid=4242,
         window_panes=1,
@@ -343,6 +346,11 @@ def test_one_bad_pane_does_not_hide_the_others() -> None:
         ("window_panes", ""),
         ("window_panes", "0"),
         ("session_name", ""),
+        ("session_id", ""),
+        ("session_id", "1"),
+        ("session_id", "$"),
+        ("session_id", "$1 "),
+        ("session_id", "=$1"),
     ],
 )
 def test_malformed_tmux_fields_are_ignored_with_a_warning(field: str, value: str) -> None:
@@ -405,6 +413,21 @@ def test_rows_of_a_linked_window_are_merged() -> None:
     assert len(found) == 1
     assert found[0].session == "first"
     assert found[0].sessions == ("first", "second")
+
+
+def test_a_linked_window_keeps_its_session_ids_in_order() -> None:
+    stdout = (
+        row({"session_name": "first", "session_id": "$4"})
+        + row({"session_name": "second", "session_id": "$2"})
+        + row({"session_name": "first", "session_id": "$4"})
+    )
+    (pane,), _ = parse(stdout)
+    assert (pane.session_id, pane.session_ids) == ("$4", ("$4", "$2"))
+
+
+def test_a_renamed_session_keeps_its_id() -> None:
+    (pane,), _ = parse(row({"session_name": "my work", "session_id": "$7"}))
+    assert (pane.session, pane.session_id) == ("my work", "$7")
 
 
 def test_a_bad_pane_in_a_linked_window_warns_once() -> None:
