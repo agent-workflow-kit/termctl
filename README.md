@@ -38,7 +38,7 @@ termctl close "$id"           # refused (exit 20) while the command still runs
 tmux -L termctl-demo kill-server   # stop the demo server
 ```
 
-`close` refuses a pane whose command is still running; `close --force` is for a human (a terminal on stdin, or `--actor human:<user>`). Callers keep only the id (and `socket_path` from `--json`) and address every later command by it.
+`close` refuses a pane whose command is still running; `close --force` is for a human (a terminal on stdin, or `--actor human:<user>`, and never with an explicit `--actor auto:<name>`). Callers keep only the id (and `socket_path` from `--json`) and address every later command by it.
 
 ## Commands
 
@@ -113,7 +113,7 @@ termctl keeps no database: what it knows about a pane is stored on the pane itse
 - **Ids, not targets.** Callers address panes by the `tc-...` id; termctl never lists, renames, signals or closes a pane it did not open.
 - **Server and state checks.** The tmux socket path, state directory, log, audit file and lock files are checked for ownership and permissions before use.
 - **Filtered environment.** tmux gets an allow-listed environment (`server_env_allow`), so credentials in your shell are not added to a server termctl starts.
-- **Human gates.** `close --force` and `--override-escalation` need a terminal or `--actor human:<user>`; a pre-hook veto always holds.
+- **Human gates.** `close --force` and `--override-escalation` need a terminal or `--actor human:<user>`, and never pass with an explicit `--actor auto:<name>`; a pre-hook veto always holds.
 - **Audit.** Mutating runs are logged; every `close --force` that saw a running pane and every `--override-escalation` run are also audited, whatever the outcome, once the id is generated (`open`) or resolved (`close`) ([Audit and log](docs/interface.md#audit-and-log)).
 
 Residual risks are real and documented, not hidden. The main ones: anyone who can reach the tmux socket has full control of the server (so the displayed name is untrusted), the human gates are advisory against a hostile caller, `--env` values are briefly visible in process listings (not safe for secrets), and `close --force` signals only the recorded process: children that ignore SIGHUP or left its process group survive, and on macOS (no pidfd) a reused PID can be signaled in a narrow race. The complete list is [Residual risks](docs/interface.md#residual-risks).
