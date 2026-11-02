@@ -417,7 +417,9 @@ def test_agent_spawn_flow(caller: Caller) -> None:
     (work / "finish").touch()
 
     def dead() -> bool:
-        return caller.ok(*sock("show", agent_id), schema="show")["state"] == "dead"
+        shown = caller.ok(*sock("show", agent_id), schema="show")
+        # tmux 3.2 reports the exit status a moment after the pane is dead.
+        return shown["state"] == "dead" and shown["exit_status"] == 3
 
     assert wait_for(dead, timeout=15)
     final = caller.ok(*sock("show", agent_id), schema="show")
