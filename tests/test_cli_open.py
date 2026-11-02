@@ -126,6 +126,14 @@ def test_tmux_missing_comes_before_the_command_check() -> None:
     assert gateway.executable_checks == [TMUX]
 
 
+def test_tmux_missing_comes_before_not_supported() -> None:
+    # Open order step 2: tmux_bin is resolved before the placement, so an unsupported
+    # placement (--target pane) with no tmux reports tmux_missing (12), not not_supported (2).
+    gateway = FakeGateway(executables=set())
+    error(run(["--target", "pane"], gateway), "tmux_missing", 12)
+    assert gateway.executable_checks == [TMUX]
+
+
 # --- step 2: the size check ---------------------------------------------------------------------
 
 
