@@ -20,8 +20,10 @@ from termctl.cli import main
 
 from .conftest import (
     NO_CONFIG,
+    STRICT_NAMES_REASON,
     TMUX_3_2,
     TMUX_PRINTS_RAW,
+    TMUX_STRICT_NAMES,
     TmuxServer,
     wait_for,
 )
@@ -135,6 +137,7 @@ def test_a_forged_but_valid_option_is_reported_as_read(tmux_server: TmuxServer) 
     assert (obj["name"], obj["labels"]) == ("trusted-by-nobody", ["a=b"])
 
 
+@pytest.mark.skipif(TMUX_STRICT_NAMES, reason=STRICT_NAMES_REASON)
 def test_tmux_text_is_escaped_in_human_output(tmux_server: TmuxServer) -> None:
     pane_id = started(tmux_server)
     assert tmux_server.raw("rename-window", "-t", pane_id, "w\x1b[2J\x07\u009b").returncode == 0

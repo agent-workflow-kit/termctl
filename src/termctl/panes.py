@@ -28,6 +28,7 @@ from __future__ import annotations
 
 import re
 import secrets
+import signal
 from collections.abc import Callable, Iterable, Sequence
 from dataclasses import dataclass
 from datetime import datetime
@@ -255,7 +256,7 @@ def _managed_pane(pane_id: str, pane_rows: list[list[str]]) -> ManagedPane:
         raise _Ignored(f"unknown @termctl_v {show(first['@termctl_v'])}")
     dead = _choice(first, "pane_dead", ("0", "1")) == "1"
     exit_status = _optional_int(first, "pane_dead_status", _COUNT)
-    exit_signal = _optional_int(first, "pane_dead_signal", _COUNT)
+    exit_signal = _optional_signal(first, "pane_dead_signal")
     if exit_status is not None and exit_signal is not None:
         raise _Ignored("tmux reports both an exit status and an exit signal")
     marker = _marker(first)
@@ -329,6 +330,23 @@ def _optional(values: dict[str, str], field: str, pattern: re.Pattern[str]) -> s
 def _optional_int(values: dict[str, str], field: str, pattern: re.Pattern[str]) -> int | None:
     value = _optional(values, field, pattern)
     return None if value is None else int(value)
+
+
+_SIGNAL_NAME = re.compile(r"[A-Za-z0-9]{1,10}")
+
+
+def _optional_signal(values: dict[str, str], field: str) -> int | None:
+    """``#{pane_dead_signal}``: tmux prints the signal number, except on a system with
+    ``sys_signame`` (macOS), where it prints the lowercase name (``kill`` for 9)."""
+    raw = values[field]
+    if not raw:
+        return None
+    if _COUNT.fullmatch(raw):
+        return int(raw)
+    named = _SIGNAL_NAME.fullmatch(raw) and signal.Signals.__members__.get("SIG" + raw.upper())
+    if not named:
+        raise _invalid(values, field)
+    return int(named)
 
 
 def _choice(values: dict[str, str], field: str, choices: Sequence[str]) -> str:

@@ -865,7 +865,7 @@ def test_drop_ins_apply_in_code_point_order(home: Path, main_file: Path, dropins
     write(main_file, {"tmux_bin": "main"})
     write(dropins / "2.yaml", {"tmux_bin": "two"})
     write(dropins / "10.yaml", {"tmux_bin": "ten", "keep_on_exit": "always"})
-    write(dropins / "b.yaml", {"marker_display": "name"})
+    write(dropins / "a.yaml", {"marker_display": "name"})
     write(dropins / "B.yaml", {"marker_display": "option", "close_grace": "5s"})
     cfg = load_home(home)
     assert (cfg.tmux_bin, cfg.keep_on_exit) == ("two", "always")

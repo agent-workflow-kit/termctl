@@ -507,7 +507,12 @@ def test_a_write_cut_short_damages_only_its_own_line(
     )
     assert child.returncode == 3, child.stderr
     assert str(log) in child.stdout
-    assert log.stat().st_size == size + 100  # one write, cut short; no second write
+    written = log.stat().st_size - size
+    if sys.platform == "darwin":
+        # macOS cuts the write at the limit, not at the remaining room: 0 < written < the record.
+        assert 0 < written < 10000
+    else:
+        assert written == 100  # one write, cut short; no second write
     last = open_record(result="error", exit_code=12)
     jsonlog.append_log(environ, last)
     raw = log.read_bytes().split(b"\n")
