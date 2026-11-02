@@ -69,8 +69,12 @@ def refuse_running(pane: ManagedPane) -> TermctlError:
 
 def row_mismatch(pane: ManagedPane) -> bool:
     """A recorded PID that does not equal ``#{pane_pid}`` in the same ``list-panes`` row: it
-    never counts (interface.md "Liveness"). No recorded PID is no mismatch."""
-    return pane.pid is not None and pane.pid != pane.pane_pid
+    never counts (interface.md "Liveness"). No recorded PID is no mismatch, and neither is a dead
+    pane without a ``#{pane_pid}``: tmux 3.8 prints none once the pane's process has exited
+    (earlier versions keep the old PID), and a dead pane has nothing to signal."""
+    if pane.pid is None or (pane.dead and pane.pane_pid is None):
+        return False
+    return pane.pid != pane.pane_pid
 
 
 @dataclass(frozen=True)
