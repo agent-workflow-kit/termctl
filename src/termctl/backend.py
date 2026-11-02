@@ -15,9 +15,9 @@ implements it:
   options and window name (``pane_change.py``); ``rename``, ``mark``, ``unmark`` and the label
   commands use them.
 - ``pane_tty``: the terminal a ``bell`` marker writes BEL to (``display.ring_bell``).
-- ``query_process`` and ``kill_pane``: ``close`` (``close_cmd``).
 - ``list_clients``, ``session_has_pane`` and ``switch_client``: ``focus`` and ``open --focus``
   (``focus_cmd``); its attach is an exec, not a backend call (``gateway.exec_replace``).
+- ``query_process`` and ``kill_pane``: ``close`` (``close_cmd``).
 """
 
 from __future__ import annotations
@@ -147,10 +147,20 @@ class Backend(Protocol):
         a mismatch can only turn a no-op into a guarded rewrite."""
         ...
 
-    def pane_tty(self, pane: ManagedPane) -> str | None:
-        """The terminal device path of ``pane`` while it is still the managed pane resolved
-        and running (read-only), or None otherwise or when it cannot be read. Any path is
-        reported; ``display.ring_bell`` writes only to a pseudo-terminal."""
+    def list_clients(self, termctl_id: str) -> tuple[tb.ClientInfo, ...]:
+        """Every client attached to a session that termctl can name (``parse_clients``).
+        Failures are those of an operation on ``termctl_id`` (``tmux_failure``)."""
+        ...
+
+    def session_has_pane(self, session_id: str, pane_id: str, termctl_id: str) -> bool:
+        """Whether pane ``pane_id`` (the caller's ``$TMUX_PANE``) exists and its window is in
+        session ``session_id`` (``tmux_backend.pane_sessions``). Failures as for
+        ``list_clients``."""
+        ...
+
+    def switch_client(self, client: str, pane_id: str, termctl_id: str) -> None:
+        """``switch-client -E -c client -t pane_id``. A client that is not attached exits 10
+        (``client_not_found``); other failures as for ``list_clients``."""
         ...
 
     def query_process(
@@ -169,20 +179,10 @@ class Backend(Protocol):
         does. Raises only when tmux cannot be run."""
         ...
 
-    def list_clients(self, termctl_id: str) -> tuple[tb.ClientInfo, ...]:
-        """Every client attached to a session that termctl can name (``parse_clients``).
-        Failures are those of an operation on ``termctl_id`` (``tmux_failure``)."""
-        ...
-
-    def session_has_pane(self, session_id: str, pane_id: str, termctl_id: str) -> bool:
-        """Whether pane ``pane_id`` (the caller's ``$TMUX_PANE``) exists and its window is in
-        session ``session_id`` (``tmux_backend.pane_sessions``). Failures as for
-        ``list_clients``."""
-        ...
-
-    def switch_client(self, client: str, pane_id: str, termctl_id: str) -> None:
-        """``switch-client -E -c client -t pane_id``. A client that is not attached exits 10
-        (``client_not_found``); other failures as for ``list_clients``."""
+    def pane_tty(self, pane: ManagedPane) -> str | None:
+        """The terminal device path of ``pane`` while it is still the managed pane resolved
+        and running (read-only), or None otherwise or when it cannot be read. Any path is
+        reported; ``display.ring_bell`` writes only to a pseudo-terminal."""
         ...
 
 
@@ -275,6 +275,30 @@ class TmuxBackend:
             return tb.GuardOutcome.FAILED
         return tb.guard_outcome(result)
 
+    def list_clients(self, termctl_id: str) -> tuple[tb.ClientInfo, ...]:
+        result = self.tmux.run(tb.list_clients())
+        if result.returncode != 0:
+            raise tb.tmux_failure(result, termctl_id, self.socket_path)
+        return tb.parse_clients(result.stdout)
+
+    def session_has_pane(self, session_id: str, pane_id: str, termctl_id: str) -> bool:
+        result = self.tmux.run(tb.pane_sessions())
+        if result.returncode != 0:
+            raise tb.tmux_failure(result, termctl_id, self.socket_path)
+        return tb.has_pane_in_session(result.stdout, pane_id, session_id)
+
+    def switch_client(self, client: str, pane_id: str, termctl_id: str) -> None:
+        result = self.tmux.run(tb.switch_client(client, pane_id))
+        if result.returncode == 0:
+            return
+        if tb.is_client_missing(result, client):
+            raise TermctlError(
+                "client_not_found",
+                f"client {client} is not attached to the server",
+                details={"socket_path": self.socket_path},
+            )
+        raise tb.tmux_failure(result, termctl_id, self.socket_path)
+
     def query_process(
         self, pane_id: str, termctl_id: str
     ) -> tuple[tb.GuardOutcome, subprocess.CompletedProcess[str], tb.ProcessQuery | None]:
@@ -300,30 +324,6 @@ class TmuxBackend:
             tb.parse_process_query(result.stdout) if outcome is tb.GuardOutcome.MATCHED else None
         )
         return outcome, result, answer
-
-    def list_clients(self, termctl_id: str) -> tuple[tb.ClientInfo, ...]:
-        result = self.tmux.run(tb.list_clients())
-        if result.returncode != 0:
-            raise tb.tmux_failure(result, termctl_id, self.socket_path)
-        return tb.parse_clients(result.stdout)
-
-    def session_has_pane(self, session_id: str, pane_id: str, termctl_id: str) -> bool:
-        result = self.tmux.run(tb.pane_sessions())
-        if result.returncode != 0:
-            raise tb.tmux_failure(result, termctl_id, self.socket_path)
-        return tb.has_pane_in_session(result.stdout, pane_id, session_id)
-
-    def switch_client(self, client: str, pane_id: str, termctl_id: str) -> None:
-        result = self.tmux.run(tb.switch_client(client, pane_id))
-        if result.returncode == 0:
-            return
-        if tb.is_client_missing(result, client):
-            raise TermctlError(
-                "client_not_found",
-                f"client {client} is not attached to the server",
-                details={"socket_path": self.socket_path},
-            )
-        raise tb.tmux_failure(result, termctl_id, self.socket_path)
 
     def _created(self, result: subprocess.CompletedProcess[str]) -> Created:
         """The ids a successful creation printed. A failed chain is never taken as created,

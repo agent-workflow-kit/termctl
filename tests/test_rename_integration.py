@@ -20,9 +20,14 @@ import pytest
 from termctl.cli import main
 from termctl.gateway import SystemGateway
 
-from .conftest import TMUX_3_2, TmuxServer, tmux_stored_name, wait_for
+from .conftest import (
+    NO_CONFIG,
+    TMUX_PRINTS_RAW,
+    TmuxServer,
+    tmux_stored_name,
+    wait_for,
+)
 from .schemas import validate
-from .test_cli_read_integration import NO_CONFIG
 from .test_panes_integration import ID, OTHER_ID, new_window, tag, window_of
 from .test_tmux_integration import NAMES
 
@@ -297,7 +302,9 @@ def test_a_window_split_mid_command_gets_the_option_only(tmux_server: TmuxServer
 # --- forged control bytes -----------------------------------------------------------------------
 
 
-@pytest.mark.skipif(TMUX_3_2, reason="tmux 3.3+ prints the byte escaped; 3.2: the next test")
+@pytest.mark.skipif(
+    TMUX_PRINTS_RAW, reason="tmux 3.3 to 3.5 print the byte escaped; 3.2 and 3.6+: the next test"
+)
 def test_a_forged_control_byte_is_replaced_not_taken_for_the_name(tmux_server: TmuxServer) -> None:
     pane_id = managed(tmux_server)
     # Someone with socket access stores "n" ESC "x"; tmux prints it as the text n\033x.
@@ -313,10 +320,14 @@ def test_a_forged_control_byte_is_replaced_not_taken_for_the_name(tmux_server: T
     assert termctl(tmux_server, "--json", "rename", ID, "n\\033x").json()["changed"] is False
 
 
-@pytest.mark.skipif(not TMUX_3_2, reason="tmux 3.2 prints the byte raw; 3.3+: the previous test")
-def test_a_forged_control_byte_makes_the_pane_ignored_on_tmux_3_2(tmux_server: TmuxServer) -> None:
-    # tmux 3.2 prints a raw ESC in an option as it is, so the name breaks the grammar and the
-    # pane is ignored with a warning (interface.md "Residual risks", forged control bytes).
+@pytest.mark.skipif(
+    not TMUX_PRINTS_RAW, reason="tmux 3.2 and 3.6+ print the byte raw; 3.3-3.5: the previous test"
+)
+def test_a_forged_control_byte_makes_the_pane_ignored_when_tmux_prints_it_raw(
+    tmux_server: TmuxServer,
+) -> None:
+    # tmux 3.2 and 3.6+ print a raw ESC in an option as it is, so the name breaks the grammar
+    # and the pane is ignored with a warning (interface.md "Residual risks", forged control bytes).
     pane_id = managed(tmux_server)
     tmux_server.raw("set", "-p", "-t", pane_id, "@termctl_name", "n\x1bx")
     assert option(tmux_server, pane_id) == "n\x1bx"
@@ -333,7 +344,7 @@ def test_a_forged_control_byte_in_the_window_name_is_replaced(tmux_server: TmuxS
     pane_id = new_window(tmux_server, "-n", "n\x1bx")
     tag(tmux_server, pane_id, **{"@termctl_name": "n\\033x"})
     tmux_server.raw("new-session", "-d", "-s", "keep", "--", "/usr/bin/env", "--", "sleep", "600")
-    assert window_name(tmux_server, pane_id) == ("n\x1bx" if TMUX_3_2 else "n\\033x")
+    assert window_name(tmux_server, pane_id) == ("n\x1bx" if TMUX_PRINTS_RAW else "n\\033x")
     assert option_bytes(tmux_server, pane_id, "window_name") == 3
     result = termctl(tmux_server, "--json", "rename", ID, "n\\033x")
     assert (result.code, result.json()["changed"]) == (0, True)
@@ -361,10 +372,11 @@ def test_raw_bytes_never_reach_human_output(tmux_server: TmuxServer) -> None:
     pane_id = managed(tmux_server)
     tmux_server.raw("set", "-p", "-t", pane_id, "@termctl_name", "n\x1bx")
     result = termctl(tmux_server, "rename", ID, "plain")
-    # tmux 3.2 prints the ESC raw: the pane is ignored, and the warning shows the byte escaped.
-    assert result.code == (10 if TMUX_3_2 else 0)
+    # tmux 3.2 and 3.6+ print the ESC raw: the pane is ignored, and the warning shows the byte
+    # escaped.
+    assert result.code == (10 if TMUX_PRINTS_RAW else 0)
     assert "\x1b" not in result.stdout + result.stderr
-    if TMUX_3_2:
+    if TMUX_PRINTS_RAW:
         assert "'n\\x1bx'" in result.stderr
 
 

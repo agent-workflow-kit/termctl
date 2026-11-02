@@ -37,27 +37,6 @@ from .hookwatch import kill_unreaped
 # How long connecting to a Unix socket may block (a listener with a full backlog).
 SOCKET_TIMEOUT = 10.0
 
-
-class BoundedOutput(NamedTuple):
-    """The result of ``Gateway.run_bounded``: at most ``limit`` bytes of each stream, and
-    whether either stream had more. When output was truncated the child is killed if still
-    running, so ``returncode`` is either its own exit status or the negative kill signal;
-    callers must not rely on it when ``truncated`` is true."""
-
-    returncode: int
-    stdout: bytes
-    stderr: bytes
-    truncated: bool
-
-
-@dataclass(frozen=True)
-class FileInfo:
-    """What termctl reads from ``lstat``: the file type and permission bits, and the owner."""
-
-    mode: int
-    uid: int
-
-
 _CHUNK = 65536
 # How long run_group keeps reading after the program exited while something it left behind
 # holds its output open (interface.md "Hooks").
@@ -111,6 +90,26 @@ class GroupRun(NamedTuple):
         return self.returncode is None
 
 
+@dataclass(frozen=True)
+class FileInfo:
+    """What termctl reads from ``lstat``: the file type and permission bits, and the owner."""
+
+    mode: int
+    uid: int
+
+
+class BoundedOutput(NamedTuple):
+    """The result of ``Gateway.run_bounded``: at most ``limit`` bytes of each stream, and
+    whether either stream had more. When output was truncated the child is killed if still
+    running, so ``returncode`` is either its own exit status or the negative kill signal;
+    callers must not rely on it when ``truncated`` is true."""
+
+    returncode: int
+    stdout: bytes
+    stderr: bytes
+    truncated: bool
+
+
 class ProcessHandle(Protocol):
     """A handle on one process, from ``Gateway.open_process``: on Linux a pidfd, which keeps
     naming that process even if it exits and its PID is reused; on macOS only the PID, so the
@@ -142,22 +141,6 @@ class Gateway(Protocol):
         timeout: float | None = None,
         env: Mapping[str, str] | None = None,
     ) -> subprocess.CompletedProcess[str]: ...
-
-    def run_bounded(
-        self,
-        argv: list[str],
-        *,
-        env: Mapping[str, str],
-        timeout: float,
-        limit: int,
-    ) -> BoundedOutput:
-        """Run ``argv`` with no stdin and keep at most ``limit`` bytes of stdout and of stderr.
-
-        Output beyond ``limit`` kills the program and sets ``truncated``. Raises
-        ``subprocess.TimeoutExpired`` (after killing it) if it has not finished, and closed
-        both streams, within ``timeout`` seconds, and ``OSError`` if it cannot be started.
-        """
-        ...
 
     def run_group(
         self,
@@ -212,6 +195,22 @@ class Gateway(Protocol):
         Raises ``OSError`` or ``ValueError`` if the watchdog cannot be started."""
         ...
 
+    def run_bounded(
+        self,
+        argv: list[str],
+        *,
+        env: Mapping[str, str],
+        timeout: float,
+        limit: int,
+    ) -> BoundedOutput:
+        """Run ``argv`` with no stdin and keep at most ``limit`` bytes of stdout and of stderr.
+
+        Output beyond ``limit`` kills the program and sets ``truncated``. Raises
+        ``subprocess.TimeoutExpired`` (after killing it) if it has not finished, and closed
+        both streams, within ``timeout`` seconds, and ``OSError`` if it cannot be started.
+        """
+        ...
+
     def current_dir(self) -> str:
         """The caller's current directory; raises ``OSError`` if it cannot be read."""
         ...
@@ -222,27 +221,6 @@ class Gateway(Protocol):
 
     def is_executable_file(self, path: str) -> bool:
         """Whether ``path`` is a regular file (symlinks followed) the real uid may execute."""
-        ...
-
-    def stdin_isatty(self) -> bool:
-        """Whether stdin (fd 0) is a terminal."""
-        ...
-
-    def stderr_isatty(self) -> bool:
-        """Whether stderr (fd 2) is a terminal."""
-        ...
-
-    def exec_replace(self, argv: list[str], env: Mapping[str, str]) -> NoReturn:
-        """Replace termctl with ``argv`` (an absolute path first) run with exactly ``env``,
-        keeping termctl's terminal, process group and descriptors: the one interactive path,
-        for ``focus``'s attach (interface.md `focus` step 2), which needs the caller's terminal
-        and so never goes through ``run``. SIGPIPE and SIGXFSZ, which Python ignores, are reset
-        to their defaults first, as ``subprocess`` does for a child. Returns only by raising
-        ``OSError`` (or ``ValueError``) when the exec fails."""
-        ...
-
-    def user_name(self) -> str | None:
-        """The real uid's user name from the password database, or None if it has none."""
         ...
 
     def real_uid(self) -> int:
@@ -289,6 +267,27 @@ class Gateway(Protocol):
         final symlink) and written only if it is a character device, with SIGTTOU blocked so a
         write to termctl's own terminal from a background group never stops it. Raises
         ``OSError`` for anything else, a write that would block or a short write."""
+        ...
+
+    def stdin_isatty(self) -> bool:
+        """Whether stdin (fd 0) is a terminal."""
+        ...
+
+    def stderr_isatty(self) -> bool:
+        """Whether stderr (fd 2) is a terminal."""
+        ...
+
+    def exec_replace(self, argv: list[str], env: Mapping[str, str]) -> NoReturn:
+        """Replace termctl with ``argv`` (an absolute path first) run with exactly ``env``,
+        keeping termctl's terminal, process group and descriptors: the one interactive path,
+        for ``focus``'s attach (interface.md `focus` step 2), which needs the caller's terminal
+        and so never goes through ``run``. SIGPIPE and SIGXFSZ, which Python ignores, are reset
+        to their defaults first, as ``subprocess`` does for a child. Returns only by raising
+        ``OSError`` (or ``ValueError``) when the exec fails."""
+        ...
+
+    def user_name(self) -> str | None:
+        """The real uid's user name from the password database, or None if it has none."""
         ...
 
     def open_process(self, pid: int) -> ProcessHandle | None:
@@ -373,40 +372,6 @@ class SystemGateway:
             completed.stderr.decode("utf-8", "surrogateescape"),
         )
 
-    def run_bounded(
-        self,
-        argv: list[str],
-        *,
-        env: Mapping[str, str],
-        timeout: float,
-        limit: int,
-    ) -> BoundedOutput:
-        deadline = time.monotonic() + timeout
-        proc = subprocess.Popen(
-            argv,
-            stdin=subprocess.DEVNULL,
-            stdout=subprocess.PIPE,
-            stderr=subprocess.PIPE,
-            env=dict(env),
-        )
-        try:
-            stdout, stderr, truncated = _read_bounded(proc, deadline, limit)
-            if truncated:
-                _kill(proc)
-            else:
-                proc.wait(timeout=max(deadline - time.monotonic(), 0))
-        except subprocess.TimeoutExpired:
-            _kill(proc)
-            raise subprocess.TimeoutExpired(argv, timeout) from None
-        except BaseException:
-            _kill(proc)
-            raise
-        finally:
-            for stream in (proc.stdout, proc.stderr):
-                if stream is not None:
-                    stream.close()
-        return BoundedOutput(proc.returncode, stdout, stderr, truncated)
-
     def run_group(
         self,
         argv: list[str],
@@ -473,6 +438,40 @@ class SystemGateway:
             _release_with_pgid(stops, None if record is not None else proc.pid)
             return proc.pid
 
+    def run_bounded(
+        self,
+        argv: list[str],
+        *,
+        env: Mapping[str, str],
+        timeout: float,
+        limit: int,
+    ) -> BoundedOutput:
+        deadline = time.monotonic() + timeout
+        proc = subprocess.Popen(
+            argv,
+            stdin=subprocess.DEVNULL,
+            stdout=subprocess.PIPE,
+            stderr=subprocess.PIPE,
+            env=dict(env),
+        )
+        try:
+            stdout, stderr, truncated = _read_bounded(proc, deadline, limit)
+            if truncated:
+                _kill(proc)
+            else:
+                proc.wait(timeout=max(deadline - time.monotonic(), 0))
+        except subprocess.TimeoutExpired:
+            _kill(proc)
+            raise subprocess.TimeoutExpired(argv, timeout) from None
+        except BaseException:
+            _kill(proc)
+            raise
+        finally:
+            for stream in (proc.stdout, proc.stderr):
+                if stream is not None:
+                    stream.close()
+        return BoundedOutput(proc.returncode, stdout, stderr, truncated)
+
     def current_dir(self) -> str:
         return os.getcwd()
 
@@ -484,31 +483,6 @@ class SystemGateway:
             return os.path.isfile(path) and os.access(path, os.X_OK)
         except ValueError:  # an embedded NUL
             return False
-
-    def stdin_isatty(self) -> bool:
-        return os.isatty(0)
-
-    def stderr_isatty(self) -> bool:
-        return os.isatty(2)
-
-    def exec_replace(self, argv: list[str], env: Mapping[str, str]) -> NoReturn:
-        if not argv or not os.path.isabs(argv[0]):
-            raise ValueError(f"exec needs an absolute program path: {argv!r}")
-        restored = _restore_exec_signals()
-        try:
-            os.execve(argv[0], argv, dict(env))
-        except BaseException:
-            # The exec failed: termctl goes on, with the handlers it had.
-            for signum, handler in restored:
-                signal.signal(signum, handler)
-            raise
-
-    def user_name(self) -> str | None:
-        # The password database, not $USER or $LOGNAME, which the caller's environment can set.
-        try:
-            return pwd.getpwuid(os.getuid()).pw_name
-        except KeyError:
-            return None
 
     def real_uid(self) -> int:
         return os.getuid()
@@ -561,6 +535,31 @@ class SystemGateway:
                 os.close(fd)
         finally:
             signal.pthread_sigmask(signal.SIG_SETMASK, previous)
+
+    def stdin_isatty(self) -> bool:
+        return os.isatty(0)
+
+    def stderr_isatty(self) -> bool:
+        return os.isatty(2)
+
+    def exec_replace(self, argv: list[str], env: Mapping[str, str]) -> NoReturn:
+        if not argv or not os.path.isabs(argv[0]):
+            raise ValueError(f"exec needs an absolute program path: {argv!r}")
+        restored = _restore_exec_signals()
+        try:
+            os.execve(argv[0], argv, dict(env))
+        except BaseException:
+            # The exec failed: termctl goes on, with the handlers it had.
+            for signum, handler in restored:
+                signal.signal(signum, handler)
+            raise
+
+    def user_name(self) -> str | None:
+        # The password database, not $USER or $LOGNAME, which the caller's environment can set.
+        try:
+            return pwd.getpwuid(os.getuid()).pw_name
+        except KeyError:
+            return None
 
     def open_process(self, pid: int) -> ProcessHandle | None:
         if sys.platform == "darwin":  # pragma: no cover - macOS only
@@ -697,54 +696,6 @@ class _PidHandle:  # pragma: no cover - macOS only
 
     def close(self) -> None:
         pass
-
-
-def _restore_exec_signals() -> list[tuple[int, Any]]:
-    """Reset the signals Python ignores (SIGPIPE, SIGXFSZ) to their defaults before an exec,
-    which would otherwise keep them ignored; returns the handlers replaced."""
-    replaced: list[tuple[int, Any]] = []
-    for name in ("SIGPIPE", "SIGXFSZ"):
-        signum = getattr(signal, name, None)
-        if signum is not None:
-            replaced.append((signum, signal.signal(signum, signal.SIG_DFL)))
-    return replaced
-
-
-def _kill(proc: subprocess.Popen[bytes]) -> None:
-    """Kill and reap the one child ``run_bounded`` started (never anything else)."""
-    if proc.poll() is None:
-        proc.kill()
-    proc.wait()
-
-
-def _read_bounded(
-    proc: subprocess.Popen[bytes], deadline: float, limit: int
-) -> tuple[bytes, bytes, bool]:
-    """Read ``proc``'s stdout and stderr until both close, keeping at most ``limit`` bytes of
-    each. Stops early, with ``truncated`` set, once either has more than ``limit`` bytes;
-    raises ``subprocess.TimeoutExpired`` at ``deadline``."""
-    assert proc.stdout is not None and proc.stderr is not None
-    buffers = {proc.stdout.fileno(): bytearray(), proc.stderr.fileno(): bytearray()}
-    with selectors.DefaultSelector() as selector:
-        for fd in buffers:
-            selector.register(fd, selectors.EVENT_READ)
-        while selector.get_map():
-            remaining = deadline - time.monotonic()
-            if remaining <= 0:
-                raise subprocess.TimeoutExpired(proc.args, 0)
-            for key, _ in selector.select(remaining):
-                buffer = buffers[key.fd]
-                # One byte past the limit is enough to know the limit was exceeded.
-                chunk = os.read(key.fd, limit + 1 - len(buffer))
-                if not chunk:
-                    selector.unregister(key.fd)
-                    continue
-                buffer += chunk
-                if len(buffer) > limit:
-                    out, err = (bytes(b[:limit]) for b in buffers.values())
-                    return out, err, True
-    out, err = (bytes(b) for b in buffers.values())
-    return out, err, False
 
 
 class _Capture:
@@ -1159,6 +1110,54 @@ def _stop(proc: subprocess.Popen[bytes]) -> None:
         proc.wait(timeout=STOP_WAIT_S)
     except subprocess.TimeoutExpired:
         raise GroupNotStopped(proc.pid) from None
+
+
+def _restore_exec_signals() -> list[tuple[int, Any]]:
+    """Reset the signals Python ignores (SIGPIPE, SIGXFSZ) to their defaults before an exec,
+    which would otherwise keep them ignored; returns the handlers replaced."""
+    replaced: list[tuple[int, Any]] = []
+    for name in ("SIGPIPE", "SIGXFSZ"):
+        signum = getattr(signal, name, None)
+        if signum is not None:
+            replaced.append((signum, signal.signal(signum, signal.SIG_DFL)))
+    return replaced
+
+
+def _kill(proc: subprocess.Popen[bytes]) -> None:
+    """Kill and reap the one child ``run_bounded`` started (never anything else)."""
+    if proc.poll() is None:
+        proc.kill()
+    proc.wait()
+
+
+def _read_bounded(
+    proc: subprocess.Popen[bytes], deadline: float, limit: int
+) -> tuple[bytes, bytes, bool]:
+    """Read ``proc``'s stdout and stderr until both close, keeping at most ``limit`` bytes of
+    each. Stops early, with ``truncated`` set, once either has more than ``limit`` bytes;
+    raises ``subprocess.TimeoutExpired`` at ``deadline``."""
+    assert proc.stdout is not None and proc.stderr is not None
+    buffers = {proc.stdout.fileno(): bytearray(), proc.stderr.fileno(): bytearray()}
+    with selectors.DefaultSelector() as selector:
+        for fd in buffers:
+            selector.register(fd, selectors.EVENT_READ)
+        while selector.get_map():
+            remaining = deadline - time.monotonic()
+            if remaining <= 0:
+                raise subprocess.TimeoutExpired(proc.args, 0)
+            for key, _ in selector.select(remaining):
+                buffer = buffers[key.fd]
+                # One byte past the limit is enough to know the limit was exceeded.
+                chunk = os.read(key.fd, limit + 1 - len(buffer))
+                if not chunk:
+                    selector.unregister(key.fd)
+                    continue
+                buffer += chunk
+                if len(buffer) > limit:
+                    out, err = (bytes(b[:limit]) for b in buffers.values())
+                    return out, err, True
+    out, err = (bytes(b) for b in buffers.values())
+    return out, err, False
 
 
 class SystemClock:

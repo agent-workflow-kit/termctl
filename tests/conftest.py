@@ -12,6 +12,7 @@ skip otherwise.
 
 from __future__ import annotations
 
+import atexit
 import os
 import pwd
 import re
@@ -56,6 +57,16 @@ def tmux_stored_name(name: str) -> str:
     ``termctl.display`` so the integration tests check that model against tmux."""
     stored = name.replace("\\", "\\\\")
     return re.sub(r"\$(?=[A-Za-z_{])", r"\\$", stored) if TMUX_3_2 else stored
+
+
+# tmux 3.3 to 3.5 escape control characters and bad UTF-8 in printed output; 3.2 and 3.6+ print
+# them raw.
+TMUX_PRINTS_RAW = TMUX_VERSION is not None and (TMUX_VERSION < (3, 3) or TMUX_VERSION >= (3, 6))
+
+# An empty config home for the CLI tests that start tmux. It is outside the checkout: the tmux
+# home guard refuses a config home under a real home, as the checkout is on CI runners.
+NO_CONFIG = tempfile.mkdtemp(prefix="tc-no-config-")
+atexit.register(shutil.rmtree, NO_CONFIG, ignore_errors=True)
 
 
 # --- the guard against tmux reading the real user's config (review round 1, R1-11) -------------
