@@ -49,8 +49,8 @@
         },
         {
           "type": "string",
-          "pattern": "^=[\\s\\S]+:@[0-9]+\\.%[0-9]+$",
-          "description": "=<session>:<window_id>.<pane_id>; the session may contain any characters."
+          "pattern": "^=\\$[0-9]+:@[0-9]+\\.%[0-9]+$",
+          "description": "=<session_id>:<window_id>.<pane_id>, with tmux's id ($N) of the pane's session."
         }
       ],
       "minItems": 7,

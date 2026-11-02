@@ -2,7 +2,7 @@
   "$schema": "https://json-schema.org/draft/2020-12/schema",
   "$id": "termctl/audit.json",
   "title": "termctl audit.jsonl record",
-  "description": "Written, once an id is generated (open) or resolved (close), for close --force of a running pane (any outcome) and for open or close with --override-escalation.",
+  "description": "Written, once an id is generated (open) or resolved (close), for close --force of a running pane (any outcome) and for open or close with --override-escalation. A run a signal stops once it has changed something (open from window creation, close from its re-check) is recorded with its output, written before the post hooks; one stopped earlier changed nothing and gets no record.",
   "type": "object",
   "properties": {
     "ts": {

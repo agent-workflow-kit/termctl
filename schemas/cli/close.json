@@ -30,7 +30,7 @@
     },
     "pid_mismatch": {
       "type": "boolean",
-      "description": "The recorded PID did not equal the pane's #{pane_pid} (at the first check, the re-check or kill time), or the process start time did not match the recorded one (pane respawned or PID reused); nothing was signaled."
+      "description": "The recorded PID failed a check or a check could not be made, so nothing was signaled: it did not equal the pane's #{pane_pid} (at the first check, the re-check or kill time), @termctl_pid or @termctl_pid_start changed between the checks, the server on the socket was not #{pid} in termctl's PID namespace, /proc showed another PID namespace, the process's parent was not the server, its start time was not the recorded one before the first signal (pane respawned or PID reused), the pane was gone at the first check while the process had not exited, or no process handle could be opened."
     },
     "decision_ids": {
       "$ref": "../defs.json#/$defs/decision_ids"

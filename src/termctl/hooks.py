@@ -22,11 +22,11 @@ No hook runs while this process holds a server lock (``lock.held()``): hooks may
 the lock must never wait on them.
 """
 
-# open (cli.open_pane) builds its payloads here, runs the hooks at steps 4 and 9 of the open
-# order, prints and logs the warnings (``HookWarning.log_record``), lists the hook process
-# groups in its log record (``HookProcess.log_entry``; design guide section 8: the group is
-# "created and recorded") and audits override runs.
-# TODO(#23): the same for close (pre-close at step 2, post-close).
+# open (cli.open_pane) and close (cli.close_pane) build their payloads here, run the pre-hooks
+# (open order step 4, close step 2) and the post-hooks, print and log the warnings
+# (``HookWarning.log_record``), list the hook process groups in their log records
+# (``HookProcess.log_entry``; design guide section 8: the group is "created and recorded")
+# and audit override runs.
 
 from __future__ import annotations
 

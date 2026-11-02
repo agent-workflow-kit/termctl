@@ -27,7 +27,7 @@
     },
     "pid_mismatch": {
       "type": "boolean",
-      "description": "The recorded PID does not equal the pane's #{pane_pid}, or no longer has the recorded start time; a real run would signal nothing."
+      "description": "The recorded PID fails a check of step 1, or a check cannot be made: it does not equal the pane's #{pane_pid}, the server on the socket is not #{pid} in termctl's PID namespace, /proc shows another PID namespace, the process's parent is not the server or its start time is not the recorded one, or the pane was gone at the check while the process has not exited. A real run would signal nothing."
     },
     "signals_possible": {
       "$ref": "../defs.json#/$defs/signals",
